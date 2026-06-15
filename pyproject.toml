@@ -21,6 +21,8 @@ dependencies = [
     "pydantic>=2.6.0",
     "pydantic-settings>=2.2.0",
     "PyYAML>=6.0.1",
+    # Persistence
+    "sqlalchemy>=2.0",        # SQLite 成交记录 + 持仓快照
     # Logging
     "loguru>=0.7.2",
     # Visualization (回测报告)

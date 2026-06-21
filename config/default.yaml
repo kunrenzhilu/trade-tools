@@ -43,3 +43,33 @@ monitor:
   telegram:
     enabled: false
     alert_levels: ["WARN", "ERROR", "CRITICAL"]
+
+# ── Phase 3 新增配置 ─────────────────────────────────────────────────────────
+
+alpaca:
+  paper: true                    # true=沙盒; false=真实账户
+  # api_key / secret_key 通过 .env 注入，不写在此处
+
+ibkr:
+  host: "127.0.0.1"
+  port: 7497                     # 7497=TWS纸面; 7496=TWS实盘; 4002=GW纸面; 4001=GW实盘
+  client_id: 1
+  timeout: 10
+  readonly: true                 # Phase 3 初期只读保护
+
+notification:
+  # telegram_enabled / wechat_work_enabled / bot_token / chat_id 通过 .env 注入
+  alert_cooldown_seconds: 300    # 同类告警最小间隔（秒），防骚扰
+  min_alert_level: "WARN"        # INFO / WARN / ERROR / CRITICAL
+
+scheduler:
+  enabled: true
+  timezone: "America/New_York"
+  morning_scan_hour: 9
+  morning_scan_minute: 35
+  intraday_interval_minutes: 30
+  eod_check_hour: 15
+  eod_check_minute: 45
+  reconciliation_hour: 16
+  reconciliation_minute: 30
+  misfire_grace_time: 60         # 错过触发后的最大延迟宽限（秒）

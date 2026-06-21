@@ -121,6 +121,76 @@ class MonitorConfig(BaseSettings):
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
 
 
+class AlpacaConfig(BaseSettings):
+    """Alpaca 美股 API 配置（敏感信息通过环境变量注入）。"""
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    api_key: str = ""
+    secret_key: str = ""
+    paper: bool = True  # True=沙盒；False=真实账户
+
+
+class IBKRConfig(BaseSettings):
+    """Interactive Brokers TWS/Gateway 连接配置。"""
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    host: str = "127.0.0.1"
+    port: int = 7497          # 7497=TWS纸面交易；7496=TWS实盘；4002=IB Gateway纸面；4001=IB Gateway实盘
+    client_id: int = 1
+    timeout: int = 10         # 连接超时（秒）
+    readonly: bool = True     # Phase 3 初期只读，避免误下单
+
+
+class NotificationConfig(BaseSettings):
+    """通知推送配置（Telegram + 企业微信）。"""
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    # Telegram Bot
+    telegram_enabled: bool = False
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+
+    # 企业微信 Webhook
+    wechat_work_enabled: bool = False
+    wechat_work_webhook_url: str = ""
+
+    # 告警冷却：同类告警最小间隔（秒），防骚扰
+    alert_cooldown_seconds: int = 300
+
+    # 最低发送级别：INFO / WARN / ERROR / CRITICAL
+    min_alert_level: str = "WARN"
+
+
+class SchedulerConfig(BaseSettings):
+    """APScheduler 定时任务配置（美股时区 ET）。"""
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    enabled: bool = True
+    timezone: str = "America/New_York"
+
+    # 盘前扫描（跳过开盘前 5 分钟噪音）
+    morning_scan_hour: int = 9
+    morning_scan_minute: int = 35
+
+    # 盘中扫描间隔（分钟）
+    intraday_interval_minutes: int = 30
+
+    # 收盘前检查
+    eod_check_hour: int = 15
+    eod_check_minute: int = 45
+
+    # 盘后对账
+    reconciliation_hour: int = 16
+    reconciliation_minute: int = 30
+
+    # 任务宽限期（秒）：错过触发后最多延迟执行
+    misfire_grace_time: int = 60
+
+
 # ---------------------------------------------------------------------------
 # 顶层 AppConfig
 # ---------------------------------------------------------------------------
@@ -142,6 +212,12 @@ class AppConfig(BaseSettings):
     signal_filter: SignalFilterConfig = Field(default_factory=SignalFilterConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     monitor: MonitorConfig = Field(default_factory=MonitorConfig)
+
+    # Phase 3 新增子配置
+    alpaca: AlpacaConfig = Field(default_factory=AlpacaConfig)
+    ibkr: IBKRConfig = Field(default_factory=IBKRConfig)
+    notification: NotificationConfig = Field(default_factory=NotificationConfig)
+    scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
 
     @field_validator("risk", mode="before")
     @classmethod

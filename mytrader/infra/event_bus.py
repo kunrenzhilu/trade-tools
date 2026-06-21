@@ -27,6 +27,11 @@ class Events:
     CIRCUIT_BREAKER_TRIGGERED = "circuit_breaker_triggered"
     ALERT = "alert"
 
+    # Phase 3 新增
+    HEALTH_CHECK_FAILED = "health_check_failed"       # 健康检查项失败
+    RECONCILIATION_DIFF = "reconciliation_diff"       # 本地与券商持仓出现差异
+    ORDER_NOTIFICATION_SENT = "order_notification_sent"  # 半自动模式通知已发送
+
 
 class EventBus:
     """同步事件总线。

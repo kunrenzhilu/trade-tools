@@ -23,6 +23,10 @@ dependencies = [
     "PyYAML>=6.0.1",
     # Persistence
     "sqlalchemy>=2.0",        # SQLite 成交记录 + 持仓快照
+    # Scheduling (Phase 3 定时任务)
+    "apscheduler>=3.10.0",       # 盘前/盘中/盘后定时 job
+    # HTTP (Phase 3 通知推送)
+    "httpx>=0.27.0",             # Telegram/企业微信 Webhook 推送
     # Logging
     "loguru>=0.7.2",
     # Visualization (回测报告)

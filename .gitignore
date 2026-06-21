@@ -10,3 +10,4 @@ venv/
 ~/.mytrader/
 reports/
 *.html
+mytrader.db

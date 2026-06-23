@@ -53,6 +53,8 @@ class BacktestResult:
     config: BacktestConfig
     portfolio: vbt.Portfolio
     stats: pd.Series
+    daily_returns: pd.Series = field(default_factory=pd.Series)
+    """日收益率序列（pf.returns()），供矩阵回测等权组合 Sharpe 计算使用。"""
 
     def print_stats(self) -> None:
         """打印关键绩效指标。"""
@@ -167,7 +169,12 @@ class BacktestRunner:
 
         stats = pf.stats()
 
-        result = BacktestResult(config=config, portfolio=pf, stats=stats)
+        result = BacktestResult(
+            config=config,
+            portfolio=pf,
+            stats=stats,
+            daily_returns=pf.returns(),
+        )
         result.print_stats()
         return result
 

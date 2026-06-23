@@ -164,6 +164,22 @@ class NotificationConfig(BaseSettings):
     min_alert_level: str = "WARN"
 
 
+class WatchlistConfig(BaseSettings):
+    """扫描标的列表配置。"""
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    symbols: list[str] = Field(
+        default_factory=lambda: ["AAPL", "MSFT", "TSLA", "NVDA", "SPY"],
+        description="扫描标的列表（美股 ticker）",
+    )
+    # 拉取多少天历史数据用于计算指标（需足够覆盖慢均线周期）
+    lookback_days: int = Field(90, ge=30, le=365)
+
+    # 并发拉取标的数（>1 时并发 fetch，受限于 yfinance/Alpaca API 限速）
+    max_concurrent_symbols: int = Field(5, ge=1, le=20)
+
+
 class SchedulerConfig(BaseSettings):
     """APScheduler 定时任务配置（美股时区 ET）。"""
 
@@ -218,6 +234,9 @@ class AppConfig(BaseSettings):
     ibkr: IBKRConfig = Field(default_factory=IBKRConfig)
     notification: NotificationConfig = Field(default_factory=NotificationConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+
+    # Phase 4 新增子配置
+    watchlist: WatchlistConfig = Field(default_factory=WatchlistConfig)
 
     @field_validator("risk", mode="before")
     @classmethod

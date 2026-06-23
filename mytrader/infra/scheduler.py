@@ -29,6 +29,7 @@ class TradingScheduler:
         on_intraday_scan: 盘中扫描回调
         on_eod_check:     收盘前检查回调
         on_reconciliation: 盘后对账回调
+        on_monthly_reoptimize: 月度策略权重重优化回调（MatrixBacktest）
         circuit_breaker:  熔断器（可选，有 is_triggered() 方法）
         scheduler:        可注入的 APScheduler 实例（测试用）
     """
@@ -40,6 +41,7 @@ class TradingScheduler:
         on_intraday_scan: Callable[[], None] | None = None,
         on_eod_check: Callable[[], None] | None = None,
         on_reconciliation: Callable[[], None] | None = None,
+        on_monthly_reoptimize: Callable[[], None] | None = None,
         circuit_breaker: Any | None = None,
         scheduler: Any | None = None,
     ) -> None:
@@ -48,6 +50,7 @@ class TradingScheduler:
         self._on_intraday_scan = on_intraday_scan or (lambda: None)
         self._on_eod_check = on_eod_check or (lambda: None)
         self._on_reconciliation = on_reconciliation or (lambda: None)
+        self._on_monthly_reoptimize = on_monthly_reoptimize  # None = 不注册
         self._circuit_breaker = circuit_breaker
         self._scheduler = scheduler
         self._jobs_registered = False
@@ -151,6 +154,24 @@ class TradingScheduler:
             replace_existing=True,
         )
 
+        # 5. 月度策略权重重优化（每月第一个交易日 00:00 ET）
+        if self._on_monthly_reoptimize is not None:
+            sched.add_job(
+                self._safe_monthly_reoptimize,
+                CronTrigger(
+                    day="1-7",          # 每月 1-7 日之间（覆盖第一个工作日）
+                    day_of_week="mon-fri",
+                    hour=0,
+                    minute=0,
+                    timezone=tz,
+                ),
+                id="monthly_reoptimize",
+                name="Monthly Walk-Forward Reoptimize",
+                misfire_grace_time=3600,   # 月度任务允许 1 小时宽限
+                replace_existing=True,
+            )
+            logger.info("TradingScheduler: monthly reoptimize job registered")
+
         self._jobs_registered = True
         logger.info(
             f"TradingScheduler: {len(sched.get_jobs())} jobs registered "
@@ -225,3 +246,12 @@ class TradingScheduler:
             logger.info("=== Reconciliation completed ===")
         except Exception as exc:
             logger.exception(f"Reconciliation error: {exc}")
+
+    def _safe_monthly_reoptimize(self) -> None:
+        try:
+            logger.info("=== Monthly Walk-Forward Reoptimize started ===")
+            if self._on_monthly_reoptimize is not None:
+                self._on_monthly_reoptimize()
+            logger.info("=== Monthly Walk-Forward Reoptimize completed ===")
+        except Exception as exc:
+            logger.exception(f"Monthly reoptimize error: {exc}")

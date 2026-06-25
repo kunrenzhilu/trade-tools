@@ -184,23 +184,32 @@ class ScanOrchestrator:
             return
         try:
             label = self._SCAN_LABEL.get(summary.scan_type, summary.scan_type)
-            buy_syms = [r.symbol for r in summary.results if r.signal_direction == "BUY"]
-            sell_syms = [r.symbol for r in summary.results if r.signal_direction == "SELL"]
+            # 区分已成交 / 信号未成交（风控拒绝或过滤拦截）
+            buy_filled = [r.symbol for r in summary.results
+                          if r.signal_direction == "BUY" and r.order_submitted]
+            buy_blocked = [r.symbol for r in summary.results
+                           if r.signal_direction == "BUY" and not r.order_submitted and not r.has_error]
+            sell_filled = [r.symbol for r in summary.results
+                           if r.signal_direction == "SELL" and r.order_submitted]
+            sell_blocked = [r.symbol for r in summary.results
+                            if r.signal_direction == "SELL" and not r.order_submitted and not r.has_error]
             err_syms = [r.symbol for r in summary.results if r.has_error]
 
             lines = [
                 f"📊 *{label}报告*",
                 f"时间：{summary.triggered_at.strftime('%Y-%m-%d %H:%M:%S UTC')}",
-                f"扫描标的：{len(summary.results)}",
-                f"买入信号：{summary.buy_count}  卖出信号：{summary.sell_count}  下单：{summary.order_count}",
-                f"错误：{summary.error_count}",
+                f"信号候选：{len(summary.results)}  下单：{summary.order_count}  错误：{summary.error_count}",
             ]
-            if buy_syms:
-                lines.append(f"买入：{', '.join(buy_syms[:10])}" + (f" 等{len(buy_syms)}只" if len(buy_syms) > 10 else ""))
-            if sell_syms:
-                lines.append(f"卖出：{', '.join(sell_syms[:10])}" + (f" 等{len(sell_syms)}只" if len(sell_syms) > 10 else ""))
+            if buy_filled:
+                lines.append(f"✅ 买入成交：{', '.join(buy_filled[:10])}")
+            if buy_blocked:
+                lines.append(f"⏸ 买入未成交（风控/过滤拦截）：{', '.join(buy_blocked[:10])}")
+            if sell_filled:
+                lines.append(f"✅ 卖出成交：{', '.join(sell_filled[:10])}")
+            if sell_blocked:
+                lines.append(f"⏸ 卖出未成交：{', '.join(sell_blocked[:10])}")
             if err_syms:
-                lines.append(f"异常：{', '.join(err_syms[:5])}")
+                lines.append(f"⚠️ 异常：{', '.join(err_syms[:5])}")
             self._notification.send_message("\n".join(lines))
         except Exception as exc:
             logger.warning(f"[Orchestrator] scan result notification failed: {exc}")
@@ -311,11 +320,13 @@ class ScanOrchestrator:
             df = self._fetch_data_phase5(symbol, lookback_days)
             if df is None or df.empty:
                 result.error = "empty data"
+                logger.warning(f"[Phase5] {symbol} SELL skipped: empty data")
                 return result
 
             # 信号过滤
             filtered_signals, filter_result = self._pipeline.run([sig], df)
             if not filtered_signals:
+                logger.warning(f"[Phase5] {symbol} SELL skipped: SignalFilter rejected")
                 return result
 
             result.signal_direction = sig.direction.value
@@ -324,6 +335,7 @@ class ScanOrchestrator:
             # 风控
             intent = self._risk.evaluate(filtered, df)
             if intent is None:
+                logger.warning(f"[Phase5] {symbol} SELL skipped: RiskManager rejected (intent=None)")
                 return result
 
             # 下单
@@ -359,11 +371,13 @@ class ScanOrchestrator:
             df = self._fetch_data_phase5(symbol, lookback_days)
             if df is None or df.empty:
                 result.error = "empty data"
+                logger.warning(f"[Phase5] {symbol} BUY skipped: empty data")
                 return result
 
             # 信号过滤
             filtered_signals, filter_result = self._pipeline.run([sig], df)
             if not filtered_signals:
+                logger.warning(f"[Phase5] {symbol} BUY skipped: SignalFilter rejected")
                 return result
 
             filtered = filtered_signals[0]
@@ -371,6 +385,7 @@ class ScanOrchestrator:
             # 风控
             intent = self._risk.evaluate(filtered, df)
             if intent is None:
+                logger.warning(f"[Phase5] {symbol} BUY skipped: RiskManager rejected (intent=None)")
                 return result
 
             # 下单

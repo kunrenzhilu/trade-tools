@@ -190,13 +190,25 @@ def main() -> None:
         symbols = components.universe.get_universe()
         logger.info(f"[DataSync] syncing {len(symbols)} symbols...")
         try:
-            primary = YFinanceProvider()
+            if config.data.provider == "alpaca":
+                from mytrader.data.providers.alpaca_provider import AlpacaDataProvider
+                from datetime import date as _date, timedelta as _td
+                primary = AlpacaDataProvider(
+                    api_key=config.alpaca.api_key,
+                    secret_key=config.alpaca.secret_key,
+                    paper=config.alpaca.paper,
+                )
+                # 盘后同步：end 用昨天避开 SIP 实时限制
+                end = _date.today() - _td(days=1)
+            else:
+                primary = YFinanceProvider()
+                end = None
             svc = DataSyncService(
                 store=components.data_store,
                 primary=primary,
                 use_fallback_on_empty=False,
             )
-            report = svc.sync_all(symbols, max_workers=4)
+            report = svc.sync_all(symbols, max_workers=4, end=end)
             logger.info(f"[DataSync] done: {report}")
         except Exception as exc:
             logger.error(f"[DataSync] failed: {exc}")
@@ -259,10 +271,27 @@ def _run_backfill(config: "Any", logger: "Any") -> None:
         logger.error("[Backfill] no symbols to backfill — abort")
         return
 
-    primary = YFinanceProvider()
+    from datetime import date as _date, timedelta as _timedelta
+
+    if config.data.provider == "alpaca":
+        from mytrader.data.providers.alpaca_provider import AlpacaDataProvider
+        primary = AlpacaDataProvider(
+            api_key=config.alpaca.api_key,
+            secret_key=config.alpaca.secret_key,
+            paper=config.alpaca.paper,
+        )
+        # Alpaca 免费 SIP 不能查当日实时数据，end 用昨天避开限制
+        end = _date.today() - _timedelta(days=1)
+        logger.info(
+            f"[Backfill] using Alpaca provider (end={end}, avoids SIP realtime limit)"
+        )
+    else:
+        primary = YFinanceProvider()
+        end = None
+
     svc = DataSyncService(store=store, primary=primary, fallback=None,
                           use_fallback_on_empty=False)
-    report = svc.backfill(symbols, years=5)
+    report = svc.backfill(symbols, years=5, end=end)
     logger.info(f"[Backfill] done: {report}")
 
 

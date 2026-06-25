@@ -73,13 +73,17 @@ class DataSyncService:
         self,
         symbol: str,
         timeframe: str = "1d",
+        end: date | None = None,
     ) -> int:
         """同步单只标的：查本地最新日期 → 拉 [last+1, today] → upsert。
+
+        Args:
+            end: 结束日期（默认今天）。Alpaca 免费 SIP 不能查当日，传 today-1。
 
         Returns:
             新增 bar 数（0 表示已是最新）
         """
-        today = date.today()
+        today = end or date.today()
         last = self._store.get_last_synced(symbol, timeframe)
 
         if last is None:
@@ -104,6 +108,7 @@ class DataSyncService:
         timeframe: str = "1d",
         max_workers: int = 8,
         sleep_between_batches: float = 0.3,
+        end: date | None = None,
     ) -> SyncReport:
         """并发同步全部标的（收盘后调用）。
 
@@ -111,12 +116,13 @@ class DataSyncService:
             symbols:               标的列表
             max_workers:           并发线程数
             sleep_between_batches: 每批次后休眠秒数（避免限速）
+            end:                   结束日期（默认今天）。Alpaca 免费 SIP 不能查当日，传 today-1。
         """
         report = SyncReport(total_symbols=len(symbols))
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(self.sync_symbol, sym, timeframe): sym
+                executor.submit(self.sync_symbol, sym, timeframe, end): sym
                 for sym in symbols
             }
             for future in as_completed(futures):
@@ -149,13 +155,18 @@ class DataSyncService:
         max_workers: int = 8,
         batch_size: int = 50,
         sleep_between_batches: float = 1.0,
+        end: date | None = None,
     ) -> SyncReport:
         """首次回填 N 年历史（一次性操作）。
 
         分批处理（每批 batch_size 只），批次间 sleep 避免触发限速。
+
+        Args:
+            end: 结束日期（默认今天）。Alpaca 免费 SIP 不能查当日实时数据，
+                 传 today-1 避开 SIP 限制。
         """
         report = SyncReport(total_symbols=len(symbols))
-        today = date.today()
+        today = end or date.today()
         start = today - timedelta(days=years * 365)
 
         logger.info(

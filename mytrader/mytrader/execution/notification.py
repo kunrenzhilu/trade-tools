@@ -202,6 +202,13 @@ class NotificationService:
         cooldown_key = f"{level.upper()}:{message[:50]}"
         self._send_all(text, cooldown_key=cooldown_key)
 
+    def send_message(self, text: str) -> None:
+        """直接发送消息（不受 min_alert_level / cooldown 限制）。
+
+        用于扫描结果、对账报告等必须送达的通知。
+        """
+        self._send_all(text, cooldown_key=None)
+
     # ------------------------------------------------------------------ #
     # 内部方法
     # ------------------------------------------------------------------ #

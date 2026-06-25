@@ -352,18 +352,33 @@ def _build_reconciliation_callback(components: "Any") -> "Callable":
                     f"[Reconciliation] {len(report.diffs)} diff(s) found: "
                     f"{[d.symbol for d in report.diffs]}"
                 )
-                if components.notification:
-                    try:
-                        components.notification.send(
-                            level="WARN",
-                            title="持仓对账差异",
-                            message=f"发现 {len(report.diffs)} 个标的持仓差异，请检查",
-                            key="reconciliation_diff",
-                        )
-                    except Exception:
-                        pass
             else:
                 logger.info("[Reconciliation] No diffs — positions match")
+
+            # 无论有无差异都推送对账报告
+            if components.notification:
+                try:
+                    from datetime import datetime, timezone
+                    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    if report.has_diff:
+                        diff_syms = [d.symbol for d in report.diffs]
+                        text = (
+                            "⚠️ *持仓对账报告*\n"
+                            f"时间：{ts}\n"
+                            f"发现 {len(report.diffs)} 个标的持仓差异：\n"
+                            f"{', '.join(diff_syms[:10])}"
+                            + (f" 等{len(diff_syms)}只" if len(diff_syms) > 10 else "")
+                            + "\n请检查 broker 与本地记录"
+                        )
+                    else:
+                        text = (
+                            "✅ *持仓对账报告*\n"
+                            f"时间：{ts}\n"
+                            "持仓一致，无差异"
+                        )
+                    components.notification.send_message(text)
+                except Exception as exc:
+                    logger.warning(f"[Reconciliation] notification failed: {exc}")
         except Exception as exc:
             logger.error(f"[Reconciliation] Failed: {exc}")
 

@@ -141,6 +141,7 @@ class ScanOrchestrator:
             f"buy={summary.buy_count} sell={summary.sell_count} "
             f"orders={summary.order_count} errors={summary.error_count}"
         )
+        self._notify_scan_result(summary)
         return summary
 
     def intraday_scan(self) -> ScanSummary:
@@ -152,6 +153,7 @@ class ScanOrchestrator:
             f"buy={summary.buy_count} sell={summary.sell_count} "
             f"orders={summary.order_count} errors={summary.error_count}"
         )
+        self._notify_scan_result(summary)
         return summary
 
     def eod_check(self) -> ScanSummary:
@@ -163,7 +165,45 @@ class ScanOrchestrator:
             f"sell={summary.sell_count} orders={summary.order_count} "
             f"errors={summary.error_count}"
         )
+        self._notify_scan_result(summary)
         return summary
+
+    # ------------------------------------------------------------------
+    # 扫描结果通知
+    # ------------------------------------------------------------------
+
+    _SCAN_LABEL = {
+        "morning": "盘前扫描",
+        "intraday": "盘中扫描",
+        "eod": "收盘检查",
+    }
+
+    def _notify_scan_result(self, summary: ScanSummary) -> None:
+        """每次扫描结束后推送结果报告（不受理赔 level/cooldown 限制）。"""
+        if self._notification is None:
+            return
+        try:
+            label = self._SCAN_LABEL.get(summary.scan_type, summary.scan_type)
+            buy_syms = [r.symbol for r in summary.results if r.signal_direction == "BUY"]
+            sell_syms = [r.symbol for r in summary.results if r.signal_direction == "SELL"]
+            err_syms = [r.symbol for r in summary.results if r.has_error]
+
+            lines = [
+                f"📊 *{label}报告*",
+                f"时间：{summary.triggered_at.strftime('%Y-%m-%d %H:%M:%S UTC')}",
+                f"扫描标的：{len(summary.results)}",
+                f"买入信号：{summary.buy_count}  卖出信号：{summary.sell_count}  下单：{summary.order_count}",
+                f"错误：{summary.error_count}",
+            ]
+            if buy_syms:
+                lines.append(f"买入：{', '.join(buy_syms[:10])}" + (f" 等{len(buy_syms)}只" if len(buy_syms) > 10 else ""))
+            if sell_syms:
+                lines.append(f"卖出：{', '.join(sell_syms[:10])}" + (f" 等{len(sell_syms)}只" if len(sell_syms) > 10 else ""))
+            if err_syms:
+                lines.append(f"异常：{', '.join(err_syms[:5])}")
+            self._notification.send_message("\n".join(lines))
+        except Exception as exc:
+            logger.warning(f"[Orchestrator] scan result notification failed: {exc}")
 
     # ------------------------------------------------------------------
     # Internal scan logic

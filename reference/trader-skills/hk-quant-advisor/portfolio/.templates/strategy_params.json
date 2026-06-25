@@ -1,0 +1,5 @@
+{
+  "_comment": "运行时策略参数覆盖层。未覆盖的参数将使用 config/strategy_params.json 中的默认值。",
+  "overrides": {},
+  "last_updated": null
+}

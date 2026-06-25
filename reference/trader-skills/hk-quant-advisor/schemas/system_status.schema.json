@@ -1,0 +1,259 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "HK Quant Advisor - System Status",
+  "description": "港股量化交易助手的系统状态消息 Schema",
+  "type": "object",
+  "required": ["version", "type", "timestamp", "status"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "type": {
+      "type": "string",
+      "enum": ["SYSTEM_STATUS"],
+      "description": "消息类型"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["INITIALIZING", "INITIALIZED", "RUNNING", "PAUSED", "SLEEPING", "ERROR", "MAINTENANCE"],
+      "description": "系统状态：初始化中/已初始化/运行中/已暂停/休眠/异常/维护中。MAINTENANCE（维护中）状态在以下场景触发：策略参数大幅调整期间、策略回测验证期间、或系统配置变更需要人工确认时，此状态下暂停所有自动交易信号生成，待维护完成后由用户手动恢复为 RUNNING"
+    },
+    "statusReason": {
+      "type": "string",
+      "description": "状态原因说明"
+    },
+    "uptime": {
+      "type": "string",
+      "description": "系统运行时长"
+    },
+    "availableSkills": {
+      "type": "object",
+      "description": "数据源 Skill 可用性状态",
+      "properties": {
+        "free": {
+          "type": "array",
+          "description": "可用的免费数据源 Skill 列表",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string", "enum": ["westock-data", "tecent-finance", "yahoo-finance", "akshare-finance"] },
+              "status": { "type": "string", "enum": ["OK", "FAIL"] }
+            }
+          }
+        },
+        "paid": {
+          "type": "array",
+          "description": "可用的付费数据源 Skill 列表（可选）",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string", "enum": ["tushare-finance", "finance"] },
+              "status": { "type": "string", "enum": ["OK", "FAIL", "NOT_CONFIGURED"] }
+            }
+          }
+        }
+      }
+    },
+    "tradingDay": {
+      "type": "object",
+      "description": "交易日信息",
+      "properties": {
+        "date": { "type": "string", "format": "date" },
+        "isTradingDay": { "type": "boolean" },
+        "isHalfDay": { "type": "boolean" },
+        "marketOpen": { "type": "string", "description": "开市时间" },
+        "marketClose": { "type": "string", "description": "收市时间" },
+        "nextTradingDay": { "type": "string", "format": "date" }
+      }
+    },
+    "dataSources": {
+      "type": "object",
+      "description": "各数据维度的数据源健康状态",
+      "properties": {
+        "realtimeQuote": {
+          "type": "object",
+          "properties": {
+            "source": { "type": "string", "enum": ["westock-data", "tecent-finance", "yahoo-finance", "akshare-finance", "tushare-finance", "finance"], "description": "当前使用的数据源 Skill 名称" },
+            "health": { "type": "string", "enum": ["OK", "DEGRADED", "FAIL"] },
+            "latencyMs": { "type": "integer" },
+            "lastSuccess": { "type": "string", "format": "date-time" },
+            "failCount": { "type": "integer" }
+          }
+        },
+        "historyKline": {
+          "type": "object",
+          "properties": {
+            "source": { "type": "string", "enum": ["westock-data", "tecent-finance", "yahoo-finance", "akshare-finance", "tushare-finance", "finance"], "description": "当前使用的数据源 Skill 名称" },
+            "health": { "type": "string", "enum": ["OK", "DEGRADED", "FAIL"] },
+            "lastUpdate": { "type": "string", "format": "date-time" }
+          }
+        },
+        "fundamental": {
+          "type": "object",
+          "properties": {
+            "source": { "type": "string", "enum": ["westock-data", "tecent-finance", "yahoo-finance", "akshare-finance", "tushare-finance", "finance"], "description": "当前使用的数据源 Skill 名称" },
+            "health": { "type": "string", "enum": ["OK", "DEGRADED", "FAIL"] },
+            "lastUpdate": { "type": "string", "format": "date-time" }
+          }
+        },
+        "news": {
+          "type": "object",
+          "properties": {
+            "source": { "type": "string", "enum": ["westock-data", "tecent-finance", "yahoo-finance", "akshare-finance", "tushare-finance", "finance"], "description": "当前使用的数据源 Skill 名称" },
+            "health": { "type": "string", "enum": ["OK", "DEGRADED", "FAIL"] },
+            "lastUpdate": { "type": "string", "format": "date-time" }
+          }
+        },
+        "southboundFlow": {
+          "type": "object",
+          "properties": {
+            "source": { "type": "string", "enum": ["westock-data", "tecent-finance", "akshare-finance", "tushare-finance"], "description": "当前使用的数据源 Skill 名称" },
+            "health": { "type": "string", "enum": ["OK", "DEGRADED", "FAIL"] },
+            "lastUpdate": { "type": "string", "format": "date-time" }
+          }
+        },
+        "disclosure": {
+          "type": "object",
+          "description": "披露易（Browser_Skill，不受 Skill 架构影响）",
+          "properties": {
+            "health": { "type": "string", "enum": ["OK", "DEGRADED", "FAIL"] },
+            "lastUpdate": { "type": "string", "format": "date-time" }
+          }
+        },
+        "ccass": {
+          "type": "object",
+          "description": "CCASS 券商持仓（Browser_Skill，不受 Skill 架构影响）",
+          "properties": {
+            "health": { "type": "string", "enum": ["OK", "DEGRADED", "FAIL"] },
+            "lastUpdate": { "type": "string", "format": "date-time" }
+          }
+        }
+      }
+    },
+    "account": {
+      "type": "object",
+      "description": "账户状态摘要",
+      "properties": {
+        "status": { "type": "string", "enum": ["NORMAL", "CIRCUIT_BREAKER", "EMERGENCY", "SUSPENDED", "PENDING_INIT"] },
+        "totalNetValue": { "type": "number", "description": "账户总净值（港币）" },
+        "cashBalance": { "type": "number" },
+        "cashRatio": { "type": "number" },
+        "totalPositionPct": { "type": "number" },
+        "openPositions": { "type": "integer" },
+        "pendingOrders": { "type": "integer" },
+        "lastReconciliation": { "type": ["string", "null"], "format": "date", "description": "最后对账日期（首次初始化时为null）" },
+        "daysSinceReconciliation": { "type": "integer" }
+      }
+    },
+    "marketStance": {
+      "type": "object",
+      "description": "当前市场立场",
+      "properties": {
+        "stance": { "type": "string", "enum": ["AGGRESSIVE_BULL", "CAUTIOUS_BULL", "NEUTRAL", "DEFENSIVE"] },
+        "positionCoefficient": { "type": "number" },
+        "determinedAt": { "type": "string", "format": "date-time" },
+        "keyIndicators": {
+          "type": "object",
+          "properties": {
+            "hsiVsMa20": { "type": "string" },
+            "ma20Direction": { "type": "string" },
+            "vhsi": { "type": "number" }
+          }
+        }
+      }
+    },
+    "strategies": {
+      "type": "object",
+      "description": "各策略运行状态",
+      "properties": {
+        "strategy1": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string", "const": "趋势突破" },
+            "status": { "type": "string", "enum": ["ACTIVE", "REDUCED", "SUSPENDED"] },
+            "weightPct": { "type": "number" },
+            "recentWinRate": { "type": "string" }
+          }
+        },
+        "strategy2": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string", "const": "回调低吸" },
+            "status": { "type": "string", "enum": ["ACTIVE", "REDUCED", "SUSPENDED"] },
+            "weightPct": { "type": "number" },
+            "recentWinRate": { "type": "string" }
+          }
+        },
+        "strategy3": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string", "const": "事件驱动" },
+            "status": { "type": "string", "enum": ["ACTIVE", "REDUCED", "SUSPENDED"] },
+            "weightPct": { "type": "number" },
+            "recentWinRate": { "type": "string" }
+          }
+        },
+        "strategy4": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string", "const": "极端情绪反转" },
+            "status": { "type": "string", "enum": ["ACTIVE", "REDUCED", "SUSPENDED"] },
+            "weightPct": { "type": "number" },
+            "recentWinRate": { "type": "string" }
+          }
+        }
+      }
+    },
+    "stockPool": {
+      "type": "object",
+      "description": "股票池状态",
+      "properties": {
+        "coreCount": { "type": "integer", "description": "核心池标的数" },
+        "watchCount": { "type": "integer", "description": "观察池标的数" },
+        "blacklistCount": { "type": "integer", "description": "黑名单标的数" },
+        "lastFullRefresh": { "type": "string", "format": "date-time" },
+        "lastIncrementalRefresh": { "type": "string", "format": "date-time" }
+      }
+    },
+    "cronTasks": {
+      "type": "array",
+      "description": "定时任务注册状态",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "cron": { "type": "string" },
+          "status": { "type": "string", "enum": ["REGISTERED", "FAILED", "SKIPPED"] },
+          "nextRun": { "type": "string", "format": "date-time" },
+          "lastRun": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
+    "errorPatterns": {
+      "type": "object",
+      "description": "错误模式状态",
+      "properties": {
+        "activeCount": { "type": "integer" },
+        "cooldownStocks": { "type": "integer" },
+        "industryRestrictions": { "type": "integer" }
+      }
+    },
+    "notifications": {
+      "type": "object",
+      "description": "通知渠道状态",
+      "properties": {
+        "primaryChannel": { "type": "string" },
+        "primaryStatus": { "type": "string", "enum": ["OK", "FAIL"] },
+        "backupChannel": { "type": "string" },
+        "backupStatus": { "type": "string", "enum": ["OK", "FAIL", "未配置"], "description": "备用通道状态" },
+        "pendingRetries": { "type": "integer" },
+        "cachedMessages": { "type": "integer" }
+      }
+    }
+  }
+}

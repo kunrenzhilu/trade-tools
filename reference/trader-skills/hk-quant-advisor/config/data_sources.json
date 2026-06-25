@@ -1,0 +1,293 @@
+{
+  "_description": "数据源 Skill 映射配置 - 定义所有数据维度到外部数据源 Skill 的路由规则",
+
+  "skill_sources": {
+    "_description": "可用的外部数据源 Skill 定义",
+    "free": {
+      "_description": "完全免费，无需 API Token",
+      "westock-data": {
+        "provider": "腾讯证券",
+        "type": "Skill",
+        "requires_token": false,
+        "features": ["港股实时行情", "历史K线", "股票列表", "恒生指数", "板块行情"],
+        "priority": 1,
+"note": "免费首选数据源，内网 Knot 渠道，覆盖面广，延迟较低。通过 knot_skills 自动安装，安装失败时需在技能页面「来自Knot」下手工安装"
+      },
+      "tecent-finance": {
+        "provider": "腾讯证券",
+        "type": "Skill",
+        "requires_token": false,
+        "features": ["港股实时行情", "历史K线", "股票列表", "恒生指数", "板块行情"],
+        "priority": 1.5,
+        "note": "外网 ClawHub 渠道，免费第一降级数据源，与 westock-data 同源"
+      },
+      "yahoo-finance": {
+        "provider": "雅虎金融",
+        "type": "Skill",
+        "requires_token": false,
+        "features": ["全球股票行情", "历史K线", "基本面数据", "外汇汇率", "指数数据"],
+        "priority": 2,
+        "note": "全球市场覆盖，基本面数据丰富"
+      },
+      "akshare-finance": {
+        "provider": "AKShare财经",
+        "type": "Skill",
+        "requires_token": false,
+        "features": ["港股行情", "沪深港通资金流向", "宏观经济数据", "利率数据", "行业分类"],
+        "priority": 3,
+        "note": "国内财经数据覆盖全面，南向资金数据优势"
+      }
+    },
+    "paid": {
+      "_description": "需要 API Token，付费数据源（若可用则优先使用）",
+      "tushare-finance": {
+        "provider": "Tushare金融",
+        "type": "Skill",
+        "requires_token": true,
+        "features": ["港股日线/分钟行情", "港股列表", "沪深港通资金流向", "Hibor利率", "外汇行情", "国际指数", "新闻快讯"],
+        "priority": 0,
+        "note": "国内量化数据标杆，港股数据维度丰富"
+      },
+      "finance": {
+        "provider": "AlphaVantage & TwelveData",
+        "type": "Skill",
+        "requires_token": true,
+        "features": ["全球股票行情", "技术指标", "基本面数据", "外汇汇率", "加密货币"],
+        "priority": 0,
+        "note": "国际数据源，技术指标计算能力强"
+      }
+    }
+  },
+
+  "data_dimensions": {
+    "_description": "每个数据维度的 Skill 路由规则。paid_preferred 表示付费源可用时优先使用；free_chain 为免费源降级链",
+
+    "realtime_quote": {
+      "description": "实时行情（个股报价、买卖盘口、成交量）",
+      "paid_preferred": ["tushare-finance", "finance"],
+      "free_chain": ["westock-data", "tecent-finance", "yahoo-finance", "akshare-finance"],
+      "switch_logic": "主源连续3次请求失败或响应超时，自动切换下一优先级源；每5分钟检测主源恢复状态",
+      "max_latency_ms": 5000,
+      "refresh_interval_sec": 60
+    },
+
+    "history_kline": {
+      "description": "历史K线（日线、周线、月线、分钟级K线、复权数据）",
+      "paid_preferred": ["tushare-finance", "finance"],
+      "free_chain": ["westock-data", "tecent-finance", "yahoo-finance", "akshare-finance"],
+      "switch_logic": "主源请求失败自动切换下一优先级源",
+      "max_latency_ms": 10000
+    },
+
+    "fundamental": {
+      "description": "基本面数据（营收、净利润、EPS、ROE、负债率、毛利率、估值）",
+      "paid_preferred": ["tushare-finance", "finance"],
+      "free_chain": ["yahoo-finance", "akshare-finance", "westock-data", "tecent-finance"],
+      "switch_logic": "主源请求失败自动切换下一优先级源",
+      "max_latency_ms": 10000
+    },
+
+    "news": {
+      "description": "新闻快讯与深度资讯",
+      "paid_preferred": ["tushare-finance"],
+      "free_chain": ["akshare-finance", "westock-data", "tecent-finance"],
+      "switch_logic": "主源请求失败自动切换下一优先级源",
+      "max_latency_ms": 10000,
+      "note": "数据源 Skill 无法覆盖的财经媒体（如财联社电报、华尔街见闻），保留 Browser_Skill 抓取作为补充"
+    },
+
+    "southbound_flow": {
+      "description": "沪深港通南向资金实时流向",
+      "paid_preferred": ["tushare-finance"],
+      "free_chain": ["akshare-finance", "westock-data", "tecent-finance"],
+      "switch_logic": "主源请求失败自动切换下一优先级源；每5分钟检测主源恢复状态",
+      "max_latency_ms": 5000,
+      "refresh_interval_sec": 300,
+      "note": "已从 free_chain 中移除 yahoo-finance，因雅虎金融不提供沪深港通南向资金数据，保留该源会导致降级链浪费请求"
+    },
+
+    "hsi_realtime": {
+      "description": "恒生指数实时数据（市场立场判定和应急风控的核心依赖）",
+      "paid_preferred": ["tushare-finance", "finance"],
+      "free_chain": ["westock-data", "tecent-finance", "yahoo-finance", "akshare-finance"],
+      "switch_logic": "主源连续3次请求失败自动切换下一优先级源；每30秒检测主源恢复状态",
+      "max_latency_ms": 5000,
+      "refresh_interval_sec": 30,
+      "health_check_interval_sec": 30,
+      "_note_health_check": "此维度级 health_check_interval_sec(30s) 覆盖全局 degradation_rules 中的默认值(300s)，因恒生指数是应急风控核心依赖，需更快检测主源恢复。refresh_interval_sec 控制正常数据刷新频率，health_check_interval_sec 控制故障后恢复探测频率，两者独立",
+      "note": "恒生指数数据是市场立场判定（§5.5）和应急风控（§5.4）的核心依赖，务必保证可用性"
+    },
+
+    "stock_list": {
+      "description": "港股全市场股票列表（含行业分类、市值等基础信息）",
+      "paid_preferred": ["tushare-finance"],
+      "free_chain": ["westock-data", "tecent-finance", "akshare-finance", "yahoo-finance"],
+      "switch_logic": "主源请求失败自动切换下一优先级源",
+      "max_latency_ms": 10000,
+      "note": "股票列表数据变化频率低，可缓存使用"
+    },
+
+    "derivatives": {
+      "description": "衍生品数据（恒指期货、期权、Put/Call比率）",
+      "paid_preferred": ["finance"],
+      "free_chain": ["yahoo-finance", "akshare-finance", "westock-data", "tecent-finance"],
+      "switch_logic": "主源请求失败自动切换下一优先级源",
+      "max_latency_ms": 10000
+    },
+
+    "fx_rate": {
+      "description": "外汇汇率（离岸人民币兑港币等）",
+      "paid_preferred": ["tushare-finance", "finance"],
+      "free_chain": ["yahoo-finance", "akshare-finance", "westock-data", "tecent-finance"],
+      "switch_logic": "主源请求失败自动切换下一优先级源",
+      "max_latency_ms": 10000,
+      "alert_threshold_weekly_pct": 1.0,
+      "schedule": "每日09:00"
+    },
+
+    "macro": {
+      "description": "宏观经济数据（Hibor利率、国际指数、全球宏观指标）",
+      "paid_preferred": ["tushare-finance", "finance"],
+      "free_chain": ["akshare-finance", "yahoo-finance"],
+      "switch_logic": "主源请求失败自动切换下一优先级源",
+      "max_latency_ms": 10000
+    },
+
+    "industry_classification": {
+      "description": "港股行业板块分类与板块行情",
+      "paid_preferred": ["tushare-finance"],
+      "free_chain": ["akshare-finance", "westock-data", "tecent-finance", "yahoo-finance"],
+      "switch_logic": "主源请求失败自动切换下一优先级源",
+      "max_latency_ms": 10000
+    },
+
+    "analyst_ratings": {
+      "description": "分析师评级与目标价",
+      "paid_preferred": ["finance"],
+      "free_chain": ["yahoo-finance", "akshare-finance"],
+      "switch_logic": "主源请求失败自动切换下一优先级源",
+      "max_latency_ms": 10000
+    },
+
+    "short_selling": {
+      "description": "港股卖空数据（每日卖空汇总、个股卖空金额和数量）",
+      "paid_preferred": ["tushare-finance"],
+      "free_chain": ["akshare-finance", "westock-data", "tecent-finance"],
+      "switch_logic": "主源请求失败自动切换下一优先级源",
+      "max_latency_ms": 10000,
+      "schedule": "每日18:30后"
+    },
+
+    "social_sentiment": {
+      "description": "社交情绪数据（个股讨论热度、帖子数、情绪倾向）",
+      "paid_preferred": [],
+      "free_chain": ["akshare-finance"],
+      "browser_fallback": [
+        {
+          "name": "xueqiu_browser",
+          "type": "Browser_Skill",
+          "description": "雪球网页抓取（数据源 Skill 无法覆盖时降级使用）",
+          "url": "https://xueqiu.com",
+          "data": ["个股讨论热度", "帖子数", "阅读量", "情绪倾向"]
+        },
+        {
+          "name": "eastmoney_guba_browser",
+          "type": "Browser_Skill",
+          "description": "东方财富股吧网页抓取",
+          "url_template": "https://guba.eastmoney.com/list,{TICKER_CODE}.html",
+          "data": ["个股讨论热度", "帖子数", "阅读量"]
+        }
+      ],
+      "note": "社交情绪数据优先通过 Skill 获取，Skill 无法覆盖时使用 Browser_Skill 抓取雪球/股吧"
+    },
+
+    "vhsi": {
+      "description": "恒指波幅指数(VHSI)实时数据",
+      "paid_preferred": ["finance"],
+      "free_chain": ["yahoo-finance", "akshare-finance", "westock-data", "tecent-finance"],
+      "switch_logic": "主源请求失败自动切换下一优先级源",
+      "max_latency_ms": 5000,
+      "browser_fallback": [
+        {
+          "name": "hkex_vhsi_browser",
+          "type": "Browser_Skill",
+          "description": "港交所/AASTOCKS VHSI页面抓取（所有 Skill 不可用时降级）",
+          "url_options": ["港交所市场数据页", "AASTOCKS VHSI专页"]
+        }
+      ]
+    },
+
+    "southbound_top10": {
+      "description": "港股通十大活跃股（盘后数据，用于盘后分析南向资金动向）",
+      "paid_preferred": ["tushare-finance"],
+      "free_chain": ["akshare-finance", "westock-data", "tecent-finance"],
+      "switch_logic": "主源请求失败自动切换下一优先级源",
+      "max_latency_ms": 10000,
+      "schedule": "每日18:00后",
+      "browser_fallback": [
+        {
+          "name": "hkex_connect_browser",
+          "type": "Browser_Skill",
+          "description": "港交所互联互通网页抓取",
+          "url": "https://www.hkex.com.hk/Mutual-Market/Stock-Connect"
+        }
+      ]
+    }
+  },
+
+  "browser_sources": {
+    "_description": "无法被数据源 Skill 替代的数据，仍使用 Browser_Skill 直接获取",
+
+    "disclosure": {
+      "name": "hkex_news",
+      "type": "Browser_Skill",
+      "url": "https://www.hkexnews.hk",
+      "schedule": "每日16:30后",
+      "data": ["翌日披露报表", "业绩公告", "权益披露", "回购公告", "供股合股公告"],
+      "pdf_parser": "File_Skill",
+      "note": "港交所披露易仅有网页+PDF，无公开API可替代"
+    },
+
+    "ccass": {
+      "name": "hkex_ccass",
+      "type": "Browser_Skill",
+      "url": "https://www.hkexclearing.com/ccass",
+      "schedule": "T+1日20:00后",
+      "data": ["券商席位持仓分布", "持仓变动"],
+      "note": "CCASS仅港交所网页可查，无公开API"
+    },
+
+    "trading_calendar": {
+      "name": "hkex_calendar",
+      "type": "Browser_Skill",
+      "url": "https://www.hkex.com.hk",
+      "data": ["年度交易日历", "半日市安排", "台风/暴雨停市公告"],
+      "note": "交易日历无公开API，需从港交所网页获取或内置静态数据；数据源 Skill 若支持交易日历接口可优先使用"
+    }
+  },
+
+  "degradation_rules": {
+    "_description": "全局降级策略",
+    "paid_first": "若用户配置了付费数据源 Token 且该 Skill 可用，则优先使用付费源获取数据",
+    "free_fallback": "付费源不可用或未配置时，按 free_chain 中的优先级依次尝试免费 Skill",
+    "browser_last": "所有 Skill 均不可用时，对于定义了 browser_fallback 的维度，降级使用 Browser_Skill 抓取",
+    "_note_dimension_override": "若数据维度配置中定义了 health_check_interval_sec，则该维度的故障恢复探测间隔以维度级配置为准，覆盖此处全局默认值",
+    "consecutive_failures_before_switch": 3,
+    "health_check_interval_sec": 300,
+    "max_retry_per_source": 3,
+    "retry_interval_sec": 5,
+    "anti_flap_window_min": 60,
+    "anti_flap_threshold": 2,
+    "anti_flap_recovery_multiplier": 2,
+    "_note_anti_flap": "若同一数据源在 anti_flap_window_min 分钟内发生 ≥ anti_flap_threshold 次降级→恢复→再降级循环，恢复回切所需连续成功次数乘以 anti_flap_recovery_multiplier（指数退避），冷却期30分钟"
+  },
+
+  "anomaly_detection": {
+    "_note": "切换/重试相关参数（consecutive_failures_before_switch、health_check_interval_sec、max_retry_per_source、retry_interval_sec）统一使用 degradation_rules 中的配置，此处不再重复定义，避免维护时不同步",
+    "price_jump_threshold_pct": 20,
+    "price_jump_threshold_announcement_pct": 30,
+    "volume_spike_multiplier": 10,
+    "cross_validation_sources": 2,
+    "timestamp_drift_alert_sec": 30
+  }
+}

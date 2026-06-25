@@ -1,0 +1,81 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "HK Quant Advisor - Parameter Update",
+  "description": "港股量化交易助手的参数更新指令 Schema",
+  "type": "object",
+  "required": ["type", "updates"],
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": ["PARAM_UPDATE"],
+      "description": "消息类型"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "更新时间"
+    },
+    "source": {
+      "type": "string",
+      "enum": ["user_request", "auto_correction", "optimization_report", "strategy_decay", "restore_default"],
+      "description": "更新来源：用户请求/自动纠正/优化报告/策略衰退/恢复默认"
+    },
+    "updates": {
+      "type": "array",
+      "description": "参数更新列表",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["param", "newValue"],
+        "properties": {
+          "category": {
+            "type": "string",
+            "enum": ["stop_loss", "position", "emergency", "pool", "data", "strategy", "global"],
+            "description": "参数类别"
+          },
+          "param": {
+            "type": "string",
+            "description": "参数名称/路径，如 'risk_management.static_stop_loss_pct'"
+          },
+          "oldValue": {
+            "description": "当前值（更新前自动填充）"
+          },
+          "newValue": {
+            "description": "目标新值"
+          },
+          "reason": {
+            "type": "string",
+            "description": "更新原因说明"
+          },
+          "validRange": {
+            "type": "object",
+            "description": "允许的取值范围（校验用）",
+            "properties": {
+              "min": { "type": "number" },
+              "max": { "type": "number" }
+            }
+          }
+        }
+      }
+    },
+    "restoreDefault": {
+      "type": "boolean",
+      "default": false,
+      "description": "是否恢复所有参数到默认值（true 时忽略 updates 数组）"
+    },
+    "restoreScope": {
+      "type": "string",
+      "enum": ["all", "stop_loss", "position", "emergency", "pool", "strategy"],
+      "description": "恢复默认的范围（仅 restoreDefault=true 时有效）"
+    }
+  },
+  "if": {
+    "properties": { "restoreDefault": { "const": true } }
+  },
+  "then": {
+    "required": ["type", "restoreDefault"]
+  },
+  "else": {
+    "required": ["type", "updates"]
+  }
+}

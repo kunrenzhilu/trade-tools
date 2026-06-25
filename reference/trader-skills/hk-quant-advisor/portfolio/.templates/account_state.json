@@ -1,0 +1,14 @@
+{
+  "total_capital": 0,
+  "available_cash": 0,
+  "total_market_value": 0,
+  "currency": "HKD",
+  "confirmed": false,
+  "last_reconciled": null,
+  "last_updated": null,
+  "daily_realized_pnl": 0,
+  "weekly_realized_pnl": 0,
+  "inception_date": null,
+  "consecutive_unreconciled_days": 0,
+  "risk_preference": "standard"
+}

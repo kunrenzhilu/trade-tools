@@ -68,6 +68,27 @@ class AlpacaBroker:
             )
         return self._client
 
+    def health_check(self) -> dict:
+        """启动自检：验证 API 连通性并返回账户摘要。
+
+        在 dry-run 或启动时调用，比等到第一个信号到来时才发现 API Key 错误更好。
+        """
+        try:
+            client = self._get_client()
+            acct = client.get_account()
+            return {
+                "status": "connected",
+                "account_id": str(acct.id),
+                "cash": float(acct.cash),
+                "buying_power": float(acct.buying_power),
+                "account_status": str(acct.status),
+                "paper": self._paper,
+            }
+        except ImportError:
+            return {"status": "error", "reason": "alpaca-py not installed"}
+        except Exception as e:
+            return {"status": "error", "reason": str(e)}
+
     def submit(self, intent: OrderIntent, df: pd.DataFrame) -> OrderResult:
         """提交订单意图。
 

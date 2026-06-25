@@ -1,0 +1,11 @@
+{
+  "last_full_refresh": "",
+  "last_incremental_refresh": "",
+  "core_pool": [],
+  "watch_pool": [],
+  "pool_stats": {
+    "core_count": 0,
+    "watch_count": 0,
+    "blacklist_count": 0
+  }
+}

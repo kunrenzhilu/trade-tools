@@ -1,3 +1,8 @@
+# System
+.DS_Store
+.claude/
+
+# Python
 .env
 __pycache__/
 *.py[cod]
@@ -6,6 +11,8 @@ dist/
 build/
 .venv/
 venv/
+
+# Data & Caches
 *.parquet
 ~/.mytrader/
 reports/

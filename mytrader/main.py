@@ -159,6 +159,22 @@ def main() -> None:
             )
         else:
             logger.info("[DryRun] Phase4 fallback mode (local DB not loaded)")
+
+        # Alpaca/IBKR 启动自检
+        if config.execution.mode in ("semi_auto", "auto"):
+            try:
+                result = components.broker.health_check()
+                if result["status"] == "connected":
+                    logger.info(
+                        f"[DryRun] Broker connected: id={result['account_id']}, "
+                        f"cash=${result['cash']:,.0f}, buying_power=${result['buying_power']:,.0f}, "
+                        f"paper={result['paper']}"
+                    )
+                else:
+                    logger.error(f"[DryRun] Broker health check FAILED: {result}")
+            except AttributeError:
+                logger.info("[DryRun] Broker does not support health_check (PaperBroker)")
+
         logger.info("Dry-run complete. Exiting.")
         return
 

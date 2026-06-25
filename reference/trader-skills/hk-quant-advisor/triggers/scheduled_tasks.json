@@ -1,0 +1,161 @@
+{
+  "_description": "港股量化交易助手 - 12项定时任务配置。所有时间为香港时间（HKT, UTC+8）",
+  "tasks": [
+    {
+      "id": "trading_day_check",
+      "cron": "30 8 * * 1-5",
+      "timezone": "Asia/Hong_Kong",
+      "action": "check_trading_day",
+      "description": "检查当日是否为港交所交易日（含半日市判断），非交易日进入休眠",
+      "message": "现在是 08:30，请执行交易日检查：\n1. 确认今日是否为港交所交易日（查阅交易日历，考虑公众假期、台风/暴雨停市）\n2. 判断是否为半日市（圣诞前夕、新年前夕、农历新年前夕等）\n3. 如为非交易日 → 通知用户并进入休眠模式，仅保留《下周展望》任务\n4. 如为半日市 → 调整盘中监控和午间复盘时间\n5. 输出交易日确认消息",
+      "skip_on_holiday": false,
+      "priority": "HIGH"
+    },
+    {
+      "id": "pre_market_report",
+      "cron": "45 8 * * 1-5",
+      "timezone": "Asia/Hong_Kong",
+      "action": "send_pre_market_report",
+      "description": "发送《盘前策略报告》：市场立场判定、关键点位、今日观察名单、预设触发价格",
+      "message": "现在是 08:45，请执行盘前策略报告任务：\n1. 执行市场立场判定（恒指与均线关系、VHSI、隔夜外盘评估）\n2. 确定当日仓位系数和可用策略\n3. 计算核心池和观察池标的的关键支撑/阻力位\n4. 扫描所有策略的潜在触发标的，生成今日观察名单\n5. 检查待确认指令（pending_orders.json）状态\n6. 检查汇率变动（离岸人民币兑港币）\n7. 输出完整盘前报告（含今日待办清单）\n按第八章《盘前策略报告》Markdown格式输出",
+      "skip_on_holiday": true,
+      "priority": "HIGH"
+    },
+    {
+      "id": "realtime_monitor",
+      "cron": "*/30 9-16 * * 1-5",
+      "timezone": "Asia/Hong_Kong",
+      "action": "scan_signals_and_refresh_data",
+      "description": "盘中实时监控：每30分钟刷新数据源、扫描策略触发条件、刷新持仓当前价",
+      "message": "盘中定时刷新：\n0. 【时段判断】\n   - IF 当日为半日市（农历新年前夕、中秋节前夕、圣诞前夕、元旦前夕）AND 当前时间 ≥ 12:00 THEN 输出「半日市已收盘，跳过本次监控」→ 直接结束本轮（半日市12:00收盘，午后所有cron触发均应跳过）\n   - IF 当前时间 < 09:30 THEN 仅执行盘前竞价（Pre-Opening Session）数据刷新（步骤1-2），不扫描策略信号（跳过步骤3-7），直接结束本轮\n   - IF 当日为半日市 AND 11:40 ≤ 当前时间 < 12:00 THEN 进入【半日市收盘竞价时段】：仅监控收盘竞价成交情况（刷新持仓最终成交价），不触发任何新交易信号，不执行步骤3-7，直接结束本轮\n   - IF 16:00 ≤ 当前时间 ≤ 16:10 THEN 进入【收盘竞价时段】：仅监控收盘竞价成交情况（刷新持仓最终成交价），不触发任何新交易信号，不执行步骤3-7，直接结束本轮\n   - IF 当前时间 > 16:10 THEN 进入【收盘后数据刷新】：仅刷新收盘定稿数据（最终收盘价、全日成交量、全日VWAP），更新持仓浮动盈亏至收盘价，不执行任何交易操作（步骤3-7全部跳过），直接结束本轮\n1. 刷新所有持仓和观察列表标的的实时行情\n2. 更新技术指标（MA/EMA/MACD/KDJ/RSI/BOLL/ATR/VWAP/OBV）\n3. 扫描四大策略触发条件\n4. 检查所有持仓的止损位（静态/移动/跳空/横盘止损）\n5. 监控恒指跌幅是否触发应急风控\n6. 检查过度交易防护（日交易次数）\n7. 若有信号触发 → 按第八章格式输出交易指令单\n8. 若无信号 → 静默不输出（除非有风险告警）",
+      "skip_on_holiday": true,
+      "half_day_adjust": {
+        "cron": "*/30 9-11 * * 1-5",
+        "description": "半日市时调整为 09:00-11:30（12:00 收盘前最后一个 30 分钟周期于 11:30 触发）"
+      },
+      "priority": "CRITICAL"
+    },
+    {
+      "id": "noon_review",
+      "cron": "15 12 * * 1-5",
+      "timezone": "Asia/Hong_Kong",
+      "action": "send_noon_review",
+      "description": "发送《午间复盘》：上午成交汇总、持仓变动、资金流向更新、下午关注点",
+      "message": "现在是 12:15，请执行午间复盘任务：\n1. 汇总上午成交记录和指令执行情况\n2. 更新持仓浮动盈亏\n3. 检查上午的南向资金流向变化\n4. 分析上午市场结构（放量/缩量、板块轮动）\n5. 列出下午重点关注标的和价位\n6. 检查是否有待回复的指令\n按第八章《午间复盘》Markdown格式输出",
+      "skip_on_holiday": true,
+      "half_day_skip": true,
+      "priority": "MEDIUM"
+    },
+    {
+      "id": "reconciliation_request",
+      "cron": "30 16 * * 1-5",
+      "timezone": "Asia/Hong_Kong",
+      "action": "request_reconciliation",
+      "description": "收盘后输出持仓汇总，请求用户核对",
+      "message": "现在是 16:30，请执行收盘对账任务：\n1. 输出当日持仓汇总表（标的、数量、成本价、现价、盈亏金额、盈亏百分比）\n2. 列出今日所有已执行和未执行的指令\n3. 计算当日账户盈亏\n4. 请求用户核对持仓是否与券商App一致\n5. 如连续3个交易日未对账 → 标红提醒\n按第八章对账格式输出",
+      "skip_on_holiday": true,
+      "half_day_adjust": {
+        "cron": "30 12 * * 1-5",
+        "description": "半日市时持仓对账提前至12:30（正常交易日为16:30）"
+      },
+      "priority": "HIGH"
+    },
+    {
+      "id": "daily_summary",
+      "cron": "0 17 * * 1-5",
+      "timezone": "Asia/Hong_Kong",
+      "action": "send_daily_summary",
+      "description": "发送《收盘总结》：成交记录、持仓盈亏、策略表现、逐笔复盘、错误模式检测",
+      "message": "现在是 17:00，请执行收盘总结任务：\n1. 汇总当日所有成交记录\n2. 输出持仓盈亏明细和账户总盈亏\n3. 对当日每笔交易进行信号回溯分析（买入条件快照、卖出原因、利润捕获率）\n4. 扫描错误模式库（8类错误模式检测）\n5. 更新绩效追踪指标（日盈亏、周收益率、最大回撤、夏普比率）\n6. 检查策略健康度是否需要预警\n7. 输出明日初步关注方向\n按第八章《收盘总结》Markdown格式输出",
+      "skip_on_holiday": true,
+      "half_day_adjust": {
+        "cron": "0 13 * * 1-5",
+        "description": "半日市时收盘总结提前至13:00（正常交易日为17:00）"
+      },
+      "priority": "HIGH"
+    },
+    {
+      "id": "post_market_data",
+      "cron": "30 17 * * 1-5",
+      "timezone": "Asia/Hong_Kong",
+      "action": "fetch_post_market_data",
+      "description": "盘后数据更新：抓取披露易公告、港股通资金流向、卖空数据、CCASS持仓",
+      "message": "现在是 17:30，请执行盘后数据更新任务：\n1. 抓取港交所披露易最新公告（业绩公告、权益披露、回购、供股合股）\n2. 获取港股通当日资金流向和十大活跃股\n3. 获取卖空数据汇总\n4. 获取CCASS券商持仓变动（通过 Browser_Skill 抓取，通常为T+1数据）\n5. 对新公告进行NLP情感分析\n6. 更新本地数据缓存\n7. 如有重大公告影响持仓标的 → 发送即时提醒",
+      "skip_on_holiday": true,
+      "priority": "MEDIUM"
+    },
+    {
+      "id": "daily_watchlist_refresh",
+      "cron": "45 17 * * 1-5",
+      "timezone": "Asia/Hong_Kong",
+      "action": "refresh_watchlist_incremental",
+      "description": "观察池每日增量刷新：更新观察池标的数据，检查晋升/降级条件",
+      "message": "现在是 17:45，请执行观察池每日增量刷新：\n1. 更新观察池所有标的的收盘行情和技术指标\n2. 重新计算观察池标的的基本面评分\n3. 检查是否有标的满足晋升核心池条件（市值达标+成交额达标+评分达标）\n4. 检查是否有标的需要移出观察池（不再满足基本条件）\n5. 检查黑名单是否有实时更新（当日公告触发）\n6. 输出股票池变动摘要",
+      "skip_on_holiday": true,
+      "priority": "LOW"
+    },
+    {
+      "id": "weekly_pool_refresh",
+      "cron": "0 8 * * 1",
+      "timezone": "Asia/Hong_Kong",
+      "action": "refresh_stock_pool",
+      "description": "每周一全量刷新核心池/观察池/黑名单，更新基本面评分卡",
+      "message": "今天是周一 08:00，请执行周度股票池全量刷新任务：\n1. 重新筛选核心池标的（港股通+市值≥80亿+日均成交额≥1500万+基本面≥40+排除条件）\n2. 重新筛选观察池标的（市值30-80亿放量股+新纳入港股通<90日+核心池移出观察期）\n3. 审查黑名单（新增/维持/可能解除）\n4. 更新所有标的的十维基本面评分卡\n5. 输出完整的股票池变动摘要（新增/移出/晋升/降级/黑名单变动）",
+      "skip_on_holiday": true,
+      "priority": "HIGH"
+    },
+    {
+      "id": "weekly_performance_report",
+      "cron": "0 18 * * 5",
+      "timezone": "Asia/Hong_Kong",
+      "action": "send_weekly_report",
+      "description": "每周五发送《周度绩效报告》：策略胜率/盈亏比/贡献度、衰退检测",
+      "message": "今天是周五 18:00，请执行周度绩效报告任务：\n1. 按四大策略分别统计本周胜率、盈亏比、贡献度、期望收益\n2. 给每个策略评定健康度评级（优秀/良好/一般/衰退）\n3. 检查策略衰退条件（连续10笔胜率<30%降权/连续20笔暂停）\n4. 本周交易深度复盘（最佳/最差交易、利润捕获率分析）\n5. 错误模式周度汇总\n6. 更新HIBOR无风险利率\n7. 下周展望和策略重点\n按第八章《周度绩效报告》格式输出",
+      "skip_on_holiday": true,
+      "priority": "HIGH"
+    },
+    {
+      "id": "monthly_optimization_report",
+      "cron": "30 18 25-31 * 5",
+      "timezone": "Asia/Hong_Kong",
+      "action": "send_monthly_optimization",
+      "description": "每月最后一个周五发送《月度策略优化建议报告》",
+      "message": "现在是 18:30，请执行月度策略优化报告前置检查：\n0. 【自检】先判断今天是否为本月最后一个周五（判断方法：取今天的日期 + 7，若结果的月份与今天不同，则今天是本月最后一个周五；否则跳过），如非本月最后一个周五则跳过本次任务，输出「非本月最后一个周五，跳过月度优化报告」并结束\n--- 以下为正式任务 ---\n1. 统计过去60个交易日的账户整体绩效\n2. 对四大策略核心参数进行参数敏感性回测\n3. 分析市场环境与策略匹配度（各市场立场下各策略表现）\n4. 分析止损有效性（按类型统计止损后走势）\n5. 汇总错误模式生命周期（新增/活跃/解除）\n6. 生成参数优化建议（标注confidence等级和autoApply状态）\n7. 输出完整报告，符合 optimization_report.schema.json 格式\n注意：参数优化建议默认 autoApply: false，需用户确认后执行",
+      "skip_on_holiday": true,
+      "note": "Cron表达式 '30 18 25-31 * 5' 意图为每月最后一个周五18:30触发，错开盘后数据更新(17:30)和周度报告(18:00)。注意：由于 cron 标准限制（Vixie cron），同时指定 day-of-month 和 day-of-week 时两者为 OR 关系，即 '25-31 * 5' 实际会在每月25-31日或每个周五触发，因此 message 中第 0 步的自检逻辑（判断是否为本月最后一个周五）是必要的应用层过滤",
+      "priority": "MEDIUM"
+    },
+    {
+      "id": "weekly_outlook",
+      "cron": "0 20 * * 0",
+      "timezone": "Asia/Hong_Kong",
+      "action": "send_weekly_outlook",
+      "description": "周日晚发送《下周展望》简报：下周重要事件、财报日历、技术面关键位",
+      "message": "今天是周日 20:00，请执行下周展望简报任务：\n1. 整理下周重要宏观事件日历（央行议息、经济数据发布、政策会议等）\n2. 整理下周港股财报发布日历（重点关注持仓和观察池标的）\n3. 标注期权到期日等衍生品事件\n4. 分析恒指及核心持仓标的的技术面关键支撑/阻力位\n5. 提出下周策略重点方向和仓位计划建议\n6. 如有持仓标的下周有重大事件 → 特别提醒\n按简报格式输出",
+      "skip_on_holiday": false,
+      "priority": "LOW"
+    }
+  ],
+  "global_settings": {
+    "skip_non_trading_days": true,
+    "trading_calendar_source": "hkex_official",
+    "half_day_detection": true,
+    "typhoon_suspension_check": true,
+    "notification_retry": {
+      "max_retries": 3,
+      "retry_interval_sec": 60,
+      "cache_on_failure": true,
+      "resend_on_reconnect": true
+    },
+    "emergency_dual_channel": {
+      "enabled": true,
+      "description": "应急风控触发时，通过主通道和备用通道双发紧急通知",
+      "trigger_conditions": [
+        "恒指急跌触发减仓/清仓",
+        "单日亏损>3%熔断",
+        "数据源全部失效",
+        "港交所紧急停市"
+      ]
+    }
+  }
+}

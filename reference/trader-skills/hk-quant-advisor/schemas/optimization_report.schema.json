@@ -1,0 +1,186 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "HK Quant Advisor - Monthly Optimization Report",
+  "description": "港股量化交易助手的月度策略优化建议报告 Schema",
+  "type": "object",
+  "required": ["version", "type", "generatedAt", "period", "totalTrades", "accountPerformance", "optimizationSuggestions"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "type": {
+      "type": "string",
+      "enum": ["MONTHLY_OPTIMIZATION_REPORT"]
+    },
+    "generatedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "报告生成时间"
+    },
+    "period": {
+      "type": "string",
+      "description": "统计区间，如 '2026-02-14 ~ 2026-03-14'"
+    },
+    "totalTrades": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "统计区间内总交易笔数"
+    },
+    "accountPerformance": {
+      "type": "object",
+      "description": "账户整体绩效",
+      "required": ["periodReturn", "maxDrawdown", "sharpeRatio", "winRate", "profitLossRatio"],
+      "properties": {
+        "periodReturn": { "type": "string", "description": "区间总收益率" },
+        "maxDrawdown": { "type": "string", "description": "区间最大回撤" },
+        "sharpeRatio": { "type": "number", "description": "区间夏普比率" },
+        "winRate": { "type": "string", "description": "综合胜率" },
+        "profitLossRatio": { "type": "number", "description": "综合盈亏比" },
+        "totalFees": { "type": "string", "description": "总交易费用" },
+        "benchmarkReturn": { "type": "string", "description": "恒指同期收益率（基准）" },
+        "alpha": { "type": "string", "description": "超额收益" }
+      }
+    },
+    "strategyBreakdown": {
+      "type": "array",
+      "description": "各策略详细表现",
+      "items": {
+        "type": "object",
+        "properties": {
+          "strategy": { "type": "string" },
+          "trades": { "type": "integer" },
+          "winRate": { "type": "string" },
+          "profitLossRatio": { "type": "number" },
+          "contribution": { "type": "string" },
+          "healthRating": { "type": "string", "enum": ["EXCELLENT", "GOOD", "FAIR", "DECLINING"] },
+          "status": { "type": "string", "enum": ["ACTIVE", "REDUCED", "SUSPENDED"] },
+          "avgHoldingDays": { "type": "number" },
+          "bestTrade": { "type": "string" },
+          "worstTrade": { "type": "string" }
+        }
+      }
+    },
+    "optimizationSuggestions": {
+      "type": "array",
+      "description": "参数优化建议列表",
+      "items": {
+        "type": "object",
+        "required": ["id", "target", "currentValue", "suggestedValue", "reason", "confidence", "autoApply"],
+        "properties": {
+          "id": { "type": "string", "description": "建议编号，如 OPT-202603-001" },
+          "target": { "type": "string", "description": "目标参数路径，如 '策略一.VR_threshold'" },
+          "currentValue": { "description": "当前参数值" },
+          "suggestedValue": { "description": "建议调整到的值" },
+          "reason": { "type": "string", "description": "建议原因及数据支撑" },
+          "confidence": {
+            "type": "string",
+            "enum": ["HIGH", "MEDIUM", "LOW"],
+            "description": "HIGH=连续3月一致且提升>20% / MEDIUM=连续2月一致且提升>15% / LOW=仅当月数据"
+          },
+          "autoApply": {
+            "type": "boolean",
+            "default": false,
+            "description": "是否自动执行（默认false，需用户确认）"
+          },
+          "backtestData": {
+            "type": "object",
+            "description": "回测对比数据",
+            "properties": {
+              "currentWinRate": { "type": "string" },
+              "optimizedWinRate": { "type": "string" },
+              "currentPnlRatio": { "type": "number" },
+              "optimizedPnlRatio": { "type": "number" },
+              "sampleSize": { "type": "integer" }
+            }
+          }
+        }
+      }
+    },
+    "errorPatternsSummary": {
+      "type": "object",
+      "description": "错误模式月度汇总",
+      "properties": {
+        "activePatterns": { "type": "integer", "description": "活跃错误模式数" },
+        "resolvedPatterns": { "type": "integer", "description": "本月解除的模式数" },
+        "newPatterns": { "type": "integer", "description": "本月新发现的模式数" },
+        "topIssue": { "type": "string", "description": "最高频的错误模式描述" },
+        "details": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "type": { "type": "string" },
+              "status": { "type": "string", "enum": ["active", "resolved", "new"] },
+              "triggerCount": { "type": "integer" },
+              "correction": { "type": "string" },
+              "impact": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "marketStrategyFit": {
+      "type": "object",
+      "description": "市场环境-策略匹配度分析",
+      "properties": {
+        "marketPhases": {
+          "type": "array",
+          "description": "各市场立场阶段天数",
+          "items": {
+            "type": "object",
+            "properties": {
+              "stance": { "type": "string" },
+              "days": { "type": "integer" },
+              "pctOfPeriod": { "type": "string" }
+            }
+          }
+        },
+        "bestPerforming": { "type": "string", "description": "最佳策略-环境组合" },
+        "worstPerforming": { "type": "string", "description": "最差策略-环境组合" },
+        "recommendations": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "匹配度优化建议"
+        }
+      }
+    },
+    "stopLossAnalysis": {
+      "type": "object",
+      "description": "止损有效性分析",
+      "properties": {
+        "totalStopLossTrades": { "type": "integer" },
+        "effectiveRate": { "type": "string", "description": "止损有效率（止损后继续下跌的比例）" },
+        "overSensitiveRate": { "type": "string", "description": "过敏率（止损后反弹回成本价的比例）" },
+        "byType": {
+          "type": "array",
+          "description": "按止损类型分析",
+          "items": {
+            "type": "object",
+            "properties": {
+              "type": { "type": "string", "enum": ["STATIC", "TRAILING", "GAP", "FLAT", "TIME"] },
+              "count": { "type": "integer" },
+              "effectiveRate": { "type": "string" },
+              "avgPostStopChange5d": { "type": "string" }
+            }
+          }
+        },
+        "recommendation": { "type": "string" }
+      }
+    },
+    "userActions": {
+      "type": "object",
+      "description": "需要用户操作的事项",
+      "properties": {
+        "pendingSuggestions": {
+          "type": "integer",
+          "description": "待确认的优化建议数"
+        },
+        "instructions": {
+          "type": "string",
+          "description": "操作提示，如'回复 \"采纳 OPT-202603-001\" 或 \"拒绝 OPT-202603-001 原因: xxx\"'"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,284 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "HK Quant Advisor - Trade Order",
+  "description": "港股量化交易助手的标准化交易指令单 Schema",
+  "type": "object",
+  "required": ["version", "type", "timestamp", "marketStance", "positionCoefficient", "accountStatus", "orders"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "const": "1.0",
+      "description": "指令单版本号"
+    },
+    "type": {
+      "type": "string",
+      "enum": ["TRADE_ORDER"],
+      "description": "消息类型"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "指令单生成时间（ISO 8601格式，含时区）"
+    },
+    "marketStance": {
+      "type": "string",
+      "enum": ["AGGRESSIVE_BULL", "CAUTIOUS_BULL", "NEUTRAL", "DEFENSIVE"],
+      "description": "市场立场：激进做多/谨慎做多/中性观望/持币防守"
+    },
+    "positionCoefficient": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 0.9,
+      "description": "总仓位系数，由市场立场决定（0表示空仓）"
+    },
+    "accountStatus": {
+      "type": "string",
+      "enum": ["NORMAL", "CIRCUIT_BREAKER", "EMERGENCY", "SUSPENDED"],
+      "description": "账户状态：正常/熔断/紧急/暂停"
+    },
+    "dailyPnL": {
+      "type": "string",
+      "description": "当日盈亏百分比，如 '+1.2%' 或 '-0.8%'"
+    },
+    "cashRatio": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "当前现金比例"
+    },
+    "dataSourceStatus": {
+      "type": "object",
+      "description": "数据源健康状态",
+      "properties": {
+        "primary": {
+          "type": "string",
+          "enum": ["westock-data", "tecent-finance", "yahoo-finance", "akshare-finance", "tushare-finance", "finance"],
+          "description": "当前主数据源 Skill 名称"
+        },
+        "primaryHealth": {
+          "type": "string",
+          "enum": ["OK", "DEGRADED", "FAIL"],
+          "description": "主数据源健康度"
+        },
+        "fallbackActive": {
+          "type": "boolean",
+          "description": "是否已切换到备用源"
+        },
+        "lastUpdate": {
+          "type": "string",
+          "format": "date-time",
+          "description": "数据最后更新时间"
+        },
+        "availableSkills": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "当前可用的数据源 Skill 列表"
+        }
+      }
+    },
+    "orders": {
+      "type": "array",
+      "description": "交易指令列表",
+      "items": {
+        "type": "object",
+        "required": ["action", "ticker", "name", "strategy", "orderType", "quantity", "rationale"],
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["BUY", "SELL"],
+            "description": "买入或卖出"
+          },
+          "ticker": {
+            "type": "string",
+            "pattern": "^[0-9]{5}\\.HK$",
+            "description": "港股代码，如 00700.HK。系统在校验前会自动将各数据源返回的代码补零规范化为 5 位格式（如 '700.HK' → '00700.HK'、'0700.HK' → '00700.HK'）"
+          },
+          "name": {
+            "type": "string",
+            "description": "股票中文名称"
+          },
+          "strategy": {
+            "type": "string",
+            "enum": [
+              "TREND_BREAKOUT",
+              "PULLBACK_BUY",
+              "EVENT_DRIVEN",
+              "EXTREME_REVERSAL",
+              "TRAILING_STOP",
+              "STATIC_STOP",
+              "GAP_STOP",
+              "TIME_STOP",
+              "FLAT_STOP",
+              "EMERGENCY_RISK",
+              "MANUAL"
+            ],
+            "description": "策略来源"
+          },
+          "strategyDetail": {
+            "type": "string",
+            "description": "策略子类说明，如'业绩超预期'或'回购驱动'"
+          },
+          "targetPositionPct": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 0.20,
+            "description": "目标仓位占比"
+          },
+          "priceRange": {
+            "type": "object",
+            "description": "建议买入/卖出价格区间",
+            "properties": {
+              "low": { "type": "number", "minimum": 0 },
+              "high": { "type": "number", "minimum": 0 }
+            }
+          },
+          "orderType": {
+            "type": "string",
+            "enum": ["LIMIT", "MARKET", "ICEBERG"],
+            "description": "委托类型：限价/市价/冰山"
+          },
+          "limitPrice": {
+            "type": "number",
+            "minimum": 0,
+            "description": "限价单委托价格"
+          },
+          "quantity": {
+            "oneOf": [
+              { "type": "integer", "minimum": 1 },
+              { "type": "string", "const": "ALL" }
+            ],
+            "description": "委托数量（股数）或 ALL 表示全部卖出"
+          },
+          "lotSize": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "每手股数（港股不同标的手数不同）"
+          },
+          "staticStopLoss": {
+            "type": "number",
+            "minimum": 0,
+            "description": "静态止损价格"
+          },
+          "trailingStop": {
+            "type": "object",
+            "description": "移动止损参数",
+            "properties": {
+              "activationPct": { "type": "number", "description": "激活浮盈百分比" },
+              "trailPct": { "type": "number", "description": "回撤止损百分比" },
+              "currentStopPrice": { "type": "number", "description": "当前止损价（只升不降）" }
+            }
+          },
+          "timeoutMinutes": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "指令有效期（分钟），超时自动过期"
+          },
+          "fundamentalScore": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "基本面评分"
+          },
+          "expectedReturn": {
+            "type": "string",
+            "description": "预期收益率，如 '+8%~+12%'"
+          },
+          "riskRewardRatio": {
+            "type": "number",
+            "description": "风险收益比"
+          },
+          "conditionsMet": {
+            "type": "object",
+            "description": "策略各子条件达成状态及具体数值",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "met": { "type": "boolean" },
+                "value": {},
+                "threshold": {},
+                "description": { "type": "string" }
+              }
+            }
+          },
+          "batchInfo": {
+            "type": "object",
+            "description": "分批建仓信息（策略四专用）",
+            "properties": {
+              "batchNumber": { "type": "integer", "description": "第几批" },
+              "totalBatches": { "type": "integer", "description": "总批次数" },
+              "batchPct": { "type": "number", "description": "本批占比" }
+            }
+          },
+          "rationale": {
+            "type": "string",
+            "description": "买卖理由的自然语言说明"
+          },
+          "urgency": {
+            "type": "string",
+            "enum": ["NORMAL", "HIGH", "CRITICAL"],
+            "description": "紧急程度：普通/高/紧急"
+          }
+        }
+      }
+    },
+    "watchlist": {
+      "type": "array",
+      "description": "观察列表（接近触发但未达条件的标的）",
+      "items": {
+        "type": "object",
+        "required": ["ticker", "condition"],
+        "properties": {
+          "ticker": { "type": "string", "pattern": "^[0-9]{5}\\.HK$", "description": "港股代码（系统在校验前自动补零规范化为 5 位格式）" },
+          "name": { "type": "string" },
+          "strategy": { "type": "string" },
+          "condition": { "type": "string", "description": "还差什么条件" },
+          "currentPrice": { "type": "number" },
+          "targetPrice": { "type": "number" },
+          "progressPct": { "type": "number", "description": "条件达成进度百分比" },
+          "daysWatching": { "type": "integer" }
+        }
+      }
+    },
+    "riskAlerts": {
+      "type": "object",
+      "description": "风险告警信息",
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": ["NORMAL", "WARNING", "CRITICAL"],
+          "description": "整体风险等级"
+        },
+        "macroEvents": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "宏观风险事件"
+        },
+        "vhsi": { "type": "number", "description": "恒指波幅指数" },
+        "hsiChange": { "type": "string", "description": "恒指当日涨跌幅" },
+        "hsiRsi14": { "type": "number", "description": "恒指RSI(14)" },
+        "fxCnhHkd": { "type": "number", "description": "离岸人民币兑港币汇率" },
+        "fxWeeklyChange": { "type": "string", "description": "汇率周变动" },
+        "circuitBreakerTriggered": { "type": "boolean" },
+        "activeErrorPatterns": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "当前生效的错误模式纠正措施"
+        }
+      }
+    },
+    "performanceSummary": {
+      "type": "object",
+      "description": "绩效摘要",
+      "properties": {
+        "dailyReturn": { "type": "string" },
+        "weeklyReturn": { "type": "string" },
+        "maxDrawdown20d": { "type": "string" },
+        "sharpe60d": { "type": "number" },
+        "totalPositionPct": { "type": "number" },
+        "cashPct": { "type": "number" },
+        "openPositionsCount": { "type": "integer" },
+        "todayTradesCount": { "type": "integer" }
+      }
+    }
+  }
+}

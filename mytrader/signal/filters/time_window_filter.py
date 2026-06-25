@@ -40,6 +40,9 @@ class TimeWindowFilter:
 
     def apply(self, signal: Signal, df: pd.DataFrame) -> FilteredSignal:
         ts = signal.timestamp
+        # 去掉 timezone，避免与 naive datetime 比较时报错
+        if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+            ts = ts.replace(tzinfo=None)
         signal_time = ts.time()
 
         # 如果时间恰好是午夜（日线数据），直接放行

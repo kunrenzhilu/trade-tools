@@ -137,8 +137,13 @@ class UniverseManager:
         """从 CSV 或内置迷你列表加载成分股。"""
         if self._universe_file and self._universe_file.exists():
             records = load_from_csv(self._universe_file)
+            if not records:
+                logger.warning(
+                    f"[universe] universe.csv found but empty ({self._universe_file.stat().st_size} bytes), "
+                    f"falling back to builtin list"
+                )
+                records = self._builtin_universe()
         else:
-            # 最小内置列表（供测试 / 首次启动用）
             records = self._builtin_universe()
             logger.info(
                 f"[universe] no universe.csv found, using builtin {len(records)} symbols"

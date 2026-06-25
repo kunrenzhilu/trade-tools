@@ -28,6 +28,10 @@ dependencies = [
     "pydantic-settings>=2.6.0",
     "PyYAML>=6.0.1",
 
+    # ── Data (web scraping for constituents) ───────────────────────────
+    "lxml>=5.0.0",               # pd.read_html 需要（Wikipedia 成分股抓取）
+    "html5lib>=1.1",             # pd.read_html fallback parser
+
     # ── Persistence ───────────────────────────────────────────────────
     "sqlalchemy>=2.0",           # SQLite 持仓记录 + MarketDataStore
 

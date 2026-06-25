@@ -98,7 +98,19 @@ class SignalPipeline:
         result = FilterResult(original_signal_count=len(signals))
         passed: list[FilteredSignal] = []
 
+        # 统一 df.index 为 tz-naive，避免各过滤器中 datetime 比较报错
+        # （MarketDataStore 读出的 index 是 tz-naive datetime64[ns]，
+        #  但 signal.timestamp 可能是 tz-aware datetime）
+        if hasattr(df.index, 'tz') and df.index.tz is not None:
+            df = df.copy()
+            df.index = df.index.tz_localize(None)
+
         for signal in signals:
+            # 将 signal.timestamp 转为与 df.index 兼容的 tz-naive
+            ts = signal.timestamp
+            if ts is not None and hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+                signal.timestamp = ts.replace(tzinfo=None)
+
             current = signal
             rejected = False
 
@@ -108,9 +120,7 @@ class SignalPipeline:
                     result.record_filtered(fs.rejected_by or f.name)
                     rejected = True
                     break
-                # 将通过的 FilteredSignal.source_signal 传给下一个过滤器
-                # 注意：各过滤器的 apply 接收原始 Signal
-                current = signal  # 仍传原始 signal，每个过滤器独立判断
+                current = signal
 
             if not rejected:
                 result.passed_count += 1

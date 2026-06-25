@@ -208,6 +208,47 @@ class SchedulerConfig(BaseSettings):
 
 
 # ---------------------------------------------------------------------------
+# Phase 5 配置块
+# ---------------------------------------------------------------------------
+
+class UniverseConfig(BaseSettings):
+    """标的池管理配置。"""
+    model_config = SettingsConfigDict(extra="ignore")
+    file: str = "config/universe.csv"
+    refresh_monthly: bool = True
+    volatility_lookback_days: int = 60
+
+
+class StrategyMatrixConfig(BaseSettings):
+    """策略矩阵运行器配置。"""
+    model_config = SettingsConfigDict(extra="ignore")
+    weights_file: str = "config/strategy_weights.json"
+    signal_valid_bars: int = 3
+
+
+class SignalRankerConfig(BaseSettings):
+    """信号排名器配置。"""
+    model_config = SettingsConfigDict(extra="ignore")
+    top_k: int = 5
+    candidates_multiplier: int = 2
+    conflict_threshold: float = 0.3
+
+
+class MarketDataStoreConfig(BaseSettings):
+    """本地时序库配置。"""
+    model_config = SettingsConfigDict(extra="ignore")
+    db_url: str = "sqlite:///mytrader_data.db"
+    sync_time_et: str = "16:30"
+
+
+class OvernightRiskConfig(BaseSettings):
+    """隔夜风险管理配置。"""
+    model_config = SettingsConfigDict(extra="ignore")
+    earnings_exit_days_before: int = 1
+    vix_high_threshold: int = 30
+
+
+# ---------------------------------------------------------------------------
 # 顶层 AppConfig
 # ---------------------------------------------------------------------------
 
@@ -237,6 +278,13 @@ class AppConfig(BaseSettings):
 
     # Phase 4 新增子配置
     watchlist: WatchlistConfig = Field(default_factory=WatchlistConfig)
+
+    # Phase 5 新增子配置
+    universe: UniverseConfig = Field(default_factory=UniverseConfig)
+    strategy_matrix: StrategyMatrixConfig = Field(default_factory=StrategyMatrixConfig)
+    signal_ranker: SignalRankerConfig = Field(default_factory=SignalRankerConfig)
+    market_data_store: MarketDataStoreConfig = Field(default_factory=MarketDataStoreConfig)
+    overnight_risk: OvernightRiskConfig = Field(default_factory=OvernightRiskConfig)
 
     @field_validator("risk", mode="before")
     @classmethod

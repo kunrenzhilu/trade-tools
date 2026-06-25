@@ -7,6 +7,7 @@
   - semi_auto: AlpacaBroker(mode="semi_auto")（推送通知，人工确认）
   - auto:      AlpacaBroker(mode="auto") 或 IBKRBroker(mode="auto")
 - 测试友好：支持注入 mock 依赖
+- Phase 5：装配 MarketDataStore + UniverseManager + StrategyMatrixRunner + SignalRanker
 """
 
 from __future__ import annotations
@@ -31,13 +32,17 @@ class AppComponents:
     """所有装配完毕的应用组件。
 
     Attributes:
-        config:       全局配置
-        bus:          事件总线
-        broker:       当前模式对应的经纪商
-        tracker:      持仓追踪器
-        notification: 通知服务
-        health:       健康检查器
-        persistence:  数据库持久化（可选）
+        config:         全局配置
+        bus:            事件总线
+        broker:         当前模式对应的经纪商
+        tracker:        持仓追踪器
+        notification:   通知服务
+        health:         健康检查器
+        persistence:    数据库持久化（可选）
+        data_store:     MarketDataStore（Phase 5 本地时序库）
+        universe:       UniverseManager（Phase 5 标的池）
+        matrix_runner:  StrategyMatrixRunner（Phase 5 多策略扫描）
+        signal_ranker:  SignalRanker（Phase 5 信号聚合排名）
     """
 
     config: AppConfig
@@ -47,6 +52,12 @@ class AppComponents:
     notification: NotificationService
     health: HealthChecker
     persistence: PortfolioPersistence | None = None
+
+    # Phase 5 模块（可选，纸面模式时可为 None）
+    data_store: Any = None                # MarketDataStore
+    universe: Any = None                  # UniverseManager
+    matrix_runner: Any = None             # StrategyMatrixRunner
+    signal_ranker: Any = None             # SignalRanker
 
 
 class Container:
@@ -64,6 +75,7 @@ class Container:
         *,
         broker_override: BrokerProtocol | None = None,
         db_url: str = "sqlite:///mytrader.db",
+        build_phase5: bool = True,
     ) -> AppComponents:
         """装配所有模块依赖。
 
@@ -71,13 +83,14 @@ class Container:
             config:          AppConfig（None 时自动加载）
             broker_override: 注入自定义 Broker（测试用）
             db_url:          SQLite 路径（":memory:" 用于测试）
+            build_phase5:    是否装配 Phase 5 模块（测试时可关闭）
         """
         if config is None:
             config = load_config()
 
         logger.info(
             f"Container.build: mode={config.execution.mode}, "
-            f"broker={config.execution.broker}"
+            f"broker={config.execution.broker}, phase5={build_phase5}"
         )
 
         # 1. 基础设施
@@ -107,9 +120,24 @@ class Container:
             persistence=persistence,
         )
 
-        # 6. 健康检查器（注册基本检查项）
+        # 6. 健康检查器
         health = HealthChecker()
         health.register_data_feed()
+
+        # 7. Phase 5 模块（可选）
+        data_store = None
+        universe = None
+        matrix_runner = None
+        signal_ranker = None
+
+        if build_phase5:
+            try:
+                data_store, universe, matrix_runner, signal_ranker = (
+                    Container._build_phase5_modules(config)
+                )
+            except Exception as exc:
+                logger.warning(f"Container: Phase 5 modules init failed ({exc}), "
+                             f"falling back to Phase 4 single-strategy mode")
 
         logger.info("Container.build complete")
         return AppComponents(
@@ -120,6 +148,10 @@ class Container:
             notification=notification,
             health=health,
             persistence=persistence,
+            data_store=data_store,
+            universe=universe,
+            matrix_runner=matrix_runner,
+            signal_ranker=signal_ranker,
         )
 
     @staticmethod
@@ -171,3 +203,61 @@ class Container:
             slippage_pct=config.execution.slippage_pct,
             commission_pct=config.execution.commission_pct,
         )
+
+    @staticmethod
+    def _build_phase5_modules(config: AppConfig) -> tuple:
+        """装配 Phase 5 模块：MarketDataStore + UniverseManager + MatrixRunner + SignalRanker。
+
+        Returns:
+            (data_store, universe, matrix_runner, signal_ranker)
+        """
+        from mytrader.data.store import MarketDataStore
+        from mytrader.universe.manager import UniverseManager
+        from mytrader.strategy.matrix_runner import StrategyMatrixRunner
+        from mytrader.signal.ranker import SignalRanker
+
+        # 1. 本地时序库
+        # db_url 为空或 "default" 时使用 MarketDataStore 默认路径（~/.mytrader/market_data.db）
+        store_db_url = config.market_data_store.db_url
+        if store_db_url.startswith("sqlite:///"):
+            store_db = store_db_url[len("sqlite:///"):]
+        else:
+            store_db = store_db_url
+        # 空字符串或 "default" → 使用默认路径
+        db_path = store_db if store_db and store_db != "default" else None
+        data_store = MarketDataStore(db_path=db_path)
+        logger.info(f"Container: MarketDataStore loaded ({data_store._db_path})")
+
+        # 2. 标的池管理器
+        universe = UniverseManager(
+            store=data_store,
+            universe_file=config.universe.file,
+            volatility_lookback_days=config.universe.volatility_lookback_days,
+        )
+        # ⚠️ 必须计算波动率分层，否则所有标的 group_id = UNKNOWN，匹配不到策略权重
+        logger.info(f"Container: UniverseManager ({len(universe.get_universe())} symbols), computing volatility tiers...")
+        universe.recompute_volatility_tiers(max_workers=8)
+        groups = universe.get_groups()
+        logger.info(f"Container: UniverseManager groups: {list(groups.keys())}")
+
+        # 3. 策略矩阵运行器
+        matrix_runner = StrategyMatrixRunner(
+            store=data_store,
+            universe=universe,
+            weights_file=config.strategy_matrix.weights_file,
+            signal_valid_bars=config.strategy_matrix.signal_valid_bars,
+        )
+        logger.info(f"Container: StrategyMatrixRunner (valid_bars={config.strategy_matrix.signal_valid_bars})")
+
+        # 4. 信号排名器
+        signal_ranker = SignalRanker(
+            top_k=config.signal_ranker.top_k,
+            candidates_multiplier=config.signal_ranker.candidates_multiplier,
+            conflict_threshold=config.signal_ranker.conflict_threshold,
+        )
+        logger.info(f"Container: SignalRanker (top_k={config.signal_ranker.top_k})")
+
+        # 确保策略注册表已填充
+        import mytrader.strategy.strategies  # noqa: F401
+
+        return data_store, universe, matrix_runner, signal_ranker

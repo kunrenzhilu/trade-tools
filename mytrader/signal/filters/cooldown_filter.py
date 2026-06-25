@@ -42,9 +42,25 @@ class CooldownFilter:
             return FilteredSignal(source_signal=signal, passed=True)
 
         # 计算信号时间戳对应的 bar 位置
+        # df.index 可能是 tz-naive 或 tz-aware；signal.timestamp 同理。统一转为 tz-naive 比较。
         all_idx = df.index
-        signal_idx = all_idx[all_idx <= signal.timestamp]
-        last_idx = all_idx[all_idx <= last_ts]
+
+        # 若 df.index 是 tz-aware，先去掉 tz
+        if hasattr(all_idx, 'tz') and all_idx.tz is not None:
+            all_idx = all_idx.tz_localize(None)
+
+        def _to_naive(ts):
+            if ts is None:
+                return None
+            if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+                return ts.replace(tzinfo=None)
+            return ts
+
+        sig_ts = _to_naive(signal.timestamp)
+        last_ts_cmp = _to_naive(last_ts)
+
+        signal_idx = all_idx[all_idx <= sig_ts]
+        last_idx = all_idx[all_idx <= last_ts_cmp]
 
         if signal_idx.empty or last_idx.empty:
             # 找不到对应 bar，放行

@@ -1,0 +1,82 @@
+{
+  "_meta": {
+    "generated_at": "2026-06-24T15:32:45.131138+00:00",
+    "backtest_window": "2021-06-25 ~ 2026-06-24",
+    "reoptimize_freq": "monthly",
+    "survivorship_bias_warning": "使用当前成分股回测，S&P 500 5年成分变动约100只(~20%)，均值回归组(SPX_low_vol)结果可能系统性偏高"
+  },
+  "groups": {
+    "SPX_mid_vol": [
+      {
+        "strategy": "dual_ma",
+        "params": {
+          "fast": 10,
+          "slow": 40
+        },
+        "weight": 1.0,
+        "backtest_sharpe": 0.2321,
+        "backtest_win_rate": 0.3851
+      }
+    ],
+    "SPX_high_vol": [
+      {
+        "strategy": "dual_ma",
+        "params": {
+          "fast": 10,
+          "slow": 40
+        },
+        "weight": 1.0,
+        "backtest_sharpe": 0.6038,
+        "backtest_win_rate": 0.3885
+      }
+    ],
+    "NDX_high_vol": [
+      {
+        "strategy": "dual_ma",
+        "params": {
+          "fast": 5,
+          "slow": 60
+        },
+        "weight": 1.0,
+        "backtest_sharpe": 0.9489,
+        "backtest_win_rate": 0.3549
+      }
+    ],
+    "SPX_low_vol": [
+      {
+        "strategy": "dual_ma",
+        "params": {
+          "fast": 5,
+          "slow": 20
+        },
+        "weight": 1.0,
+        "backtest_sharpe": 0.0727,
+        "backtest_win_rate": 0.3158
+      }
+    ],
+    "NDX_mid_vol": [
+      {
+        "strategy": "dual_ma",
+        "params": {
+          "fast": 10,
+          "slow": 40
+        },
+        "weight": 1.0,
+        "backtest_sharpe": 0.5161,
+        "backtest_win_rate": 0.4299
+      }
+    ],
+    "NDX_low_vol": [
+      {
+        "strategy": "dual_ma",
+        "params": {
+          "fast": 10,
+          "slow": 20
+        },
+        "weight": 1.0,
+        "backtest_sharpe": 0.1077,
+        "backtest_win_rate": 0.4194
+      }
+    ]
+  }
+}

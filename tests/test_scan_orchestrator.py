@@ -462,27 +462,45 @@ class TestSyncRiskState:
 
 class TestBuildOrchestrator:
     def test_build_with_yfinance(self):
-        """yfinance 模式正确构建 Orchestrator。"""
+        """默认配置正确构建 Orchestrator（Phase 5 模式）。"""
         from mytrader.infra.config import load_config
         from mytrader.infra.container import Container
 
         config = load_config()
-        components = Container.build(config, db_url=":memory:")
+        components = Container.build(config, db_url=":memory:", build_phase5=True)
 
         orch = build_orchestrator(components)
         assert isinstance(orch, ScanOrchestrator)
+        # Phase 5 模式时 _provider 是 MarketDataStore
+        assert orch._use_phase5 is True
 
     def test_build_uses_alpaca_provider_when_configured(self):
-        """data.provider='alpaca' 时使用 AlpacaDataProvider。"""
+        """Phase 4 降级模式时，data.provider='alpaca' 使用 AlpacaDataProvider。"""
         from mytrader.infra.config import load_config
         from mytrader.infra.container import Container
 
         config = load_config()
-        # 覆盖 provider
         object.__setattr__(config.data, "provider", "alpaca")
 
-        components = Container.build(config, db_url=":memory:")
+        # Phase 4 模式：关闭 Phase 5 模块装配
+        components = Container.build(config, db_url=":memory:", build_phase5=False)
         orch = build_orchestrator(components)
 
         from mytrader.data.providers.alpaca_provider import AlpacaDataProvider
         assert isinstance(orch._provider, AlpacaDataProvider)
+
+    def test_build_phase5_uses_market_data_store(self):
+        """Phase 5 模式时，_provider 是 MarketDataStore。"""
+        from mytrader.infra.config import load_config
+        from mytrader.infra.container import Container
+
+        config = load_config()
+        components = Container.build(config, db_url=":memory:", build_phase5=True)
+        orch = build_orchestrator(components)
+
+        assert orch._use_phase5 is True
+        from mytrader.data.store.market_data_store import MarketDataStore
+        assert isinstance(orch._provider, MarketDataStore)
+        assert orch._universe is not None
+        assert orch._matrix_runner is not None
+        assert orch._signal_ranker is not None

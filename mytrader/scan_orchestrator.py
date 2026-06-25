@@ -122,6 +122,12 @@ class ScanOrchestrator:
         self._tracker = tracker
         self._notification = notification
 
+        # Phase 5 专属依赖（由 build_orchestrator 注入）
+        self._use_phase5: bool = False
+        self._universe: Any = None
+        self._matrix_runner: Any = None
+        self._signal_ranker: Any = None
+
     # ------------------------------------------------------------------
     # Public 扫描入口
     # ------------------------------------------------------------------
@@ -164,10 +170,12 @@ class ScanOrchestrator:
     # ------------------------------------------------------------------
 
     def _run_scan(self, scan_type: str) -> ScanSummary:
-        """盘前/盘中通用扫描逻辑。"""
-        # 1. 同步 RiskManager 持仓状态
-        self._sync_risk_state()
+        """盘前/盘中扫描：Phase 5 链路或 Phase 4 降级。"""
+        if self._use_phase5 and self._matrix_runner is not None:
+            return self._run_scan_phase5(scan_type)
 
+        # Phase 4 降级
+        self._sync_risk_state()
         symbols = self._cfg.watchlist.symbols
         lookback = self._cfg.watchlist.lookback_days
         summary = ScanSummary(scan_type=scan_type)
@@ -177,6 +185,192 @@ class ScanOrchestrator:
             summary.results.append(result)
 
         return summary
+
+    def _run_scan_phase5(self, scan_type: str) -> ScanSummary:
+        """Phase 5 链路：MarketDataStore → MatrixRunner → SignalRanker → CandidateSelector → Broker。
+
+        数据流：
+            1. StrategyMatrixRunner.run() 扫全标的池 → M×N 条 Signal
+            2. SignalRanker.rank() 聚合 + Top-2K 候选
+            3. CandidateSelector 递补选出 ≤K 个订单
+            4. 每张订单经过 SignalFilter + RiskManager → Broker.submit()
+        """
+        self._sync_risk_state()
+        summary = ScanSummary(scan_type=scan_type)
+        lookback = self._cfg.watchlist.lookback_days
+
+        # Step 1: 矩阵扫描
+        logger.info(f"[Phase5] Matrix scan: {len(self._universe.get_universe())} symbols...")
+        scan_result = self._matrix_runner.run(lookback_days=lookback, max_workers=4)
+        logger.info(
+            f"[Phase5] Scan done: {scan_result.symbol_count} symbols → "
+            f"{len(scan_result.signals)} raw signals "
+            f"({len(scan_result.buy_signals)} BUY, {len(scan_result.sell_signals)} SELL)"
+        )
+
+        if not scan_result.signals:
+            logger.info("[Phase5] No signals today")
+            return summary
+
+        # Step 2: 排名 + Top-2K 候选
+        ranking = self._signal_ranker.rank(scan_result.signals)
+        logger.info(
+            f"[Phase5] Ranker: {ranking.total_candidates} signals → "
+            f"{len(ranking.buy_candidates)} BUY candidates, "
+            f"{len(ranking.sell_signals)} SELL, "
+            f"dropped={ranking.dropped_conflicts}"
+        )
+
+        # Step 3a: SELL 优先（不受 Top-K 限制）
+        for rs in ranking.sell_signals:
+            result = self._execute_ranked_signal(rs, lookback)
+            summary.results.append(result)
+
+        # Step 3b: CandidateSelector 递补选出 BUY 订单
+        from mytrader.risk.candidate_selector import AccountState, select_orders_from_candidates
+
+        account = AccountState(
+            total_capital=self._risk.total_capital,
+            current_exposure=self._risk.current_exposure,
+            current_position_count=self._risk.current_positions_count,
+        )
+        approved, rejections = select_orders_from_candidates(
+            candidates=ranking.buy_candidates,
+            account=account,
+            max_orders=self._cfg.signal_ranker.top_k,
+            max_single_position_pct=self._cfg.risk.max_single_position_pct,
+            max_total_exposure_pct=self._cfg.risk.max_total_exposure_pct,
+            max_sector_exposure_pct=self._cfg.risk.get("max_sector_exposure_pct", 0.40)
+                if isinstance(self._cfg.risk, dict) else getattr(self._cfg.risk, 'max_sector_exposure_pct', 0.40),
+            max_concurrent_positions=self._cfg.risk.max_concurrent_positions
+                if hasattr(self._cfg.risk, 'max_concurrent_positions') else 5,
+            target_position_pct=self._cfg.risk.max_single_position_pct
+                if hasattr(self._cfg.risk, 'max_single_position_pct') else 0.20,
+        )
+
+        logger.info(
+            f"[Phase5] CandidateSelector: {len(ranking.buy_candidates)} candidates → "
+            f"{len(approved)} approved, {len(rejections)} rejected"
+        )
+
+        # Step 3c: 执行每一张通过约束的订单
+        for order in approved:
+            result = self._execute_phase5_order(order, lookback)
+            summary.results.append(result)
+
+        return summary
+
+    def _execute_ranked_signal(self, rs: Any, lookback_days: int) -> SymbolScanResult:
+        """执行一条已排名的 SELL 信号（经过过滤+风控 → Broker）。"""
+        from mytrader.signal.ranker import RankedSignal as _RS
+        sig = rs.signal if isinstance(rs, _RS) else rs
+        symbol = sig.symbol if hasattr(sig, 'symbol') else str(sig)
+
+        result = SymbolScanResult(symbol=symbol)
+        try:
+            df = self._fetch_data_phase5(symbol, lookback_days)
+            if df is None or df.empty:
+                result.error = "empty data"
+                return result
+
+            # 信号过滤
+            filtered_signals, filter_result = self._pipeline.run([sig], df)
+            if not filtered_signals:
+                return result
+
+            result.signal_direction = sig.direction.value
+            filtered = filtered_signals[0]
+
+            # 风控
+            intent = self._risk.evaluate(filtered, df)
+            if intent is None:
+                return result
+
+            # 下单
+            order_result = self._broker.submit(intent, df)
+            result.order_submitted = True
+            result.order_status = order_result.status.value
+
+            from mytrader.execution.models import OrderStatus
+            if order_result.status == OrderStatus.FILLED:
+                self._tracker.process_order(order_result)
+
+            if self._notification is not None:
+                try:
+                    self._notification.notify_order(order_result)
+                except Exception as exc:
+                    logger.warning(f"[{symbol}] Notification failed: {exc}")
+
+            logger.info(f"[{symbol}] SELL submitted: {result.order_status}")
+        except Exception as exc:
+            logger.exception(f"[{symbol}] Phase5 SELL error: {exc}")
+            result.error = str(exc)
+
+        return result
+
+    def _execute_phase5_order(self, order: Any, lookback_days: int) -> SymbolScanResult:
+        """执行一张 CandidateSelector 通过的订单。"""
+        sig = order.signal
+        symbol = sig.symbol
+        result = SymbolScanResult(symbol=symbol)
+        result.signal_direction = sig.direction.value
+
+        try:
+            df = self._fetch_data_phase5(symbol, lookback_days)
+            if df is None or df.empty:
+                result.error = "empty data"
+                return result
+
+            # 信号过滤
+            filtered_signals, filter_result = self._pipeline.run([sig], df)
+            if not filtered_signals:
+                return result
+
+            filtered = filtered_signals[0]
+
+            # 风控
+            intent = self._risk.evaluate(filtered, df)
+            if intent is None:
+                return result
+
+            # 下单
+            order_result = self._broker.submit(intent, df)
+            result.order_submitted = True
+            result.order_status = order_result.status.value
+
+            from mytrader.execution.models import OrderStatus
+            if order_result.status == OrderStatus.FILLED:
+                self._tracker.process_order(order_result)
+
+            if self._notification is not None:
+                try:
+                    self._notification.notify_order(order_result)
+                except Exception as exc:
+                    logger.warning(f"[{symbol}] Notification failed: {exc}")
+
+            logger.info(
+                f"[{symbol}] Phase5 order: {sig.direction.value} "
+                f"value=${order.order_value:,.0f} status={order_result.status.value}"
+            )
+        except Exception as exc:
+            logger.exception(f"[{symbol}] Phase5 order error: {exc}")
+            result.error = str(exc)
+
+        return result
+
+    def _fetch_data_phase5(self, symbol: str, lookback_days: int) -> pd.DataFrame | None:
+        """Phase 5 数据获取：优先读 MarketDataStore 本地库，降级到外部 DataProvider。"""
+        # 先尝试本地库
+        if self._use_phase5 and hasattr(self._provider, 'get_latest_n_bars'):
+            try:
+                df = self._provider.get_latest_n_bars(symbol, n=lookback_days)
+                if not df.empty:
+                    return df
+            except Exception:
+                pass  # 降级到外部 API
+
+        # 降级：走外部 DataProvider
+        return self._fetch_data(symbol, lookback_days)
 
     def _scan_symbol(self, symbol: str, lookback_days: int) -> SymbolScanResult:
         """扫描单个标的：拉数据 → 信号 → 风控 → 执行。"""
@@ -438,21 +632,81 @@ class ScanOrchestrator:
 # ---------------------------------------------------------------------------
 
 def build_orchestrator(components: Any) -> ScanOrchestrator:
-    """从 Container.build() 返回的 AppComponents 构建 ScanOrchestrator。
+    """从 Container.build() 返回的 AppComponents 构建编排器。
 
-    Args:
-        components: AppComponents 实例
-
-    Returns:
-        ScanOrchestrator 实例，已完成依赖注入
+    优先使用 Phase 5 链路（若 Phase 5 模块可用），否则降级为 Phase 4 单策略模式。
     """
+    cfg = components.config
+
+    # 判断是否走 Phase 5 链路
+    use_phase5 = (
+        components.data_store is not None
+        and components.universe is not None
+        and components.matrix_runner is not None
+        and components.signal_ranker is not None
+    )
+
+    if use_phase5:
+        logger.info("[Orchestrator] Using Phase 5 multi-strategy pipeline")
+        return _build_phase5_orchestrator(components)
+    else:
+        logger.info("[Orchestrator] Using Phase 4 single-strategy pipeline")
+        return _build_phase4_orchestrator(components)
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 Orchestrator 工厂
+# ---------------------------------------------------------------------------
+
+def _build_phase5_orchestrator(components: Any) -> ScanOrchestrator:
+    """构建 Phase 5 编排器：MarketDataStore → MatrixRunner → SignalRanker → CandidateSelector → Broker。"""
+    cfg = components.config
+    import mytrader.strategy.strategies  # noqa: F401
+
+    # 信号过滤管线
+    from mytrader.signal.pipeline import SignalPipeline
+    pipeline = SignalPipeline.from_config(cfg.signal_filter)
+
+    # 风险管理器
+    from mytrader.risk.manager import RiskManager
+    risk_manager = RiskManager(
+        config=cfg.risk,
+        total_capital=cfg.backtest.init_cash,
+    )
+
+    orchestrator = ScanOrchestrator(
+        config=cfg,
+        data_provider=components.data_store,   # Phase 5: 用本地库替代 DataProvider
+        pipeline=pipeline,
+        risk_manager=risk_manager,
+        broker=components.broker,
+        tracker=components.tracker,
+        notification=components.notification,
+    )
+
+    # 注入 Phase 5 专属依赖
+    orchestrator._use_phase5 = True
+    orchestrator._universe = components.universe
+    orchestrator._matrix_runner = components.matrix_runner
+    orchestrator._signal_ranker = components.signal_ranker
+
+    logger.info("[Orchestrator] Phase 5 pipeline: MarketDataStore → MatrixRunner → SignalRanker → CandidateSelector → Broker")
+    return orchestrator
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 Orchestrator 工厂（向后兼容）
+# ---------------------------------------------------------------------------
+
+def _build_phase4_orchestrator(components: Any) -> ScanOrchestrator:
+    """构建 Phase 4 编排器：DataProvider → 单策略 → 信号过滤 → 风控 → Broker。"""
+    cfg = components.config
+
     from mytrader.data.cache import DataCache
     from mytrader.risk.manager import RiskManager
     from mytrader.signal.pipeline import SignalPipeline
 
-    cfg = components.config
-
-    # 数据提供者：根据 data.provider 配置选择
+    # 数据提供者
     provider_name = cfg.data.provider.lower()
     if provider_name == "alpaca":
         from mytrader.data.providers.alpaca_provider import AlpacaDataProvider
@@ -463,27 +717,16 @@ def build_orchestrator(components: Any) -> ScanOrchestrator:
             paper=cfg.alpaca.paper,
             cache=cache,
         )
-        logger.info(
-            f"[Orchestrator] Using AlpacaDataProvider "
-            f"(paper={cfg.alpaca.paper})"
-        )
+        logger.info("[Orchestrator] Using AlpacaDataProvider")
     else:
-        # 默认 yfinance
         from mytrader.data.providers.yfinance_provider import YFinanceProvider
         cache = DataCache(cache_dir=cfg.data.cache_dir)
         data_provider = YFinanceProvider(cache=cache)
         logger.info("[Orchestrator] Using YFinanceProvider")
 
-    # 信号过滤管线
     pipeline = SignalPipeline.from_config(cfg.signal_filter)
+    risk_manager = RiskManager(config=cfg.risk, total_capital=cfg.backtest.init_cash)
 
-    # 风险管理器（初始资金来自 backtest.init_cash）
-    risk_manager = RiskManager(
-        config=cfg.risk,
-        total_capital=cfg.backtest.init_cash,
-    )
-
-    # 导入所有策略（确保注册表已填充）
     import mytrader.strategy.strategies  # noqa: F401
 
     return ScanOrchestrator(

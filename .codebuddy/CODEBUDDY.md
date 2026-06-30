@@ -1,8 +1,29 @@
 # Trade-Tools 项目核心参考文档
 
-> 最后更新：2026-06-23  
+> 最后更新：2026-06-30 (新增 Orchestrator 监控循环)  
 > 本文是项目规范 + 关键索引，供 AI 助手快速建立项目上下文。  
 > **各阶段开发详情见** → [`.codebuddy/notes/dev_records.md`](.codebuddy/notes/dev_records.md)
+
+---
+
+## ⚖️ AI Constitution（最高行为准则）
+
+> **AI 在此项目中的所有决策，必须以 `alignment/ai_constitution.md` 为最高准则。**
+>
+> 该文件通过 9 层对齐访谈（L0 Vision → L9 Evolution）建立，覆盖：
+> - 目标体系（年化 20-30%，DD≤20%，Sortino 优先）
+> - 交易哲学（Hybrid 混合系统，AI 持续进化策略）
+> - 架构边界（Trading System 纯规则 / Agent System 研究层）
+> - 决策权重矩阵（15 项优先级排序）
+> - 运行时故障处理策略
+> - 代码规范与测试纪律
+> - 策略上线验证流水线
+> - AI 自主权矩阵 + 禁止行为清单
+>
+> **🔗 全文** → [`alignment/ai_constitution.md`](../alignment/ai_constitution.md)
+>
+> **AI 遇到模糊决策时必须记录决策日志** → `alignment/decision_log.md`  
+> **每次策略迭代必须留痕** → `alignment/iteration_trajectory.md`
 
 ---
 
@@ -228,6 +249,14 @@ python main.py --mode semi_auto              # 半自动（推送通知，人工
 
 ## 8. 设计文档索引
 
+### AI 行为准则
+| 文件 | 内容 |
+|------|------|
+| [`alignment/ai_constitution.md`](../alignment/ai_constitution.md) | **AI Constitution** — 9 层对齐访谈产物，Agent System 最高行为准则 |
+| [`alignment/orchestrator_design.md`](../alignment/orchestrator_design.md) | **Orchestrator 设计** — GLM 监控 CodeBuddy 的循环架构方案 |
+| [`alignment/orchestrator.py`](../alignment/orchestrator.py) | **Orchestrator 实现** — ACP 客户端，驱动 CodeBuddy 迭代开发 |
+
+### 系统设计文档
 路径：`mytrader/designs/design_v2/`（当前版本 v2.1）
 
 | 文件 | 内容 |
@@ -270,7 +299,28 @@ trade-tools/
 
 ---
 
-## 10. 参考链接
+## 10. Skills
+
+| Skill | 位置 | 说明 |
+|------|------|------|
+| `cb-acp-dev` | `.codebuddy/skills/cb-acp-dev/` | **CodeBuddy ACP Orchestrator** — 通过 ACP 协议驱动 CodeBuddy 实例开发 mytrader，含 Constitution 合规检查、Agent Teams 支持、迭代轨迹记录 |
+
+### Skill 使用方式
+
+当用户说"让 codebuddy 开发"、"启动迭代"、"监控 codebuddy"等触发词时，自动加载 `cb-acp-dev` skill。
+
+核心脚本：
+```bash
+# 运行一次开发迭代
+/Users/rickouyang/miniforge3/envs/py312trade/bin/python alignment/orchestrator.py --task "任务描述"
+
+# 带并行 Agent Teams 调研
+/Users/rickouyang/miniforge3/envs/py312trade/bin/python alignment/orchestrator.py --task "任务" --team-research
+```
+
+---
+
+## 11. 参考链接
 
 - [VectorBT 文档](https://vectorbt.dev/)
 - [pandas-ta](https://github.com/twopirllc/pandas-ta)
@@ -278,3 +328,5 @@ trade-tools/
 - [ib_insync](https://ib-insync.readthedocs.io/)
 - [DuckDB SQLite Extension](https://duckdb.org/docs/extensions/sqlite)
 - *Advances in Financial Machine Learning* — Marcos López de Prado
+- [ACP 协议规范](https://github.com/agentclientprotocol/agent-client-protocol)
+- [CodeBuddy CLI 文档](https://www.codebuddy.ai/docs/zh/cli/headless)

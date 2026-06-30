@@ -303,13 +303,24 @@ trade-tools/
 
 | Skill | 位置 | 说明 |
 |------|------|------|
-| `cb-acp-dev` | `.codebuddy/skills/cb-acp-dev/` | **CodeBuddy ACP Orchestrator** — 通过 ACP 协议驱动 CodeBuddy 实例开发 mytrader，含 Constitution 合规检查、Agent Teams 支持、迭代轨迹记录 |
+| `meta-agent` | `.codebuddy/skills/meta-agent/` | **Meta Agent（策略层）** — 站在用户角度监督 CodeBuddy 迭代，负责目标评估、任务定义、结果判断、下一步决策。判断标准是"是否离盈利目标更近"，不只是"代码是否正确" |
+| `cb-acp-dev` | `.codebuddy/skills/cb-acp-dev/` | **CodeBuddy ACP Orchestrator（执行层）** — 通过 ACP 协议驱动 CodeBuddy 实例开发 mytrader，含 Constitution 合规检查、Agent Teams 支持、迭代轨迹记录 |
 
-### Skill 使用方式
+### Skill 层级
 
-当用户说"让 codebuddy 开发"、"启动迭代"、"监控 codebuddy"等触发词时，自动加载 `cb-acp-dev` skill。
+```
+meta-agent（策略层：决定做什么、判断结果好不好）
+  ↓ 委托执行
+cb-acp-dev（执行层：ACP 协议、监控、合规检查）
+  ↓ 驱动
+CodeBuddy（开发者：写代码、测试、文档）
+```
 
-核心脚本：
+- 用户说"启动迭代"、"下一步做什么"、"复盘结果"时 → 先加载 `meta-agent`
+- 需要实际运行 ACP 调用时 → meta-agent 引用 `cb-acp-dev`
+
+### 核心脚本
+
 ```bash
 # 运行一次开发迭代
 /Users/rickouyang/miniforge3/envs/py312trade/bin/python alignment/orchestrator.py --task "任务描述"

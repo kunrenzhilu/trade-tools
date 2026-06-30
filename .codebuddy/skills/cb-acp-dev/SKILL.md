@@ -73,10 +73,10 @@ Execute the orchestrator script with the task:
     --max-turns 50 \
     --timeout 1800
 
-# Long task (> 30 min): run in background
+# Long task: run in background
 nohup /Users/rickouyang/miniforge3/envs/py312trade/bin/python alignment/orchestrator.py \
     --task "具体任务描述" \
-    --max-turns 100 \
+    --max-turns 80 \
     --timeout 86400 \
     > /tmp/orchestrator.log 2>&1 &
 
@@ -90,20 +90,31 @@ nohup /Users/rickouyang/miniforge3/envs/py312trade/bin/python alignment/orchestr
 Key parameters:
 - `--task`: The development task description (required)
 - `--max-turns`: Max agent turns (default 50, increase for complex tasks)
-- `--timeout`: Max runtime in seconds (default 300, increase for long tasks)
+- `--timeout`: Max runtime in seconds before force-exit (default 900=15min)
 - `--team-research`: Trigger CodeBuddy to create an Agent Team for parallel research
 
 ### Step 4: Monitor
 
-During execution, the orchestrator captures all `session_update` events:
-- **Text responses**: CodeBuddy's outputs and explanations
-- **Tool calls**: Which tools CodeBuddy invoked (Read, Write, Bash, etc.)
-- **Team events**: If Agent Teams are used, track `teamUpdate` and `memberEvent`
-- **Permission requests**: Tools that needed permission (auto-approved in bypassPermissions mode)
+During execution, the orchestrator prints a **heartbeat line every 30 seconds** to stdout:
 
-For long-running background tasks, periodically check the log:
+```
+[2m30s] 心跳 | phase=model_streaming idle_since_last_update=0s updates=145 tools=28
+[5m00s] 心跳 | phase=idle idle_since_last_update=120s updates=200 tools=35
+[7m30s] 心跳 | phase=idle idle_since_last_update=270s updates=200 tools=35
+```
+
+Heartbeat format: `[elapsed] 心跳 | phase=<agentPhase> idle_since_last_update=<seconds> updates=<count> tools=<count>`
+
+- **agentPhase**: `idle` → `preparing` → `model_requesting` → `model_streaming` → `model_done` → `idle`
+- **idle_since_last_update**: Seconds since last `session_update` event — growing = CodeBuddy may be done or stuck
+- **updates**: Total session_update events received
+- **tools**: Total tool calls made
+
+> The heartbeat is for **observability only** — it does not change the exit logic. The orchestrator always waits the full `--timeout` seconds (deterministic and predictable).
+
+For long-running background tasks, check the log:
 ```bash
-tail -50 /tmp/orchestrator.log
+tail -20 /tmp/orchestrator.log | grep -E '^\['
 ```
 
 ### Step 5: Post-Iteration Validation
@@ -182,6 +193,37 @@ Extracted from `ai_constitution.md`:
 **Validation Pipeline**: Backtest (≥5 years) → Walk-Forward (4 rounds) → Paper Trade (≥1 month) → Live
 
 **High-risk changes** (require user approval): risk param changes, execution logic, validation thresholds, new Alpha sources, major refactors, cash/leverage changes
+
+## Troubleshooting
+
+### CodeBuddy goes silent during iteration
+
+**Symptom**: Log stops updating, process shows SN (sleeping) at 0% CPU, heartbeat shows growing `idle_since_last_update`.
+
+**How to diagnose**:
+
+```bash
+# See current heartbeat and agent phase
+tail -10 /tmp/orchestrator.log | grep -E '^\['
+
+# Check if process alive
+ps aux | grep orchestrator
+
+# See what CodeBuddy already produced
+git diff --stat
+```
+
+**Interpretation guide**:
+
+| Heartbeat pattern | Likely meaning | Action |
+|---|---|---|
+| `phase=idle, idle_since_last_update > 60s` | CodeBuddy finished or max-turns reached | Wait for timeout or kill and check git diff |
+| `phase=model_requesting, idle_since_last_update > 60s` | Stuck waiting for model API | May need to kill and retry |
+| `phase=model_streaming, idle_since_last_update < 5s` | Actively working | Normal, wait |
+
+### Telegram notification during iteration
+
+If CodeBuddy runs `pytest` and `test_integration_live.py::test_send_test_message` triggers a real Telegram message, this is expected behavior — the test is designed to validate Telegram connectivity. Record it in `decision_log.md` and consider adding `@pytest.mark.live` skip markers in a future iteration.
 
 ## Resources
 

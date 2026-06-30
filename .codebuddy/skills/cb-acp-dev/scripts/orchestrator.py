@@ -58,6 +58,9 @@ class IterationResult:
     tool_calls: list[dict] = field(default_factory=list)
     team_events: list[dict] = field(default_factory=list)
     permission_requests: list[dict] = field(default_factory=list)
+    # 空闲检测
+    agent_phase: str = "unknown"        # 当前 agentPhase（仅用于心跳日志，不参与退出决策）
+    last_update_time: float = 0.0       # 最后一次 session_update 的时间戳
     violations: list[str] = field(default_factory=list)
     test_result: dict | None = None
     error: str | None = None
@@ -164,8 +167,9 @@ def build_constitution_prompt(task: str, rules: ConstitutionRules) -> str:
 class OrchestratorClient(Client):
     """ACP 客户端 — 监控 CodeBuddy 的工作"""
 
-    def __init__(self, result: IterationResult):
+    def __init__(self, result: IterationResult, heartbeat_cb=None):
         self.result = result
+        self._heartbeat_cb = heartbeat_cb
 
     async def request_permission(
         self, options, session_id, tool_call, **kwargs
@@ -193,13 +197,15 @@ class OrchestratorClient(Client):
         return {"outcome": {"outcome": "cancelled"}}
 
     async def session_update(self, session_id, update, **kwargs):
-        """接收 CodeBuddy 的实时更新"""
+        """接收 CodeBuddy 的实时更新 — 追踪 agentPhase 用于心跳监控"""
+        now = time.time()
         if hasattr(update, "model_dump"):
             d = update.model_dump()
         else:
             d = update
 
         self.result.updates_count += 1
+        self.result.last_update_time = now
 
         # 提取文本
         for chunk in _extract_text(d):
@@ -210,8 +216,17 @@ class OrchestratorClient(Client):
         tool_name = meta.get("codebuddy.ai/toolName")
         if tool_name:
             self.result.tool_calls.append(
-                {"tool": tool_name, "timestamp": time.time()}
+                {"tool": tool_name, "timestamp": now}
             )
+
+        # 追踪 agentPhase（心跳监控信号，不参与退出决策）
+        phase_info = meta.get("codebuddy.ai/agentPhase")
+        if phase_info and isinstance(phase_info, dict):
+            new_phase = phase_info.get("phase", "")
+            if new_phase and new_phase != self.result.agent_phase:
+                self.result.agent_phase = new_phase
+                if self._heartbeat_cb:
+                    self._heartbeat_cb(f"agentPhase → {new_phase}")
 
         # 提取团队事件
         for key in meta:
@@ -395,10 +410,16 @@ def log_iteration(result: IterationResult, rules: ConstitutionRules):
 async def run_iteration(
     task: str,
     max_turns: int = 50,
-    timeout_seconds: int = 300,
+    timeout_seconds: int = 900,
     use_team: bool = False,
 ) -> IterationResult:
-    """执行一次完整的迭代循环"""
+    """执行一次完整的迭代循环
+
+    等待策略：time-based（确定性，简单可靠）:
+    - 等满 timeout_seconds，不提前退出
+    - 每 30 秒打印心跳（agentPhase + 距上次 session_update 多久）
+    - session_update 实时刷新 last_update_time（用于心跳显示，不改变退出逻辑）
+    """
 
     iteration_id = str(uuid4())[:8]
     result = IterationResult(
@@ -411,10 +432,8 @@ async def run_iteration(
     rules = load_constitution()
     prompt = build_constitution_prompt(task, rules)
 
-    # 如果需要团队调研，追加团队指令
     if use_team:
         prompt += """
-
 ## 并行调研指令
 请使用 TeamCreate 工具创建团队 'research-team'，
 派出两个成员并行工作：
@@ -422,7 +441,15 @@ async def run_iteration(
 2. 'module-researcher-2' — 调研相关模块的测试覆盖情况
 完成后汇总结果再开始开发。"""
 
-    client = OrchestratorClient(result)
+    def heartbeat_log(msg: str):
+        """心跳 — 输出到 stdout（nohup 日志可见），只用于监控，不参与退出决策"""
+        elapsed = time.time() - result.start_time
+        since_last = time.time() - result.last_update_time if result.last_update_time else 0
+        print(f"[{elapsed//60:.0f}m{elapsed%60:02.0f}s] {msg} | "
+              f"phase={result.agent_phase} idle_since_last_update={since_last:.0f}s "
+              f"updates={result.updates_count} tools={len(result.tool_calls)}")
+
+    client = OrchestratorClient(result, heartbeat_cb=heartbeat_log)
 
     try:
         async with spawn_agent_process(
@@ -434,29 +461,34 @@ async def run_iteration(
             cwd=str(MYTRADER_ROOT),
         ) as (conn, proc):
 
-            # 初始化
             await conn.initialize(protocol_version=PROTOCOL_VERSION)
 
-            # 创建会话
             session = await conn.new_session(
                 cwd=str(MYTRADER_ROOT),
                 mcp_servers=[],
             )
 
-            # 发送任务
-            await conn.prompt(
+            prompt_response = await conn.prompt(
                 session_id=session.session_id,
                 prompt=[text_block(prompt)],
                 message_id=str(uuid4()),
             )
+            heartbeat_log(f"prompt 已发送, stop_reason={prompt_response.stop_reason}")
 
-            # 等待完成或超时
+            # time-based 等待（确定性，不提前退出）
             elapsed = 0
+            check_interval = 5
+            heartbeat_interval = 30
+            last_heartbeat = time.time()
+
             while elapsed < timeout_seconds:
-                await asyncio.sleep(5)
-                elapsed += 5
-                # 如果 CodeBuddy 已经 idle（没有新更新），提前退出
-                # (简化处理：等待固定时间)
+                await asyncio.sleep(check_interval)
+                elapsed += check_interval
+
+                # 心跳（仅日志，不改变退出逻辑）
+                if time.time() - last_heartbeat > heartbeat_interval:
+                    heartbeat_log("心跳")
+                    last_heartbeat = time.time()
 
     except Exception as e:
         result.error = str(e)
@@ -466,14 +498,11 @@ async def run_iteration(
 
     # 迭代后验证
     if not result.error:
-        # 检查 git diff 违规
         violations = check_git_diff_violations()
         result.violations.extend(violations)
 
-        # 运行测试收集
         result.test_result = run_tests()
 
-        # 判定状态
         if result.violations:
             result.status = "failed"
         elif result.test_result and result.test_result.get("error"):
@@ -481,9 +510,7 @@ async def run_iteration(
         else:
             result.status = "passed"
 
-    # 记录日志
     log_iteration(result, rules)
-
     return result
 
 
@@ -499,7 +526,7 @@ def main():
     parser.add_argument("--task", required=True, help="迭代任务描述")
     parser.add_argument("--max-turns", type=int, default=50, help="最大代理轮次")
     parser.add_argument(
-        "--timeout", type=int, default=300, help="超时时间（秒）"
+        "--timeout", type=int, default=900, help="总超时时间（秒，默认 900=15min）"
     )
     parser.add_argument(
         "--team-research",

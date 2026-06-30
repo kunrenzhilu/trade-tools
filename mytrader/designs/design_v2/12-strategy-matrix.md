@@ -49,15 +49,15 @@ Signal Ranker
   "groups": {
     "NDX_high_vol": [
       {"strategy": "dual_ma", "params": {"fast": 5, "slow": 60}, "weight": 0.6,
-       "backtest_sharpe": 1.42, "backtest_win_rate": 0.58},
-      {"strategy": "macd", "params": {"fast": 12, "slow": 26, "signal": 9}, "weight": 0.4,
-       "backtest_sharpe": 1.18, "backtest_win_rate": 0.55}
+       "backtest_sharpe": 1.42, "backtest_sortino": 1.85, "backtest_win_rate": 0.58},
+      {"strategy": "macd_cross", "params": {"fast": 12, "slow": 26, "signal_period": 9}, "weight": 0.4,
+       "backtest_sharpe": 1.18, "backtest_sortino": 1.54, "backtest_win_rate": 0.55}
     ],
     "SPX_low_vol": [
-      {"strategy": "rsi", "params": {"period": 14, "oversold": 30, "overbought": 70}, "weight": 0.7,
-       "backtest_sharpe": 1.05, "backtest_win_rate": 0.62},
-      {"strategy": "bollinger", "params": {"period": 20, "std_dev": 2.0}, "weight": 0.3,
-       "backtest_sharpe": 0.92, "backtest_win_rate": 0.60}
+      {"strategy": "rsi_mean_revert", "params": {"period": 14, "oversold": 30, "overbought": 70}, "weight": 0.7,
+       "backtest_sharpe": 1.05, "backtest_sortino": 1.32, "backtest_win_rate": 0.62},
+      {"strategy": "bollinger_band", "params": {"period": 20, "std_dev": 2.0}, "weight": 0.3,
+       "backtest_sharpe": 0.92, "backtest_sortino": 1.18, "backtest_win_rate": 0.60}
     ]
   }
 }
@@ -65,7 +65,9 @@ Signal Ranker
 
 > 关键字段：
 > - `weight`：该策略在组内的权重（组合本身是被回测过的，权重来自回测优化）
-> - `backtest_sharpe` / `backtest_win_rate`：供 Signal Ranker 计算综合得分
+> - `backtest_sharpe` / `backtest_sortino` / `backtest_win_rate`：供 Signal Ranker 计算综合得分
+> - `backtest_sortino`（迭代 #1 新增）：Constitution L1 首要 KPI，组合 Sortino（等权合并组内日收益率序列后手算，详见 [07-backtest-module.md](./07-backtest-module.md) §10.4）
+> - ⚠️ **策略名必须与 `@register_strategy(name)` 装饰器完全一致**：`dual_ma` / `rsi_mean_revert` / `macd_cross` / `bollinger_band`（早期文档误用简称 `rsi`/`macd`/`bollinger`，已在迭代 #1 修正）
 
 ---
 
@@ -214,7 +216,7 @@ def run_symbol(symbol, lookback_days=90):
 
 | 风险 | 级别 | 缓解措施 |
 |------|------|---------|
-| 权重文件与注册表不同步 | 中 | 加载时校验策略存在性 |
+| 权重文件与注册表不同步 | 中 | 加载时校验策略存在性；**MatrixBacktest `_run_group` 在策略循环入口检查 `strategy not in STRATEGY_REGISTRY` → `WARNING` 级日志 + `continue`**（迭代 #1 新增，防止策略名拼写错误被静默跳过） |
 | 多策略信号冲突 | 中 | 交由 Signal Ranker 按权重综合 |
 | 并发计算资源占用 | 低 | max_workers 限流 |
 

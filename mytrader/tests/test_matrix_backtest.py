@@ -18,7 +18,9 @@ from mytrader.backtest.matrix_backtest import (
     MatrixBacktest,
     _backtest_one,
     _compute_sharpe,
+    _compute_sortino,
     _portfolio_sharpe_from_results,
+    _portfolio_sortino_from_results,
     SingleBacktestResult,
 )
 
@@ -127,6 +129,73 @@ class TestHelpers:
             f"差异应 >1e-6，否则说明实现有误"
         )
 
+    # ── Sortino（迭代 #1 新增，Constitution L1 首要 KPI）─────────────────────
+
+    def test_compute_sortino_positive(self):
+        """正均值的收益序列 Sortino > 0。"""
+        returns = pd.Series([0.001, -0.0005, 0.002, -0.0003, 0.0015] * 60)
+        assert _compute_sortino(returns) > 0
+
+    def test_compute_sortino_empty(self):
+        """空序列返回 0。"""
+        assert _compute_sortino(pd.Series([], dtype=float)) == 0.0
+
+    def test_compute_sortino_no_downside_returns_zero(self):
+        """全正收益（无下行波动）→ 0.0（退化处理，与 _compute_sharpe 一致）。
+
+        理论上 Sortino 应为 +inf，但返回 0 保持可算术聚合 + 保守评估。
+        """
+        returns = pd.Series([0.001] * 100)   # 全正，无下行
+        assert _compute_sortino(returns) == 0.0
+
+    def test_compute_sortino_differs_from_sharpe_when_asymmetric(self):
+        """当上行/下行波动不对称时，Sortino ≠ Sharpe（这是引入 Sortino 的意义）。"""
+        # 大幅上行小波动 + 偶尔小幅下行：Sortino 应明显高于 Sharpe
+        np.random.seed(42)
+        upside = np.random.normal(0.003, 0.005, 200)   # 正均值的上行
+        downside_shocks = np.array([-0.01, -0.012, -0.008] * 3)  # 少量下行冲击
+        returns = pd.Series(np.concatenate([upside, downside_shocks]))
+
+        sharpe = _compute_sharpe(returns)
+        sortino = _compute_sortino(returns)
+        # Sortino 仅对下行惩罚 → 上行波动不计入分母 → Sortino > Sharpe
+        assert sortino > sharpe, (
+            f"非对称收益下 Sortino({sortino:.4f}) 应 > Sharpe({sharpe:.4f})，"
+            f"否则说明 Sortino 公式退化为 Sharpe"
+        )
+
+    def test_compute_sortino_known_value(self):
+        """已知值验算 Sortino 公式正确性。"""
+        # r = [0.01, 0.01, 0.01, -0.01]
+        # mean = 0.005; downside = [0,0,0,-0.01]; dd = sqrt(mean([0,0,0,0.0001])) = sqrt(0.000025) = 0.005
+        # Sortino = 0.005 / 0.005 * sqrt(252) = 15.8745...
+        returns = pd.Series([0.01, 0.01, 0.01, -0.01] * 25)   # 重复 25 次以满足 len>=5
+        expected = (0.005 / 0.005) * np.sqrt(252)
+        assert abs(_compute_sortino(returns) - expected) < 1e-6
+
+    def test_portfolio_sortino_from_results(self):
+        """等权组合 Sortino 不等于各标的 Sortino 算术平均（与 Sharpe 同理）。"""
+        n = 252
+        np.random.seed(0)
+        r1 = pd.Series(np.random.normal(0.001, 0.01, n))
+        r2 = pd.Series(np.random.normal(0.0005, 0.002, n))
+
+        s1 = _compute_sortino(r1)
+        s2 = _compute_sortino(r2)
+        arithmetic_avg = (s1 + s2) / 2
+
+        results = [
+            SingleBacktestResult("SYM1", "s1", {}, 0.0, 0, 0, 0, 0, r1),
+            SingleBacktestResult("SYM2", "s2", {}, 0.0, 0, 0, 0, 0, r2),
+        ]
+        portfolio_sortino = _portfolio_sortino_from_results(results)
+
+        diff = abs(portfolio_sortino - arithmetic_avg)
+        assert diff > 1e-6, (
+            f"组合 Sortino({portfolio_sortino:.4f}) 与算术平均({arithmetic_avg:.4f}) "
+            f"差异应 >1e-6，否则说明实现退化为算术平均"
+        )
+
     def test_backtest_one_with_open(self):
         """传入 open= 参数，回测正常运行。"""
         df = _make_ohlcv(300)
@@ -204,10 +273,10 @@ class TestMatrixBacktest:
         """每个分组的策略权重之和 ≈ 1.0。"""
         mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=2)
         report = mb.run(
-            strategies=["dual_ma", "rsi"],
+            strategies=["dual_ma", "rsi_mean_revert"],
             param_grids={
                 "dual_ma": {"fast": [5], "slow": [20]},
-                "rsi": {"period": [14], "oversold": [30], "overbought": [70]},
+                "rsi_mean_revert": {"period": [14], "oversold": [30], "overbought": [70]},
             },
         )
         for gid, weights in report.groups.items():
@@ -274,3 +343,84 @@ class TestMatrixBacktest:
         data = json.loads(output.read_text())
         warning = data["_meta"].get("survivorship_bias_warning", "")
         assert "成分" in warning or "survivorship" in warning.lower()
+
+    # ── 迭代 #1 新增：观测性 + 回归 + Sortino 输出 ──────────────────────────
+
+    def test_unknown_strategy_logs_warning(self, mock_store, mock_universe):
+        """未注册策略名在 _run_group 中输出 WARNING 日志（而非静默跳过）。
+
+        这是迭代 #1 修复的核心观测性问题：之前 _backtest_one 内部静默 return None，
+        导致 main.py 误用 "rsi"/"macd"/"bollinger" 简称 6 天未被发现。
+
+        注意：项目用 loguru 而非 stdlib logging，故用 loguru sink 捕获（caplog 无效）。
+        """
+        from loguru import logger
+
+        msgs: list[str] = []
+        # 临时 sink 捕获所有 WARNING+ 日志到列表
+        handler_id = logger.add(lambda m: msgs.append(str(m)), level="WARNING")
+        try:
+            mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=2)
+            mb.run(
+                strategies=["dual_ma", "totally_bogus_name"],
+                param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+            )
+        finally:
+            logger.remove(handler_id)
+
+        # 应有 WARNING 提及 bogus 策略名
+        assert any("totally_bogus_name" in m for m in msgs), (
+            f"未注册策略应触发 WARNING，实际捕获: {msgs}"
+        )
+
+    def test_reoptimize_strategy_names_match_registry(self):
+        """回归测试：main.REOPTIMIZE_STRATEGIES 中每个策略名必须在注册表中。
+
+        防止迭代 #1 的 bug 重现：策略名拼写与 @register_strategy 装饰器不匹配，
+        导致矩阵回测静默跳过整类策略、strategy_weights.json 退化为仅 dual_ma。
+        """
+        from main import REOPTIMIZE_STRATEGIES, REOPTIMIZE_PARAM_GRIDS
+        from mytrader.strategy.registry import STRATEGY_REGISTRY
+
+        assert len(REOPTIMIZE_STRATEGIES) >= 4, (
+            f"预期至少 4 个策略，实际 {len(REOPTIMIZE_STRATEGIES)}：{REOPTIMIZE_STRATEGIES}"
+        )
+        for name in REOPTIMIZE_STRATEGIES:
+            assert name in STRATEGY_REGISTRY, (
+                f"REOPTIMIZE_STRATEGIES 中的 '{name}' 未在 STRATEGY_REGISTRY 注册。"
+                f"已注册: {sorted(STRATEGY_REGISTRY.keys())}"
+            )
+            assert name in REOPTIMIZE_PARAM_GRIDS, (
+                f"REOPTIMIZE_PARAM_GRIDS 缺少 '{name}' 的参数网格"
+            )
+
+    def test_output_file_contains_sortino(self, mock_store, mock_universe, tmp_path):
+        """strategy_weights.json 每个权重条目含 backtest_sortino 字段（Constitution L1 首要 KPI）。"""
+        output = tmp_path / "weights_with_sortino.json"
+        mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=1)
+        mb.run(
+            strategies=["dual_ma"],
+            param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+            output_file=output,
+        )
+        data = json.loads(output.read_text())
+        for gid, weights in data["groups"].items():
+            for w in weights:
+                assert "backtest_sortino" in w, (
+                    f"{gid}: 权重条目缺少 backtest_sortino 字段，实际 keys={list(w.keys())}"
+                )
+                assert isinstance(w["backtest_sortino"], (int, float)), (
+                    f"{gid}: backtest_sortino 应为数值，实际 {type(w['backtest_sortino'])}"
+                )
+
+    def test_group_results_have_portfolio_sortino(self, mock_store, mock_universe):
+        """GroupBacktestResult.portfolio_sortino 是浮点数（迭代 #1 新增字段）。"""
+        mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=1)
+        report = mb.run(
+            strategies=["dual_ma"],
+            param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+        )
+        for gr in report.group_results:
+            assert isinstance(gr.portfolio_sortino, float), (
+                f"portfolio_sortino 应为 float，实际 {type(gr.portfolio_sortino)}"
+            )

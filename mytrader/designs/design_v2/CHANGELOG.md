@@ -4,6 +4,49 @@
 
 ---
 
+## v2.2 — 2026-06-30（迭代 #1：策略名 bug 修复 + Sortino 指标）
+
+### 背景
+
+`--reoptimize` 产出的 `strategy_weights.json` 中 6 个组**全部只剩 `dual_ma`**，
+其余 3 个策略（rsi / macd / bollinger）被静默跳过。根因：`main.py::_run_reoptimize`
+传入的策略名 `["dual_ma","rsi","macd","bollinger"]` 与 `@register_strategy` 注册表
+中的实际名 `["dual_ma","rsi_mean_revert","macd_cross","bollinger_band"]` 不匹配，
+`_backtest_one` 内部 `STRATEGY_REGISTRY.get(name)` 返回 `None` 后静默 `return None`，
+仅 `_run_group` 层留下"no valid results"的 debug 日志，bug 隐藏 6 天未被发现。
+
+同时发现 Constitution L1 首要 KPI（**Sortino Ratio**）在矩阵回测中**完全未计算**，
+`strategy_weights.json` 仅含 `backtest_sharpe`，无法对"在 DD≤20% 约束下优化 Sortino"
+这一 Constitution 目标进行度量。
+
+### 修改清单
+
+| 优先级 | 问题 | 涉及文件 | 变更内容 |
+|--------|------|----------|---------|
+| P0 | `main.py` 策略名与注册表不匹配 | `main.py` | 策略名改为 `dual_ma`/`rsi_mean_revert`/`macd_cross`/`bollinger_band`；提取为模块级常量 `REOPTIMIZE_STRATEGIES` / `REOPTIMIZE_PARAM_GRIDS` 便于回归测试 |
+| P0 | 未注册策略被静默跳过 | `matrix_backtest.py` | `_run_group` 策略循环入口加 `if strategy not in STRATEGY_REGISTRY: logger.warning(...) + continue`（替代 `_backtest_one` 内部静默 `return None`） |
+| P0 | `examples/phase5_e2e.py` 同款策略名错误 | `examples/phase5_e2e.py` | `"macd"` → `"macd_cross"` |
+| P1 | 矩阵回测缺 Sortino（Constitution 首要 KPI） | `matrix_backtest.py` | 新增 `_compute_sortino()` + `_portfolio_sortino_from_results()`；`SingleBacktestResult.sortino` / `GroupBacktestResult.portfolio_sortino` 字段；`strategy_weights.json` 每条目输出 `backtest_sortino` |
+| P1 | 测试 `test_run_weights_sum_to_one` 有同款 bug | `tests/test_matrix_backtest.py` | `"rsi"` → `"rsi_mean_revert"`（原测试因单策略权重自然=1.0 而碰巧通过） |
+| P1 | 缺回归测试防策略名再次脱节 | `tests/test_matrix_backtest.py` | 新增 `test_reoptimize_strategy_names_match_registry`：断言 `REOPTIMIZE_STRATEGIES ⊆ STRATEGY_REGISTRY.keys()` |
+| P2 | 缺 Sortino 单元测试 | `tests/test_matrix_backtest.py` | 新增 `test_compute_sortino_*`（5 个）+ `test_portfolio_sortino_from_results` + `test_output_file_contains_sortino` + `test_group_results_have_portfolio_sortino` |
+| P2 | 缺未注册策略 WARNING 测试 | `tests/test_matrix_backtest.py` | 新增 `test_unknown_strategy_logs_warning` |
+| P2 | 设计文档策略名/字段不同步 | `07-backtest-module.md`, `12-strategy-matrix.md` | §5 指标表加 Sortino 行 + 计算口径说明；§10.4 加"组合 Sortino"+"策略名校验"设计点；`12` §3 JSON 示例修策略名 + 加 `backtest_sortino`；§9 风险缓解加 MatrixBacktest WARNING 校验 |
+
+### 不变项
+
+- 权重优化仍基于 **Sharpe**（`_optimize_ensemble_weights`）—— 切换为 Sortino 优化属行为变更，留待下一轮迭代单独评估（见 `alignment/decision_log.md`）
+- 4 策略参数网格不变（rsi/macd/bollinger 仍是单点默认参数）—— 扩参属"策略参数微调"另一轮迭代
+- `BacktestRunner`（单标的回测）不受影响，未改动
+
+### 影响范围
+
+- ✅ 向后兼容：`strategy_weights.json` 新增 `backtest_sortino` 字段，旧字段保留；`SingleBacktestResult.sortino` / `GroupBacktestResult.portfolio_sortino` 带 default 值，位置式构造不受影响
+- ⚠️ 行为变更：`--reoptimize` 重新产出后，6 个组中至少 3 组最优策略不再是 `dual_ma`（预期）
+- 🔲 下一轮迭代候选：(1) 权重优化目标 Sharpe→Sortino；(2) rsi/macd/bollinger 参数网格扩展；(3) 低波动组（SPX_low_vol Sortino 待度量）策略淘汰评估
+
+---
+
 ## v2.1 — 2026-06-23（Claude 审查后修正）
 
 ### 背景

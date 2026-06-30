@@ -44,7 +44,8 @@ class SingleBacktestResult:
     max_drawdown_pct: float
     win_rate_pct: float
     total_trades: int
-    daily_returns: pd.Series    # pf.returns() — 供组合 Sharpe 计算
+    daily_returns: pd.Series    # pf.returns() — 供组合 Sharpe / Sortino 计算
+    sortino: float = 0.0       # Constitution L1 首要 KPI（迭代 #1 新增）
 
 
 @dataclass
@@ -59,6 +60,7 @@ class GroupBacktestResult:
     avg_max_drawdown_pct: float
     avg_win_rate_pct: float
     symbol_count: int
+    portfolio_sortino: float = 0.0   # 等权组合 Sortino（迭代 #1 新增）
 
 
 @dataclass
@@ -86,6 +88,42 @@ def _compute_sharpe(returns: pd.Series, periods_per_year: int = 252) -> float:
     if std <= 0 or np.isnan(std):
         return 0.0
     return float(mean / std * np.sqrt(periods_per_year))
+
+
+def _compute_sortino(
+    returns: pd.Series,
+    periods_per_year: int = 252,
+    target: float = 0.0,
+) -> float:
+    """从日收益率序列计算年化 Sortino Ratio（Constitution L1 首要 KPI）。
+
+    Sortino = (mean(returns) - target) / downside_deviation * sqrt(periods_per_year)
+    downside_deviation = sqrt( mean( min(0, returns - target)^2 ) )
+
+    与 Sharpe 的区别：仅对下行波动惩罚，上行波动不计入分母。
+    适合"收益>0 但偶尔大跌"的中长线策略评估。
+
+    退化处理（与 _compute_sharpe 一致）：
+        - 样本 < 5 → 0.0
+        - 下行波动 ≤ 0（无下行样本）→ 0.0（理论为 +inf，返回 0 保持保守 + 可算术聚合）
+
+    Args:
+        returns:          日收益率序列（如 pf.returns()）
+        periods_per_year: 年化因子（日线 = 252）
+        target:           MAR/目标收益率，默认 0（与 _compute_sharpe 无风险利率假设一致）
+
+    Returns:
+        年化 Sortino Ratio
+    """
+    returns = returns.dropna()
+    if len(returns) < 5:
+        return 0.0
+    excess = returns - target
+    downside = excess.where(excess < 0, 0.0)        # 仅保留负偏离，正偏离置 0
+    dd = np.sqrt((downside ** 2).mean())
+    if dd <= 0 or np.isnan(dd):
+        return 0.0
+    return float(returns.mean() / dd * np.sqrt(periods_per_year))
 
 
 def _backtest_one(
@@ -142,6 +180,8 @@ def _backtest_one(
 
         stats = pf.stats()
 
+        daily_returns = pf.returns()
+
         return SingleBacktestResult(
             symbol=str(df.index.name or ""),
             strategy=strategy_name,
@@ -151,7 +191,8 @@ def _backtest_one(
             max_drawdown_pct=float(stats.get("Max Drawdown [%]", 0.0) or 0.0),
             win_rate_pct=float(stats.get("Win Rate [%]", 0.0) or 0.0),
             total_trades=int(stats.get("Total Trades", 0) or 0),
-            daily_returns=pf.returns(),
+            daily_returns=daily_returns,
+            sortino=_compute_sortino(daily_returns),
         )
     except Exception as e:
         logger.debug(f"[backtest_one] {strategy_name}({params}) failed: {e}")
@@ -171,6 +212,18 @@ def _portfolio_sharpe_from_results(results: list[SingleBacktestResult]) -> float
     # 对齐时间索引，等权平均
     combined = pd.concat(valid, axis=1).mean(axis=1)
     return _compute_sharpe(combined)
+
+
+def _portfolio_sortino_from_results(results: list[SingleBacktestResult]) -> float:
+    """等权合并组内日收益率序列，计算组合 Sortino（与 _portfolio_sharpe_from_results 同语义）。
+
+    不能取各标的 Sortino 算术平均（与 Sharpe 同理：比率不可直接平均）。
+    """
+    valid = [r.daily_returns for r in results if not r.daily_returns.empty]
+    if not valid:
+        return 0.0
+    combined = pd.concat(valid, axis=1).mean(axis=1)
+    return _compute_sortino(combined)
 
 
 def _optimize_ensemble_weights(
@@ -334,6 +387,17 @@ class MatrixBacktest:
         group_results: list[tuple[str, dict, list[SingleBacktestResult]]] = []
 
         for strategy in strategies:
+            # ⚠️ 早期检测未注册策略名（迭代 #1 修复"策略名拼写错误被静默跳过"的 bug）
+            # 之前 _backtest_one 内部静默 return None，导致 main.py 误用 "rsi"/"macd"/"bollinger"
+            # 简称 6 天未被发现。改为 WARNING 级日志 + continue。
+            if strategy not in STRATEGY_REGISTRY:
+                logger.warning(
+                    f"[MatrixBacktest] {group_id}: strategy '{strategy}' not in "
+                    f"STRATEGY_REGISTRY — skipped. "
+                    f"Check spelling against @register_strategy decorators. "
+                    f"Known: {sorted(STRATEGY_REGISTRY.keys())}"
+                )
+                continue
             grid = param_grids.get(strategy, {})
             param_combos = list(
                 dict(zip(grid.keys(), combo))
@@ -342,6 +406,7 @@ class MatrixBacktest:
 
             best_params = None
             best_sharpe = float("-inf")
+            best_sortino = 0.0
             best_results: list[SingleBacktestResult] = []
 
             for params in param_combos:
@@ -364,9 +429,11 @@ class MatrixBacktest:
 
                 # ⚠️ 等权合并日收益率序列计算组合 Sharpe（不能取算术平均）
                 ps = _portfolio_sharpe_from_results(results)
+                pso = _portfolio_sortino_from_results(results)
 
                 if ps > best_sharpe:
                     best_sharpe = ps
+                    best_sortino = pso
                     best_params = params
                     best_results = results
 
@@ -387,6 +454,7 @@ class MatrixBacktest:
                         np.mean([r.win_rate_pct for r in best_results])
                     ),
                     symbol_count=len(best_results),
+                    portfolio_sortino=best_sortino,
                 ))
 
         if not group_results:
@@ -414,6 +482,7 @@ class MatrixBacktest:
                 "params": params,
                 "weight": round(weight, 4),
                 "backtest_sharpe": round(gr.portfolio_sharpe if gr else 0.0, 4),
+                "backtest_sortino": round(gr.portfolio_sortino if gr else 0.0, 4),
                 "backtest_win_rate": round(gr.avg_win_rate_pct / 100 if gr else 0.5, 4),
             })
 

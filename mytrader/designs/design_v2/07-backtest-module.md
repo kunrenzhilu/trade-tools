@@ -160,6 +160,7 @@ pf = vbt.Portfolio.from_signals(
 | **Total Return** | 总回报率 | > 基准 | `Total Return [%]` |
 | **Benchmark Return** | 买入持有基准收益 | 参考对比 | `Benchmark Return [%]` |
 | **Sharpe Ratio** | 风险调整后收益（年化） | > 1.0，> 2.0 优秀 | `Sharpe Ratio` |
+| **Sortino Ratio** ⭐ | 下行风险调整后收益（**Constitution L1 首要 KPI**） | > 1.5，> 2.5 优秀 | `Sortino Ratio`（矩阵回测中手算，见 §10.4） |
 | **Max Drawdown** | 最大回撤 | < 20% | `Max Drawdown [%]` |
 | **Calmar Ratio** | 年化收益 / 最大回撤 | > 1.0 | `Calmar Ratio` |
 | **Win Rate** | 盈利交易占比 | 并不是越高越好，配合 R:R 看 | `Win Rate [%]` |
@@ -167,6 +168,10 @@ pf = vbt.Portfolio.from_signals(
 | **Total Trades** | 总交易次数 | 符合策略预期 | `Total Trades` |
 
 > ⚠️ **注意**：vectorbt 1.0.0 的 `pf.stats()` **不包含** `Annualized Return [%]` 字段（旧文档中有，新版本已移除）。年化收益需自行从 Total Return 和 Period 计算，或使用 `Calmar Ratio × Max Drawdown` 反推。
+>
+> ⚠️ **Sortino 计算口径（迭代 #1 确认）**：
+> - 单标的层面：vectorbt 1.0.0 `pf.stats()` 含 `Sortino Ratio`，可直接读取
+> - 矩阵回测层面（**组组合 Sortino**）：**必须手算**，因为 Sortino 是比率不可直接平均。正确做法是等权合并组内日收益率序列，再算下行偏差。`matrix_backtest.py::_compute_sortino()` 实现此公式，与 `_compute_sharpe()` 同口径（target=0、年化因子 252、退化返回 0.0）。这样保证单标的/组合口径一致，且不依赖 vectorbt stats 键名（曾发生 `Annualized Return [%]` 被移除的破坏性变更）。
 
 ```python
 # vectorbt 1.0.0 输出所有指标
@@ -375,6 +380,8 @@ def run_matrix_backtest(universe: UniverseManager,
 | 设计点 | 做法 | 理由 |
 |--------|------|------|
 | **组内取平均** | 等权合并组内日收益率序列，计算组合 Sharpe（而非直接平均各标的 Sharpe 比率） | 避免单只过拟合；Sharpe 是比率，不能直接平均；需要组合视角 |
+| **组合 Sortino**（迭代 #1 新增） | 与组合 Sharpe 同口径：等权合并日收益率 → `_compute_sortino(combined)` | Constitution L1 首要 KPI；比率不可直接平均；与 Sharpe 同口径保证可比 |
+| **策略名校验**（迭代 #1 新增） | `_run_group` 进入策略循环前检查 `strategy not in STRATEGY_REGISTRY` → `logger.warning` + `continue` | 防止策略名拼写错误被静默跳过（迭代 #1 修复的 bug：`main.py` 误用 `"rsi"/"macd"/"bollinger"` 简称导致 3 个策略 6 天未跑） |
 | **参数按组** | 同组共用参数，不对单只优化 | 防过拟合（详见 02-strategy-engine.md 6.3） |
 | **历史分组对齐** | 矩阵回测使用 point-in-time 分组（按回测时间点重算波动率），而非当前静态分组 | 避免回测静态分组而实盘动态分组导致回测/实盘不一致 |
 | **实盘 ensemble 对齐** | MatrixBacktest 的 ensemble 权重优化须在"单点离散值聚合"语义下验证 | 实盘只取 iloc[-1] 单点离散值加权，与序列级加权不等价，权重必须在相同语义下产出 |

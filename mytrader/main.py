@@ -24,6 +24,29 @@ import sys
 from pathlib import Path
 
 
+# ---------------------------------------------------------------------------
+# Walk-Forward 重优化配置（迭代 #1 提为模块级常量，便于回归测试）
+# ⚠️ 策略名必须与 mytrader/strategy/strategies/*.py 中 @register_strategy(...)
+#    装饰器的名字完全一致。回归测试 test_reoptimize_strategy_names_match_registry
+#    会断言 REOPTIMIZE_STRATEGIES ⊆ STRATEGY_REGISTRY.keys()，防止策略名拼写
+#    错误导致矩阵回测静默跳过整类策略。
+# ---------------------------------------------------------------------------
+
+REOPTIMIZE_STRATEGIES: list[str] = [
+    "dual_ma",
+    "rsi_mean_revert",
+    "macd_cross",
+    "bollinger_band",
+]
+
+REOPTIMIZE_PARAM_GRIDS: dict[str, dict[str, list]] = {
+    "dual_ma":         {"fast": [5, 10], "slow": [20, 40, 60]},
+    "rsi_mean_revert": {"period": [14], "oversold": [30], "overbought": [70]},
+    "macd_cross":      {"fast": [12], "slow": [26], "signal_period": [9]},
+    "bollinger_band":  {"period": [20], "std_dev": [2.0]},
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="mytrader",
@@ -310,13 +333,16 @@ def _run_reoptimize(config: "Any", logger: "Any") -> None:
     universe.recompute_volatility_tiers(max_workers=4)
 
     mb = MatrixBacktest(store=store, universe=universe, years=5, top_k=2)
-    strategies = ["dual_ma", "rsi", "macd", "bollinger"]
-    param_grids = {
-        "dual_ma": {"fast": [5, 10], "slow": [20, 40, 60]},
-        "rsi":     {"period": [14], "oversold": [30], "overbought": [70]},
-        "macd":    {"fast": [12], "slow": [26], "signal_period": [9]},
-        "bollinger": {"period": [20], "std_dev": [2.0]},
-    }
+
+    # ⚠️ 策略名必须与 @register_strategy(...) 装饰器中的名字完全一致。
+    # 早期版本误用 "rsi"/"macd"/"bollinger" 简称，与注册表
+    # ("rsi_mean_revert"/"macd_cross"/"bollinger_band") 不匹配，
+    # 导致这 3 个策略在矩阵回测中被 _backtest_one 静默跳过，
+    # strategy_weights.json 退化为仅 dual_ma（迭代 #1 修复）。
+    # 模块级常量 REOPTIMIZE_STRATEGIES / REOPTIMIZE_PARAM_GRIDS 便于回归测试
+    # （test_reoptimize_strategy_names_match_registry 防止策略名再次与注册表脱节）。
+    strategies = REOPTIMIZE_STRATEGIES
+    param_grids = REOPTIMIZE_PARAM_GRIDS
 
     output = Path("config/strategy_weights.json")
     report = mb.run(strategies=strategies, param_grids=param_grids, output_file=output)

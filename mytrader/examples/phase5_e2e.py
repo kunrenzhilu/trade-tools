@@ -73,7 +73,7 @@ def main() -> None:
         default_strategies = [
             {"strategy": "dual_ma",  "params": {"fast": 5, "slow": 60},
              "weight": 0.6, "backtest_sharpe": 1.2, "backtest_win_rate": 0.55},
-            {"strategy": "macd",     "params": {"fast": 12, "slow": 26, "signal_period": 9},
+            {"strategy": "macd_cross",  "params": {"fast": 12, "slow": 26, "signal_period": 9},
              "weight": 0.4, "backtest_sharpe": 1.0, "backtest_win_rate": 0.52},
         ]
         for gid in groups:

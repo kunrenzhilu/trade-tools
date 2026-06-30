@@ -234,6 +234,139 @@ Typical flow:
 
 **Do not load cb-acp-dev for strategic discussions.** Load meta-agent first. If execution is needed, meta-agent will reference cb-acp-dev.
 
+## Paper Trading Entry Protocol
+
+Paper trading has exactly **1 slot** and requires **≥1 month** (Constitution L7). This scarce resource must be used wisely.
+
+### What Paper Trading Tests
+
+Backtest + Walk-Forward test **strategy logic** ("does this strategy make money on historical data?").
+
+Paper trading tests **the system** ("does this system work in the real environment?"):
+
+| Problem type | Example | Backtest can find? |
+|-------------|---------|:-:|
+| Strategy logic error | Signal calculation bug | Yes |
+| Parameter overfitting | Walk-Forward exposes | Yes |
+| Data source failure | Alpaca API rate limit, yfinance IP ban | No |
+| Order execution issues | Slippage, partial fills, rejected orders | No |
+| System crash | Memory leak, process exit | No |
+| Unseen market behavior | New market regime | No |
+| Timing issues | Signal delay, timezone errors | No |
+| End-to-end pipeline | Data → Signal → Risk → Execution → Portfolio | No |
+
+**Key insight**: Paper trading is NOT for validating "is the strategy optimal?" — that's backtest's job. Paper is for "does the system work?" So you don't need the best strategy to go to paper — you need a non-broken strategy and a functional system.
+
+### Three Gates
+
+Enter paper trading only after passing all three gates:
+
+#### Gate 1: Strategy Is Not Broken (Backtest Verified)
+
+The strategy doesn't need to be optimal — it just needs to not be garbage:
+
+| Condition | Threshold | Rationale |
+|-----------|-----------|-----------|
+| Sortino | > 0.5 | Below 0.5 = no better than random, no testing value |
+| Max DD | ≤ 20% | Constitution hard constraint |
+| Walk-Forward | 4 rounds, no round with >15% loss | Not required to profit every round, but no disasters |
+| Ensemble diversity | ≥ 2 strategies in weights | Single strategy = no ensemble, fix that first |
+| Run `--reoptimize` | Actual weights produced, verified | Must have real numbers, not just code that should work |
+
+**If Gate 1 fails**: Continue iterating on strategy code. Do NOT go to paper.
+
+#### Gate 2: System Is Complete (End-to-End Works)
+
+The system can actually run in a real environment:
+
+| Condition | How to verify |
+|-----------|---------------|
+| AlpacaBroker connects to paper account | Run a test connection |
+| Scan orchestrator runs end-to-end | `python main.py --scan-now morning` |
+| Portfolio reconciliation works | Reconciliation module produces output |
+| Telegram notifications work | Already verified (iteration #1) |
+| Data source fallback works | yfinance → alpaca switch tested |
+| Process stays alive | Run for ≥ 1 hour without crash |
+
+**If Gate 2 fails**: This is Phase 6 work. Fix system issues before paper.
+
+#### Gate 3: Diminishing Returns on Code Iteration
+
+Continuing to iterate on code yields less value than real-environment testing:
+
+| Signal | Meaning |
+|--------|---------|
+| Last 3 iterations: cumulative Sortino improvement < 0.1 | Strategy is plateauing in backtest |
+| Next improvement ideas require live data | Can't progress without real market behavior |
+| Found a problem that only manifests in real execution | Must go to paper to reproduce |
+| No clear next task with expected ROI > cost of iteration | Time to test in real environment |
+
+**If Gate 3 is not reached**: Keep iterating — there's still measurable improvement to be had.
+
+### One-Slot Constraint
+
+Since paper trading has only 1 slot, when multiple versions are available:
+
+**Principle: Deploy the current best stable version. Do NOT wait for "the next better one."**
+
+Rationale:
+1. Paper tests the system, not the optimal strategy
+2. System problems (data disconnects, execution bugs) appear in any version
+3. 3 days of paper data is worth more than 3 days waiting for Sortino +0.4
+4. During paper, continue iterating strategy — replace next month with a better version
+
+**Exception**: If the current version has a known bug (Gate 1 not met), fix it first.
+
+### Paper Trading Parallel Work
+
+While paper trading runs (≥1 month), do NOT stop development:
+
+```
+Paper Trading (production layer)
+  │
+  │  Tests: data sources, execution, system stability, real market behavior
+  │  Runs: ≥1 month, collects daily results
+  │
+  └── If system crash → fix immediately (high priority)
+
+Research (parallel, does not touch paper)
+  │
+  │  Strategy optimization (new params, new strategies)
+  │  Parameter grid expansion
+  │  Walk-Forward experiments
+  │
+  └── Ready to deploy when paper period ends or system proves stable
+```
+
+Constitution L8: "Research ∥ Production — 研究层与生产层并行，互不阻塞"
+
+### Upgrade: Paper → Live
+
+After ≥1 month of paper trading with stable operation:
+
+| Condition | Threshold |
+|-----------|-----------|
+| Paper Sortino | ≥ 0.5 (confirms backtest is not purely overfitted) |
+| No system crashes in last 2 weeks | Stability |
+| All Telegram alerts working | User visibility |
+| Portfolio reconciliation matches broker | Data integrity |
+| User approval | Constitution L8: Live deployment is high-risk |
+
+**If paper results are significantly worse than backtest**: Investigate slippage, execution delay, data quality. Do NOT go live until the gap is understood.
+
+### Current Status (as of 2026-06-30)
+
+| Gate | Status | Blocker |
+|------|--------|---------|
+| Gate 1 | Unknown — iteration #1 fixed strategy name bug but did NOT run `--reoptimize`. Actual Sortino unknown. | Must run `--reoptimize` and check |
+| Gate 2 | Not met — AlpacaBroker auto mode not implemented, alpaca-py not installed | Phase 6 work |
+| Gate 3 | N/A — only 1 iteration so far | Need more data |
+
+**Immediate next steps**:
+1. Run `python main.py --reoptimize` — get actual Sortino/Sharpe/DD (Gate 1 check)
+2. If Gate 1 passes → Phase 6: AlpacaBroker auto mode (Gate 2 work)
+3. If Gate 1 fails → Continue strategy iteration (fix whatever the reoptimize reveals)
+
 ## Iteration History
 
 ### Iteration #1 (2026-06-30)

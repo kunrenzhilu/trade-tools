@@ -35,3 +35,6 @@ TODO：
 
 ## worldquant alpha101
 https://docs.dolphindb.com/en/Tutorials/wq101alpha.html
+
+## 多因子
+如何把海龟和当前的RSI都结合到多因子的模型？

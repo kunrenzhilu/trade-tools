@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pandas as pd
+from loguru import logger
 
 from mytrader.signal.filters.atr_filter import ATRFilter
 from mytrader.signal.filters.cooldown_filter import CooldownFilter
@@ -118,6 +119,11 @@ class SignalPipeline:
                 fs = f.apply(current, df)
                 if not fs.passed:
                     result.record_filtered(fs.rejected_by or f.name)
+                    logger.warning(
+                        f"[SignalFilter] {signal.symbol} {signal.direction.value} "
+                        f"rejected by {fs.rejected_by or f.name}: "
+                        f"{fs.rejection_reason}"
+                    )
                     rejected = True
                     break
                 current = signal

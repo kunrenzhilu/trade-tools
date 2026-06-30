@@ -241,7 +241,7 @@ def main() -> None:
         on_morning_scan=orchestrator.morning_scan,
         on_intraday_scan=orchestrator.intraday_scan,
         on_eod_check=orchestrator.eod_check,
-        on_reconciliation=_build_reconciliation_callback(components),
+        on_reconciliation=_build_reconciliation_callback(components, sync_fn=_on_data_sync),
         on_monthly_reoptimize=lambda: _run_reoptimize(config, logger),
     )
 
@@ -359,11 +359,21 @@ def _run_reoptimize(config: "Any", logger: "Any") -> None:
         pass
 
 
-def _build_reconciliation_callback(components: "Any") -> "Callable":
-    """构建对账回调（盘后 16:30 ET）。"""
+def _build_reconciliation_callback(components: "Any", sync_fn: "Any" = None) -> "Callable":
+    """构建对账回调（盘后 16:30 ET）。
+
+    盘后流程：先同步当日行情数据，再做持仓对账。
+    """
     from loguru import logger
 
     def on_reconciliation() -> None:
+        # 1. 先同步当日数据（修复：_on_data_sync 原本只在启动时跑，导致数据库不更新）
+        if sync_fn is not None:
+            try:
+                sync_fn()
+            except Exception as exc:
+                logger.warning(f"[Reconciliation] data sync failed: {exc}")
+        # 2. 持仓对账
         try:
             from mytrader.portfolio.reconciliation import ReconciliationService
             svc = ReconciliationService(

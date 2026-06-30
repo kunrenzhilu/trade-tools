@@ -117,14 +117,28 @@ For long-running background tasks, check the log:
 tail -20 /tmp/orchestrator.log | grep -E '^\['
 ```
 
-### Step 5: Post-Iteration Validation
+### Step 5: Post-Iteration Validation (Automated)
 
-After the iteration completes, verify:
+The orchestrator automatically performs these checks after each iteration:
 
-1. **Test suite**: Run `pytest` in `mytrader/` — test count should not decrease, all tests should pass
-2. **Git diff compliance**: Check changed files for forbidden patterns (RL imports, black-box strategies, DD threshold changes)
-3. **Documentation sync**: Verify `CODEBUDDY.md` and design docs are updated if architecture changed
-4. **Trajectory log**: Verify `alignment/iteration_trajectory.md` has a new entry
+1. **Test suite**: Runs `pytest` — checks passed/failed counts and compares test count before vs after (Constitution forbidden action #9: test coverage must not decrease)
+2. **Git diff compliance**: Checks changed `.py` files for forbidden patterns (RL imports, black-box strategies) and high-risk parameter changes (DD threshold, stop_loss, position limits)
+3. **High-risk file detection**: Checks if CodeBuddy touched files in `mytrader/risk/` or `mytrader/execution/` directories (Constitution L8: requires user approval)
+4. **Trajectory log check**: Detects whether CodeBuddy updated `iteration_trajectory.md` itself (via mtime comparison). If not, orchestrator auto-writes the entry from session data (方案 B)
+5. **Decision log check**: Same auto-detection for `decision_log.md`
+6. **Telegram notification**: Sends iteration result summary to Telegram (if `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` env vars are set)
+
+The validation results are printed to stdout and logged:
+
+```
+trajectory_updated_by_codebuddy: True/False
+decision_log_updated_by_codebuddy: True/False
+test_count: 467 → 478 (+11)
+high_risk_files: []
+violations: []
+```
+
+If CodeBuddy did NOT update the trajectory log, the orchestrator writes it automatically — no manual intervention needed.
 
 ### Step 6: Report
 

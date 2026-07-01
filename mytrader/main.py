@@ -357,6 +357,40 @@ def _run_reoptimize(config: "Any", logger: "Any") -> None:
         f"output={output}"
     )
 
+    # 迭代 #3：Walk-Forward 4 轮验证（Constitution L7 流水线硬要求）
+    # WF 是验证步骤，不影响 strategy_weights.json；结果输出到日志
+    try:
+        from mytrader.backtest.matrix_backtest import run_walk_forward
+        logger.info("[Reoptimize] starting Walk-Forward 4-round validation...")
+        wf_report = run_walk_forward(
+            mb=mb,
+            strategies=strategies,
+            param_grids=param_grids,
+            rounds=4,
+            train_months=18,
+            val_months=6,
+        )
+        for r in wf_report.rounds:
+            logger.info(
+                f"[WalkForward] Round {r.round_num}/4: "
+                f"train={r.train_start}~{r.train_end}, "
+                f"val={r.val_start}~{r.val_end}, "
+                f"sortino={r.val_sortino:.4f}, "
+                f"dd={r.val_max_dd:.4f}%, "
+                f"passed={r.passed}"
+            )
+        logger.info(
+            f"[WalkForward] Summary: pass_all_rounds={wf_report.pass_all_rounds}, "
+            f"max_val_dd={wf_report.max_val_dd:.4f}%"
+        )
+        if not wf_report.pass_all_rounds:
+            logger.warning(
+                "[WalkForward] NOT all rounds passed — "
+                "Constitution L7 requires all 4 rounds DD<=15% before paper trading."
+            )
+    except Exception as exc:
+        logger.error(f"[WalkForward] failed: {exc}", exc_info=True)
+
     # 热加载（如果 StrategyMatrixRunner 已在运行）
     try:
         from mytrader.strategy.matrix_runner import StrategyMatrixRunner

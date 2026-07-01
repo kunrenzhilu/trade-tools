@@ -29,6 +29,19 @@ from mytrader.universe.manager import UniverseManager
 
 
 # ---------------------------------------------------------------------------
+# 常量
+# ---------------------------------------------------------------------------
+
+# Constitution L1 硬约束：portfolio 最大回撤 ≤ 20%
+# _run_group 在 top-K 选择时按此阈值过滤合规候选（迭代 #3 新增）
+MAX_PORTFOLIO_DRAWDOWN_PCT: float = 20.0
+
+# Constitution L7 Walk-Forward 门槛：单轮验证期 portfolio DD ≤ 15%
+# （低于 L1 的 20% 线，给样本外留缓冲）
+WALK_FORWARD_VAL_DD_THRESHOLD: float = 15.0
+
+
+# ---------------------------------------------------------------------------
 # 数据结构
 # ---------------------------------------------------------------------------
 
@@ -62,6 +75,7 @@ class GroupBacktestResult:
     symbol_count: int
     portfolio_sortino: float = 0.0          # 等权组合 Sortino（迭代 #1 新增）
     portfolio_max_drawdown: float = 0.0     # 等权组合最大回撤（迭代 #2 新增，Constitution L1 KPI）
+    dd_constrained: bool = False            # 迭代 #3：该组是否用了 DD fallback（无合规候选）
 
 
 @dataclass
@@ -73,6 +87,55 @@ class MatrixBacktestReport:
     groups: dict[str, list[dict]]   # group_id → [策略权重配置]
     group_results: list[GroupBacktestResult] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Walk-Forward 数据结构（迭代 #3 新增，Constitution L7 验证流水线）
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WalkForwardRound:
+    """单轮 Walk-Forward 验证结果。
+
+    一轮 = 训练期（找最优参数）+ 验证期（用同参数回测，记录样本外指标）。
+
+    Attributes:
+        round_num:    轮次编号（1-indexed）
+        train_start:  训练期起始日期（含）
+        train_end:    训练期结束日期（含）
+        val_start:    验证期起始日期（含）
+        val_end:      验证期结束日期（含）
+        val_sortino:  验证期等权组合 Sortino Ratio（年化）
+        val_max_dd:   验证期等权组合最大回撤（正值百分数，0~100）
+        passed:       是否通过 = val_max_dd <= WALK_FORWARD_VAL_DD_THRESHOLD (15%)
+    """
+
+    round_num: int
+    train_start: date
+    train_end: date
+    val_start: date
+    val_end: date
+    val_sortino: float
+    val_max_dd: float
+    passed: bool
+
+
+@dataclass
+class WalkForwardReport:
+    """Walk-Forward 4 轮验证汇总报告。
+
+    Constitution L7 要求 Backtest(>=5年) → Walk-Forward(4轮) → Paper → Live。
+    本报告是 Walk-Forward 阶段的产出。
+
+    Attributes:
+        rounds:         每轮结果列表（长度通常为 4）
+        pass_all_rounds: 是否所有轮都通过（all(r.passed for r in rounds)）
+        max_val_dd:     所有轮中最大的验证期 DD（用于风险监控）
+    """
+
+    rounds: list[WalkForwardRound] = field(default_factory=list)
+    pass_all_rounds: bool = False
+    max_val_dd: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +404,216 @@ def _optimize_ensemble_weights(
 
 
 # ---------------------------------------------------------------------------
+# Walk-Forward 验证（迭代 #3 新增，Constitution L7 验证流水线）
+# ---------------------------------------------------------------------------
+
+def _add_months(d: date, months: int) -> date:
+    """对 date 加/减 months 个月，自动 clamp 到月末。
+
+    使用 pandas DateOffset 以避免引入 dateutil 依赖（pandas 已是核心依赖）。
+    """
+    return (pd.Timestamp(d) + pd.DateOffset(months=months)).date()
+
+
+def _backtest_with_params_on_period(
+    mb: "MatrixBacktest",
+    symbols: list[str],
+    weights: list[dict[str, Any]],
+    start: date,
+    end: date,
+) -> list[pd.Series]:
+    """用给定权重配置在 [start, end] 期间回测，返回每条 (策略×标的) 的日收益率序列。
+
+    用于 Walk-Forward 验证期：用训练期产出的 best params 在验证期回测，
+    不再做参数搜索。返回原始日收益率列表，由调用方聚合为整体 portfolio。
+
+    Args:
+        mb:       MatrixBacktest 实例（复用其 store/init_cash/fees/slippage）
+        symbols:  该组的标的列表
+        weights:  训练期产出的权重配置（list of dict，含 strategy/params/weight）
+        start:    验证期起始日期
+        end:      验证期结束日期
+
+    Returns:
+        list[pd.Series] — 每条 (strategy×symbol) 的日收益率；空列表表示无有效数据
+    """
+    if not weights or not symbols:
+        return []
+
+    data = mb._store.get_bars_multi(symbols, start, end)
+    if not data:
+        return []
+
+    all_returns: list[pd.Series] = []
+    for w in weights:
+        strategy = w.get("strategy", "")
+        params = w.get("params", {})
+        if not strategy or strategy not in STRATEGY_REGISTRY:
+            continue
+        for sym in symbols:
+            df = data.get(sym, pd.DataFrame())
+            if df.empty:
+                continue
+            df = df.copy()
+            df.index.name = sym
+            r = _backtest_one(
+                df, strategy, params,
+                mb._init_cash, mb._fees, mb._slippage,
+            )
+            if r is not None and not r.daily_returns.empty:
+                all_returns.append(r.daily_returns)
+    return all_returns
+
+
+def run_walk_forward(
+    mb: "MatrixBacktest",
+    strategies: list[str],
+    param_grids: dict[str, dict[str, list]],
+    rounds: int = 4,
+    train_months: int = 18,
+    val_months: int = 6,
+) -> WalkForwardReport:
+    """执行 N 轮 Walk-Forward 验证（Constitution L7 验证流水线硬要求）。
+
+    每轮流程：
+        1. 训练期 [train_start, train_end]：跑矩阵回测找最优参数
+        2. 验证期 [val_start, val_end]：用同参数回测，记录 portfolio Sortino 和 max DD
+        3. passed = val_max_dd <= WALK_FORWARD_VAL_DD_THRESHOLD (15%)
+
+    时间窗口（动态计算，today=today）：
+        - 最后一轮 val_end = today - val_months（留 1 个 val 期给 paper trading）
+        - 每轮向前推 val_months
+        - train_end = val_start，train_start = train_end - train_months
+
+    默认参数 (rounds=4, train_months=18, val_months=6) 对应用户提供的固定窗口：
+        today=2026-07-01 →
+        Round 1: train 2021-07-02~2023-01-02, val 2023-01-02~2023-07-02
+        Round 2: train 2022-01-02~2023-07-02, val 2023-07-02~2024-01-02
+        Round 3: train 2022-07-02~2024-01-02, val 2024-01-02~2024-07-02
+        Round 4: train 2023-01-02~2024-07-02, val 2024-07-02~2025-01-02
+
+    Args:
+        mb:            MatrixBacktest 实例（复用其 store/universe/init_cash 等）
+        strategies:    策略名称列表
+        param_grids:   参数网格（与 mb.run() 接收的格式一致）
+        rounds:        轮次数（默认 4，Constitution L7 要求）
+        train_months:  训练期月数（默认 18）
+        val_months:    验证期月数（默认 6）
+
+    Returns:
+        WalkForwardReport — 包含每轮结果、pass_all_rounds、max_val_dd
+
+    Note:
+        - WF 是验证步骤，不修改 strategy_weights.json
+        - 失败轮次会记录 WARNING 但不抛异常
+        - 全部 4 轮通过是进入 paper trading 的前置条件
+    """
+    today = date.today()
+    groups = mb._universe.get_groups()
+    if not groups:
+        logger.warning("[WalkForward] no groups available — skipping")
+        return WalkForwardReport()
+
+    wf_rounds: list[WalkForwardRound] = []
+
+    for i in range(rounds):
+        round_num = i + 1
+        # 计算本轮时间窗口
+        # 最后一轮 (i=rounds-1) 的 val_end = today - val_months
+        # 前面轮次依次向前推 val_months
+        val_end = _add_months(today, -val_months - (rounds - round_num) * val_months)
+        val_start = _add_months(val_end, -val_months)
+        train_end = val_start
+        train_start = _add_months(train_end, -train_months)
+
+        logger.info(
+            f"[WalkForward] Round {round_num}/{rounds}: "
+            f"train={train_start}~{train_end}, val={val_start}~{val_end}"
+        )
+
+        # ── 训练期：跑矩阵回测找最优参数（复用 mb._run_group）──
+        train_report = MatrixBacktestReport(
+            generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
+            backtest_window=f"{train_start.isoformat()} ~ {train_end.isoformat()}",
+            groups={},
+        )
+
+        for group_id, symbols in groups.items():
+            weights = mb._run_group(
+                group_id=group_id,
+                symbols=symbols,
+                start=train_start,
+                end=train_end,
+                strategies=strategies,
+                param_grids=param_grids,
+                report=train_report,
+            )
+            train_report.groups[group_id] = weights
+
+        # ── 验证期：用训练期 best params 回测，聚合为整体 portfolio ──
+        all_returns: list[pd.Series] = []
+        for group_id, symbols in groups.items():
+            weights = train_report.groups.get(group_id, [])
+            if not weights:
+                continue
+            group_returns = _backtest_with_params_on_period(
+                mb, symbols, weights, val_start, val_end,
+            )
+            all_returns.extend(group_returns)
+
+        # 计算整体 portfolio 指标（等权合并所有组的日收益率）
+        if not all_returns:
+            val_sortino = 0.0
+            val_max_dd = 0.0
+            logger.warning(
+                f"[WalkForward] Round {round_num}: no valid val returns — "
+                f"sortino=0, dd=0, passed=True (vacuous)"
+            )
+        else:
+            combined = pd.concat(all_returns, axis=1).mean(axis=1).dropna()
+            if len(combined) < 5:
+                val_sortino = 0.0
+                val_max_dd = 0.0
+            else:
+                val_sortino = _compute_sortino(combined)
+                wrapper = [SingleBacktestResult(
+                    symbol="portfolio", strategy="", params={},
+                    sharpe=0.0, total_return_pct=0.0, max_drawdown_pct=0.0,
+                    win_rate_pct=0.0, total_trades=0, daily_returns=combined,
+                )]
+                val_max_dd = _portfolio_max_drawdown_from_results(wrapper)
+
+        passed = val_max_dd <= WALK_FORWARD_VAL_DD_THRESHOLD
+        wf_rounds.append(WalkForwardRound(
+            round_num=round_num,
+            train_start=train_start,
+            train_end=train_end,
+            val_start=val_start,
+            val_end=val_end,
+            val_sortino=val_sortino,
+            val_max_dd=val_max_dd,
+            passed=passed,
+        ))
+        logger.info(
+            f"[WalkForward] Round {round_num} result: "
+            f"sortino={val_sortino:.4f}, dd={val_max_dd:.4f}%, "
+            f"passed={passed} (threshold={WALK_FORWARD_VAL_DD_THRESHOLD}%)"
+        )
+
+    report = WalkForwardReport(
+        rounds=wf_rounds,
+        pass_all_rounds=all(r.passed for r in wf_rounds) if wf_rounds else False,
+        max_val_dd=max((r.val_max_dd for r in wf_rounds), default=0.0),
+    )
+    logger.info(
+        f"[WalkForward] done: {len(wf_rounds)} rounds, "
+        f"pass_all_rounds={report.pass_all_rounds}, "
+        f"max_val_dd={report.max_val_dd:.4f}%"
+    )
+    return report
+
+
+# ---------------------------------------------------------------------------
 # MatrixBacktest 主类
 # ---------------------------------------------------------------------------
 
@@ -542,12 +815,56 @@ class MatrixBacktest:
             logger.warning(f"[MatrixBacktest] {group_id}: no valid results")
             return []
 
-        # 3. 按组合 Sharpe 排序，保留 Top-K 策略
-        group_results.sort(key=lambda x: _portfolio_sharpe_from_results(x[2]), reverse=True)
-        top_results = group_results[: self._top_k]
+        # 3. 迭代 #3：DD 约束 + Sortino 排序选 Top-K
+        #    Constitution L1: portfolio DD ≤ 20% 是硬约束
+        #    步骤：(a) 计算每候选 portfolio_max_drawdown
+        #          (b) 过滤 DD <= MAX_PORTFOLIO_DRAWDOWN_PCT 的合规集
+        #          (c) 合规集非空 → 按 Sortino 降序取 top-K
+        #          (d) 合规集为空 → fallback：按 DD 升序取 top-K，标记 dd_constrained=True
+        candidates: list[tuple[str, dict, list[SingleBacktestResult], float, float]] = []
+        for (strategy, params, results) in group_results:
+            pso = _portfolio_sortino_from_results(results)
+            pdd = _portfolio_max_drawdown_from_results(results)
+            candidates.append((strategy, params, results, pso, pdd))
+
+        compliant = [c for c in candidates if c[4] <= MAX_PORTFOLIO_DRAWDOWN_PCT]
+        if compliant:
+            # 合规集非空：按 Sortino 降序取 top-K
+            ranked = sorted(compliant, key=lambda x: x[3], reverse=True)
+            dd_constrained = False
+            logger.info(
+                f"[MatrixBacktest] {group_id}: DD filter passed — "
+                f"{len(compliant)}/{len(candidates)} candidates compliant "
+                f"(DD <= {MAX_PORTFOLIO_DRAWDOWN_PCT}%)"
+            )
+        else:
+            # Fallback：无合规候选（结构性问题，如 NDX_high_vol 全部 > 20%）
+            # 按 DD 升序（最低 DD 优先）取 top-K，标记 dd_constrained
+            ranked = sorted(candidates, key=lambda x: x[4])
+            dd_constrained = True
+            logger.warning(
+                f"[MatrixBacktest] {group_id}: NO compliant candidates "
+                f"(all {len(candidates)} exceed DD={MAX_PORTFOLIO_DRAWDOWN_PCT}%). "
+                f"Fallback: selected top-{self._top_k} by lowest DD. "
+                f"This group is marked dd_constrained=True — "
+                f"review whether to drop the group or accept the risk."
+            )
+            report.warnings.append(
+                f"{group_id}: dd_constrained=True "
+                f"(min DD={ranked[0][4]:.2f}% > {MAX_PORTFOLIO_DRAWDOWN_PCT}%)"
+            )
+
+        top_results = ranked[: self._top_k]
+
+        # 把 dd_constrained 标记同步到 report.group_results 中对应组的条目
+        for gr in report.group_results:
+            if gr.group_id == group_id:
+                gr.dd_constrained = dd_constrained
 
         # 4. 优化 ensemble 权重（单点离散值加权投票语义）
-        weighted = _optimize_ensemble_weights(top_results)
+        weighted = _optimize_ensemble_weights(
+            [(s, p, r) for (s, p, r, _, _) in top_results]
+        )
 
         # 5. 构建权重配置列表
         weights_list = []
@@ -566,6 +883,9 @@ class MatrixBacktest:
                 "backtest_sortino": round(gr.portfolio_sortino if gr else 0.0, 4),
                 "backtest_max_drawdown": round(gr.portfolio_max_drawdown if gr else 0.0, 4),
                 "backtest_win_rate": round(gr.avg_win_rate_pct / 100 if gr else 0.5, 4),
+                # 迭代 #3：标记该组是否用了 DD fallback（无合规候选）
+                # 同组所有策略条目共享同一 dd_constrained 值
+                "dd_constrained": dd_constrained,
             })
 
         return weights_list

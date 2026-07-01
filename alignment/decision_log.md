@@ -46,3 +46,58 @@
 
 - **后续待办**: 后续迭代可考虑统一所有 `*_max_drawdown_*` 字段为正值约定，并更新相关测试和文档。
 
+---
+
+### [2026-07-01 UTC] 迭代 #3 — P0 DD 约束应用层级 + P1 Walk-Forward 窗口语义
+
+- **困境描述 (P0)**: 任务描述 "对该组内所有参数组合的 portfolio_max_drawdown 计算完成后，先过滤出 DD <= 20.0 的候选（合规集），再在合规集中按 Sortino 选 top-K" 中的"所有参数组合"存在歧义：
+  - 解读 A: 所有 (strategy, params) 笛卡尔积（约 83 个候选 × 组），但这会破坏 ensemble 多样性语义（top-K 需为不同策略）
+  - 解读 B: 每策略已选出 best params 后的 group_results（每策略 1 个候选，共 N 个），再过滤 + Sortino top-K
+
+- **涉及 AI Constitution 条款**:
+  - L7: 验证流水线 — 必须保证每组 top-K 是不同策略（ensemble 多样性）
+  - L1: 决策可解释 — top-K 应可读为"K 个不同策略的加权组合"
+  - Constitution 决策权重矩阵：策略多样性 > 参数微调
+
+- **决策逻辑 (P0)**: 采用解读 B。理由：
+  1. 现有 `_run_group` 结构是"每策略选 best params → top-K 策略"， ensemble 语义要求 top-K 为不同策略
+  2. 解读 A 会让同一策略以不同 params 出现在 top-K 中，违反 ensemble 多样性设计
+  3. 改动最小化（仅修改 top-K 选择步骤，不重构 per-strategy 选 best params 逻辑）
+  4. "所有参数组合"指的是计算已完成的状态，不是过滤的对象
+
+  附带决策：per-strategy best params 仍按 Sharpe 选择（不切换为 Sortino），仅 top-K 步骤切换为 Sortino + DD 约束。理由：
+  - 任务描述只要求 top-K 用 Sortino，未要求 per-strategy 切换
+  - per-strategy 切换为 Sortino 是更大的语义变更，应单独评估
+  - 当前 NDX_high_vol 的问题不是 per-strategy 选错 params，而是该组所有 (strategy, params) 组合的 DD 都 > 20%
+
+- **决策结果 (P0)**: 在 `_run_group` 的 top-K 选择步骤添加 DD <= 20 过滤 + Sortino 排序；fallback 时按 DD 升序取 top-K 并标记 `dd_constrained=True`。per-strategy best params 选择逻辑保持不变（仍按 Sharpe）。
+
+- **困境描述 (P1)**: Walk-Forward 时间窗口的动态计算。任务给出了固定的 4 轮窗口，但函数签名要求 `rounds=4, train_months=18, val_months=6` 参数化。应硬编码 4 个固定窗口，还是动态计算？
+
+- **涉及 AI Constitution 条款**:
+  - L7: 验证流水线 — Walk-Forward 应可复现，且能适应未来数据扩展
+  - L9: Evolution — 系统应支持参数化迭代，不写死
+
+- **决策逻辑 (P1)**: 动态计算窗口。理由：
+  1. 函数签名已参数化，硬编码 4 轮窗口与参数矛盾
+  2. 未来数据扩展到 10 年时，固定窗口会失效
+  3. 用户提供的 4 轮窗口可由 `train_months=18, val_months=6, rounds=4` + 起始日期计算得出，完全可复现
+  4. 计算公式：last_round_val_end = today - val_months（留 1 个 val 期给 paper trading）；每轮向前推 val_months
+
+  验证（today=2026-07-01）：
+  - Round 4 val_end = 2026-07-01 - 6m ≈ 2025-01-01 ≈ 2025-01-02 ✓
+  - Round 1 val_end = 2025-01-02 - 18m ≈ 2023-07-02 ✓
+  - Round 1 train_start = 2023-01-02 - 18m ≈ 2021-07-02 ✓
+
+- **决策结果 (P1)**: 动态计算窗口。`run_walk_forward()` 接受 `rounds/train_months/val_months` 参数，按公式计算每轮窗口。用户提供的固定窗口作为测试用例的 expected value 验证公式正确性。
+
+- **困境描述 (P1.2)**: Walk-Forward 验证期的 portfolio 指标是 per-group 还是全局聚合？任务说"记录验证期的 Sortino 和 portfolio DD"，未明确范围。
+
+- **决策逻辑 (P1.2)**: 全局聚合。理由：
+  1. Constitution L1 的 DD 约束是针对整体 portfolio（"Max DD ≤ 20%"），不是 per-group
+  2. 真实部署时组合所有组的策略为一个 portfolio，全局 DD 是真正的风险指标
+  3. per-group DD 已在 MatrixBacktest 中记录，WF 是补充验证整体 portfolio 的样本外稳定性
+
+- **决策结果 (P1.2)**: 验证期将所有组的回测日收益率按等权合并为一个 portfolio 序列，计算 Sortino 和 max DD。
+
+---

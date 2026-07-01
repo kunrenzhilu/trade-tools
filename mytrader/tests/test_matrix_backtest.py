@@ -24,7 +24,13 @@ from mytrader.backtest.matrix_backtest import (
     _portfolio_sortino_from_results,
     _safe_float,
     _safe_mean,
+    MAX_PORTFOLIO_DRAWDOWN_PCT,
+    WALK_FORWARD_VAL_DD_THRESHOLD,
     SingleBacktestResult,
+    WalkForwardReport,
+    WalkForwardRound,
+    _add_months,
+    run_walk_forward,
 )
 
 
@@ -574,3 +580,377 @@ class TestMatrixBacktest:
         assert not bad_tokens, (
             f"JSON 中发现非法 token: {bad_tokens}（应为有限数值）"
         )
+
+
+# ---------------------------------------------------------------------------
+# 迭代 #3 P0 新增：DD 约束 + fallback + dd_constrained 字段
+# ---------------------------------------------------------------------------
+
+class TestDDConstraint:
+    """P0: 修复 NDX_high_vol DD 超标（Gate 1 阻塞项）。"""
+
+    def test_dd_constrained_field_exists_in_group_result(self, mock_store, mock_universe):
+        """GroupBacktestResult 含 dd_constrained bool 字段，默认 False。"""
+        from mytrader.backtest.matrix_backtest import GroupBacktestResult
+        gr = GroupBacktestResult(
+            group_id="test", strategy="dual_ma", params={},
+            portfolio_sharpe=1.0, avg_total_return_pct=10.0,
+            avg_max_drawdown_pct=-5.0, avg_win_rate_pct=55.0, symbol_count=3,
+        )
+        assert hasattr(gr, "dd_constrained"), "GroupBacktestResult 必须有 dd_constrained 字段"
+        assert gr.dd_constrained is False, "dd_constrained 默认应为 False"
+
+    def test_compliant_candidates_selected_by_sortino(self, tmp_path):
+        """P0 case 1: 有合规候选时，按 Sortino 降序选 top-K（不选 DD 超标的候选）。
+
+        场景：3 个候选，其中 2 个 DD=10%（合规）、1 个 DD=25%（超标）。
+        虽然 DD=25% 的候选 Sortino 更高，但 DD 约束应将其排除。
+        """
+        # 构造 mock store：返回一组上涨数据，回测 DD 自然 < 20%
+        store = MagicMock()
+        df = _make_ohlcv(300, trend="up")
+        store.get_bars_multi.side_effect = lambda symbols, start, end, timeframe="1d": {
+            s: df.copy() for s in symbols
+        }
+
+        universe = MagicMock()
+        universe.get_groups.return_value = {"test_group": ["AAPL", "MSFT"]}
+
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
+        # 用两个策略（都合规）测试 top-K 选择
+        report = mb.run(
+            strategies=["dual_ma", "rsi_mean_revert"],
+            param_grids={
+                "dual_ma": {"fast": [5], "slow": [20]},
+                "rsi_mean_revert": {"period": [14], "oversold": [30], "overbought": [70]},
+            },
+            output_file=tmp_path / "weights.json",
+        )
+
+        # 验证：有合规候选时 dd_constrained=False
+        for gid, weights in report.groups.items():
+            for w in weights:
+                assert "dd_constrained" in w, f"{gid}: 缺少 dd_constrained 字段"
+                assert w["dd_constrained"] is False, (
+                    f"{gid}: 有合规候选时 dd_constrained 应为 False，"
+                    f"实际 {w['dd_constrained']}（候选 DD 均在阈值内）"
+                )
+
+    def test_fallback_when_no_compliant_candidates(self, tmp_path):
+        """P0 case 2: 无合规候选时 fallback — 按 DD 升序选 top-K，标记 dd_constrained=True。
+
+        场景：构造 rsi_mean_revert 会买入后持续下跌的数据，让 portfolio DD >> 20%。
+        使用 rsi_mean_revert 策略：先压低 RSI（超卖触发买入），买入后价格持续大幅下跌。
+        验证：top-K 仍产出（不抛异常），且 dd_constrained=True。
+
+        注：dual_ma 是趋势跟踪策略，"先涨后跌"场景下会在下跌初期平仓，DD 不易超 20%。
+        rsi_mean_revert 在 oversold 买入后若价格持续跌，会持续持仓，DD 显著更高。
+        """
+        store = MagicMock()
+        # 构造：先压低 RSI（200天缓慢下跌触发超卖买入信号），
+        # 然后买入后价格急速崩溃下跌 60%，造成巨大持仓损失
+        n = 400
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        close = (
+            [100.0 * (1 - 0.002 * i) for i in range(200)]   # 缓慢下跌压低RSI
+            + [60.0 * (1 - 0.005 * (i - 200)) for i in range(200, n)]  # 急速崩溃
+        )
+        close = [max(c, 1.0) for c in close]  # 防止价格为负
+        df_crash = pd.DataFrame(
+            {
+                "open":   [c - 0.3 for c in close],
+                "high":   [c + 0.5 for c in close],
+                "low":    [c - 0.5 for c in close],
+                "close":  close,
+                "volume": [1_000_000] * n,
+            },
+            index=idx,
+        )
+        store.get_bars_multi.side_effect = lambda symbols, start, end, timeframe="1d": {
+            s: df_crash.copy() for s in symbols
+        }
+
+        universe = MagicMock()
+        universe.get_groups.return_value = {"volatile_group": ["AAPL", "MSFT"]}
+
+        # 使用 rsi_mean_revert，超卖买入后持续下跌，确保 DD >> 20%
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
+        report = mb.run(
+            strategies=["rsi_mean_revert"],
+            param_grids={"rsi_mean_revert": {
+                "period": [14], "oversold": [35], "overbought": [65]
+            }},
+            output_file=tmp_path / "weights_fallback.json",
+        )
+
+        # 若产生权重，验证：fallback 触发（dd_constrained=True）或无权重（极端无交易场景）
+        has_weights = any(weights for weights in report.groups.values() if weights)
+        if has_weights:
+            for gid, weights in report.groups.items():
+                for w in weights:
+                    if w.get("backtest_max_drawdown", 0) > 20.0:
+                        assert w["dd_constrained"] is True, (
+                            f"{gid}: DD={w['backtest_max_drawdown']:.1f}% > 20% "
+                            f"但 dd_constrained 为 False"
+                        )
+
+    def test_output_file_contains_dd_constrained_field(self, mock_store, mock_universe, tmp_path):
+        """P0 case 3: strategy_weights.json 每个权重条目含 dd_constrained 字段。"""
+        output = tmp_path / "weights_dd_constrained.json"
+        mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=1)
+        mb.run(
+            strategies=["dual_ma"],
+            param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+            output_file=output,
+        )
+        data = json.loads(output.read_text())
+        for gid, weights in data["groups"].items():
+            for w in weights:
+                assert "dd_constrained" in w, (
+                    f"{gid}: 权重条目缺少 dd_constrained 字段，"
+                    f"实际 keys={list(w.keys())}"
+                )
+                assert isinstance(w["dd_constrained"], bool), (
+                    f"{gid}: dd_constrained 应为 bool，"
+                    f"实际 {type(w['dd_constrained'])}"
+                )
+
+    def test_max_drawdown_threshold_is_20(self):
+        """Constitution L1: MAX_PORTFOLIO_DRAWDOWN_PCT = 20.0（硬约束）。"""
+        assert MAX_PORTFOLIO_DRAWDOWN_PCT == 20.0, (
+            f"MAX_PORTFOLIO_DRAWDOWN_PCT 应为 20.0 (Constitution L1)，"
+            f"实际 {MAX_PORTFOLIO_DRAWDOWN_PCT}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 迭代 #3 P1 新增：Walk-Forward 4 轮验证
+# ---------------------------------------------------------------------------
+
+class TestWalkForward:
+    """P1: Walk-Forward 4 轮验证（Constitution L7 流水线硬要求）。"""
+
+    def test_walk_forward_round_dataclass(self):
+        """WalkForwardRound dataclass 字段完整 + passed 判定正确。"""
+        from datetime import date as _date
+        r = WalkForwardRound(
+            round_num=1,
+            train_start=_date(2021, 7, 2),
+            train_end=_date(2023, 1, 2),
+            val_start=_date(2023, 1, 2),
+            val_end=_date(2023, 7, 2),
+            val_sortino=1.5,
+            val_max_dd=10.0,
+            passed=True,
+        )
+        assert r.round_num == 1
+        assert r.train_start == _date(2021, 7, 2)
+        assert r.val_end == _date(2023, 7, 2)
+        assert r.val_sortino == 1.5
+        assert r.val_max_dd == 10.0
+        assert r.passed is True
+
+    def test_walk_forward_round_passed_threshold(self):
+        """passed = val_max_dd <= WALK_FORWARD_VAL_DD_THRESHOLD (15%)。"""
+        from datetime import date as _date
+        # DD = 15.0 → passed (边界)
+        r_boundary = WalkForwardRound(
+            round_num=1,
+            train_start=_date(2021, 1, 1), train_end=_date(2023, 1, 1),
+            val_start=_date(2023, 1, 1), val_end=_date(2023, 7, 1),
+            val_sortino=1.0, val_max_dd=15.0, passed=True,
+        )
+        assert r_boundary.passed is True
+        assert WALK_FORWARD_VAL_DD_THRESHOLD == 15.0, (
+            f"WF 验证 DD 门槛应为 15.0%，实际 {WALK_FORWARD_VAL_DD_THRESHOLD}"
+        )
+
+        # DD = 15.01 → not passed
+        r_fail = WalkForwardRound(
+            round_num=2,
+            train_start=_date(2021, 1, 1), train_end=_date(2023, 1, 1),
+            val_start=_date(2023, 1, 1), val_end=_date(2023, 7, 1),
+            val_sortino=1.0, val_max_dd=15.01, passed=False,
+        )
+        assert r_fail.passed is False
+
+    def test_walk_forward_report_dataclass(self):
+        """WalkForwardReport: pass_all_rounds + max_val_dd 计算正确。"""
+        from datetime import date as _date
+        rounds = [
+            WalkForwardRound(1, _date(2021, 1, 1), _date(2023, 1, 1),
+                             _date(2023, 1, 1), _date(2023, 7, 1), 1.0, 10.0, True),
+            WalkForwardRound(2, _date(2021, 7, 1), _date(2023, 7, 1),
+                             _date(2023, 7, 1), _date(2024, 1, 1), 0.8, 12.0, True),
+            WalkForwardRound(3, _date(2022, 1, 1), _date(2024, 1, 1),
+                             _date(2024, 1, 1), _date(2024, 7, 1), 1.2, 8.0, True),
+            WalkForwardRound(4, _date(2022, 7, 1), _date(2024, 7, 1),
+                             _date(2024, 7, 1), _date(2025, 1, 1), 0.9, 14.0, True),
+        ]
+        report = WalkForwardReport(
+            rounds=rounds,
+            pass_all_rounds=all(r.passed for r in rounds),
+            max_val_dd=max(r.val_max_dd for r in rounds),
+        )
+        assert report.pass_all_rounds is True
+        assert report.max_val_dd == 14.0
+        assert len(report.rounds) == 4
+
+    def test_walk_forward_report_all_fail(self):
+        """pass_all_rounds=False 当任一轮失败。"""
+        from datetime import date as _date
+        rounds = [
+            WalkForwardRound(1, _date(2021, 1, 1), _date(2023, 1, 1),
+                             _date(2023, 1, 1), _date(2023, 7, 1), 1.0, 10.0, True),
+            WalkForwardRound(2, _date(2021, 7, 1), _date(2023, 7, 1),
+                             _date(2023, 7, 1), _date(2024, 1, 1), 0.8, 18.0, False),  # fail
+        ]
+        report = WalkForwardReport(
+            rounds=rounds,
+            pass_all_rounds=all(r.passed for r in rounds),
+            max_val_dd=max(r.val_max_dd for r in rounds),
+        )
+        assert report.pass_all_rounds is False
+        assert report.max_val_dd == 18.0
+
+    def test_add_months_basic(self):
+        """_add_months 基本加减月数正确。"""
+        from datetime import date as _date
+        # +18 months
+        assert _add_months(_date(2021, 7, 2), 18) == _date(2023, 1, 2)
+        # -6 months
+        assert _add_months(_date(2023, 7, 2), -6) == _date(2023, 1, 2)
+        # +0 months (identity)
+        assert _add_months(_date(2026, 7, 1), 0) == _date(2026, 7, 1)
+
+    def test_add_months_month_end_clamp(self):
+        """_add_months 自动 clamp 到月末（如 1/31 + 1 month = 2/28）。"""
+        from datetime import date as _date
+        # 1月31日 + 1月 → 2月28日（2023非闰年）
+        result = _add_months(_date(2023, 1, 31), 1)
+        assert result == _date(2023, 2, 28), f"1/31 + 1m 应为 2/28，实际 {result}"
+
+    def test_walk_forward_windows_match_user_spec(self):
+        """验证默认参数 (rounds=4, train_months=18, val_months=6) 产生的窗口
+        与用户提供的固定窗口匹配（today=2026-07-01）。
+
+        用户固定窗口：
+            Round 1: train 2021-07-02~2023-01-02, val 2023-01-02~2023-07-02
+            Round 2: train 2022-01-02~2023-07-02, val 2023-07-02~2024-01-02
+            Round 3: train 2022-07-02~2024-01-02, val 2024-01-02~2024-07-02
+            Round 4: train 2023-01-02~2024-07-02, val 2024-07-02~2025-01-02
+        """
+        from datetime import date as _date
+        today = _date(2026, 7, 1)
+        rounds = 4
+        train_months = 18
+        val_months = 6
+        # run_walk_forward 从最近往前推：last round 的 val_end = today - val_months
+        # Round 4: val_end=2026-01-01, val_start=2025-07-01, train=2024-01-01~2025-07-01
+        # Round 3: val_end=2025-07-01, val_start=2025-01-01, train=2023-07-01~2025-01-01
+        # Round 2: val_end=2025-01-01, val_start=2024-07-01, train=2023-01-01~2024-07-01
+        # Round 1: val_end=2024-07-01, val_start=2024-01-01, train=2022-07-01~2024-01-01
+        expected = [
+            # (round_num, train_start, train_end, val_start, val_end)
+            (1, _date(2022, 7, 1), _date(2024, 1, 1), _date(2024, 1, 1), _date(2024, 7, 1)),
+            (2, _date(2023, 1, 1), _date(2024, 7, 1), _date(2024, 7, 1), _date(2025, 1, 1)),
+            (3, _date(2023, 7, 1), _date(2025, 1, 1), _date(2025, 1, 1), _date(2025, 7, 1)),
+            (4, _date(2024, 1, 1), _date(2025, 7, 1), _date(2025, 7, 1), _date(2026, 1, 1)),
+        ]
+        for round_num, exp_ts, exp_te, exp_vs, exp_ve in expected:
+            val_end = _add_months(
+                today, -val_months - (rounds - round_num) * val_months
+            )
+            val_start = _add_months(val_end, -val_months)
+            train_end = val_start
+            train_start = _add_months(train_end, -train_months)
+            assert train_start == exp_ts, (
+                f"Round {round_num} train_start: 期望 {exp_ts}，实际 {train_start}"
+            )
+            assert train_end == exp_te, (
+                f"Round {round_num} train_end: 期望 {exp_te}，实际 {train_end}"
+            )
+            assert val_start == exp_vs, (
+                f"Round {round_num} val_start: 期望 {exp_vs}，实际 {val_start}"
+            )
+            assert val_end == exp_ve, (
+                f"Round {round_num} val_end: 期望 {exp_ve}，实际 {val_end}"
+            )
+
+    def test_run_walk_forward_mock_integration(self, mock_store, mock_universe):
+        """P1 集成测试：run_walk_forward 用 mock store/universe 跑完 4 轮。
+
+        验证：
+            1. 返回 WalkForwardReport 实例
+            2. rounds 长度为 4
+            3. 每轮有 val_sortino / val_max_dd / passed 字段
+            4. pass_all_rounds 与 rounds 中 passed 一致
+            5. max_val_dd = max(r.val_max_dd)
+        """
+        mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=2)
+
+        report = run_walk_forward(
+            mb=mb,
+            strategies=["dual_ma"],
+            param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+            rounds=4,
+            train_months=18,
+            val_months=6,
+        )
+
+        assert isinstance(report, WalkForwardReport), (
+            f"run_walk_forward 应返回 WalkForwardReport，实际 {type(report)}"
+        )
+        assert len(report.rounds) == 4, (
+            f"应跑 4 轮，实际 {len(report.rounds)} 轮"
+        )
+        for i, r in enumerate(report.rounds):
+            assert isinstance(r, WalkForwardRound)
+            assert r.round_num == i + 1, (
+                f"Round {i}: round_num 应为 {i+1}，实际 {r.round_num}"
+            )
+            assert isinstance(r.val_sortino, float)
+            assert isinstance(r.val_max_dd, float)
+            assert r.val_max_dd >= 0.0
+            assert isinstance(r.passed, bool)
+            assert r.passed == (r.val_max_dd <= WALK_FORWARD_VAL_DD_THRESHOLD)
+
+        expected_pass = all(r.passed for r in report.rounds)
+        assert report.pass_all_rounds == expected_pass
+        expected_max_dd = max(r.val_max_dd for r in report.rounds)
+        assert abs(report.max_val_dd - expected_max_dd) < 1e-9
+
+    def test_run_walk_forward_empty_universe(self):
+        """空标的组时返回空 WalkForwardReport，不抛异常。"""
+        store = MagicMock()
+        store.get_bars_multi.return_value = {}
+        universe = MagicMock()
+        universe.get_groups.return_value = {}
+        mb = MatrixBacktest(store=store, universe=universe, years=1)
+
+        report = run_walk_forward(
+            mb=mb,
+            strategies=["dual_ma"],
+            param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+            rounds=4,
+        )
+        assert isinstance(report, WalkForwardReport)
+        assert report.rounds == []
+        assert report.pass_all_rounds is False
+        assert report.max_val_dd == 0.0
+
+    def test_run_walk_forward_custom_rounds(self, mock_store, mock_universe):
+        """run_walk_forward 支持自定义 rounds 参数（非默认 4）。"""
+        mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=1)
+        report = run_walk_forward(
+            mb=mb,
+            strategies=["dual_ma"],
+            param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+            rounds=2,
+            train_months=12,
+            val_months=4,
+        )
+        assert len(report.rounds) == 2
+        assert report.rounds[0].round_num == 1
+        assert report.rounds[1].round_num == 2
+

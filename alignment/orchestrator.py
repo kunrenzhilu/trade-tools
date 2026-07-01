@@ -42,6 +42,7 @@ CONSTITUTION_FILE = ALIGNMENT_DIR / "ai_constitution.md"
 TRAJECTORY_FILE = ALIGNMENT_DIR / "iteration_trajectory.md"
 DECISION_LOG_FILE = ALIGNMENT_DIR / "decision_log.md"
 CODEBUDDY_FILE = PROJECT_ROOT / ".codebuddy" / "CODEBUDDY.md"
+ITERATIONS_DIR = PROJECT_ROOT / "iterations"  # 每次迭代的完整快照
 
 PYTHON_BIN = "/Users/rickouyang/miniforge3/envs/py312trade/bin/python"
 
@@ -85,6 +86,9 @@ class IterationResult:
     # 文件变更
     changed_files: list[str] = field(default_factory=list)
     error: str | None = None
+    # ACP buffer 溢出统计（LimitOverrunError，非致命）
+    buffer_overflow_count: int = 0
+    buffer_overflow_errors: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -519,6 +523,13 @@ def log_iteration(result: IterationResult, rules: ConstitutionRules):
         for f in result.high_risk_files_touched:
             entry += f"- ⚠️ {f}（需用户审批）\n"
 
+    if result.buffer_overflow_count > 0:
+        entry += f"\n### ACP Buffer 溢出（{result.buffer_overflow_count} 次）\n"
+        entry += "- 非致命错误：某条 JSON-RPC 消息超过 StreamReader limit\n"
+        entry += "- CodeBuddy 可能已完成部分工作，验证结果反映实际产出\n"
+        for err in result.buffer_overflow_errors:
+            entry += f"- ⚠️ {err}\n"
+
     entry += f"""
 ### Constitution 合规
 - DD 20% 约束: {"✅" if not result.violations else "⚠️ 检查违规"}
@@ -605,11 +616,100 @@ def log_decision_if_needed(result: IterationResult):
 - **涉及 AI Constitution 条款**: L8 高风险变更 / 禁止行为
 - **决策逻辑**: Orchestrator 自动检测到合规风险
 - **决策结果**: {d['action']}
-- **详情**: {d['details']}
+        - **详情**: {d['details']}
 - **用户反馈**: 待用户确认
 
 ---
 """)
+
+
+# ─── 迭代快照保存 ──────────────────────────────────────────────────────────
+
+
+def save_iteration_snapshot(result: IterationResult):
+    """将完整迭代快照保存到 iterations/iteration_N/ 目录。
+
+    与 iteration_trajectory.md（摘要留痕）互补，快照包含完整原始数据：
+    - prompt_template.md: 发送给 CodeBuddy 的完整 prompt（含 Constitution 注入）
+    - full_response.md: CodeBuddy 的全部文本输出
+    - heartbeat_log.txt: stdout 中的心跳和时间线（从 print 捕获）
+    - code_diff.patch: 迭代结束时的 git diff
+    - result.json: IterationResult 的结构化序列化
+    """
+    iter_num = get_next_iteration_number() - 1  # log_iteration 已调用，编号已分配
+    if iter_num < 1:
+        iter_num = 1
+    snapshot_dir = ITERATIONS_DIR / f"iteration_{iter_num}"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. result.json — 结构化结果
+    result_data = {
+        "iteration_id": result.iteration_id,
+        "task": result.task,
+        "status": result.status,
+        "start_time": result.start_time,
+        "end_time": result.end_time,
+        "duration_seconds": result.end_time - result.start_time if result.end_time else 0,
+        "updates_count": result.updates_count,
+        "tool_calls_count": len(result.tool_calls),
+        "team_events_count": len(result.team_events),
+        "permission_requests_count": len(result.permission_requests),
+        "changed_files": result.changed_files,
+        "violations": result.violations,
+        "high_risk_files_touched": result.high_risk_files_touched,
+        "test_count_before": result.test_count_before,
+        "test_count_after": result.test_count_after,
+        "test_result": result.test_result,
+        "trajectory_updated_by_codebuddy": result.trajectory_updated_by_codebuddy,
+        "decision_log_updated_by_codebuddy": result.decision_log_updated_by_codebuddy,
+        "buffer_overflow_count": result.buffer_overflow_count,
+        "buffer_overflow_errors": result.buffer_overflow_errors,
+        "error": result.error,
+    }
+    (snapshot_dir / "result.json").write_text(
+        json.dumps(result_data, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+
+    # 2. full_response.md — CodeBuddy 的全部文本输出
+    response_text = "\n---\n".join(result.text_responses) if result.text_responses else "(无文本输出)"
+    (snapshot_dir / "full_response.md").write_text(response_text, encoding="utf-8")
+
+    # 3. code_diff.patch — git diff 快照
+    try:
+        diff_result = subprocess.run(
+            ["git", "diff", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=str(PROJECT_ROOT),
+            timeout=15,
+        )
+        diff_content = diff_result.stdout if diff_result.stdout.strip() else "(无代码变更)"
+    except Exception as e:
+        diff_content = f"(git diff 失败: {e})"
+    (snapshot_dir / "code_diff.patch").write_text(diff_content, encoding="utf-8")
+
+    # 4. prompt_template.md — 记录任务描述（prompt 本身在 build_constitution_prompt 中构造）
+    (snapshot_dir / "prompt_template.md").write_text(
+        f"# 迭代 #{iter_num} Prompt\n\n"
+        f"**任务**: {result.task}\n\n"
+        f"**时间**: {datetime.fromtimestamp(result.start_time, tz=timezone.utc).isoformat()}\n\n"
+        f"**注**: 完整 prompt 由 build_constitution_prompt() 动态生成，"
+        f"注入了 ai_constitution.md 的禁止行为、验证流水线、代码规范等规则。\n",
+        encoding="utf-8",
+    )
+
+    # 5. tool_calls.json — 工具调用时间线
+    if result.tool_calls:
+        (snapshot_dir / "tool_calls.json").write_text(
+            json.dumps(result.tool_calls, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+
+    print(f"  快照已保存: {snapshot_dir}")
+
+
+
 
 
 # ─── Telegram 通知 ───────────────────────────────────────────────────────
@@ -661,6 +761,9 @@ def notify_iteration_result(result: IterationResult):
     if result.test_count_after != result.test_count_before and result.test_count_before > 0:
         delta = result.test_count_after - result.test_count_before
         msg += f"测试数变化: {result.test_count_before} → {result.test_count_after} ({delta:+d})\n"
+
+    if result.buffer_overflow_count > 0:
+        msg += f"⚠️ ACP buffer 溢出: {result.buffer_overflow_count} 次（非致命）\n"
 
     if result.violations:
         msg += f"\n*违规检测 ({len(result.violations)} 条):*\n"
@@ -735,6 +838,7 @@ async def run_iteration(
             "--permission-mode", "bypassPermissions",
             "--max-turns", str(max_turns),
             cwd=str(MYTRADER_ROOT),
+            transport_kwargs={"limit": 1024 * 1024},  # 64KB → 1MB
         ) as (conn, proc):
 
             await conn.initialize(protocol_version=PROTOCOL_VERSION)
@@ -765,6 +869,23 @@ async def run_iteration(
                     heartbeat_log("心跳")
                     last_heartbeat = time.time()
 
+    except ValueError as e:
+        # ACP _receive_loop 中 readline() 超限时，acp 库将 LimitOverrunError
+        # 包装为 ValueError("Separator is found, but chunk is longer than limit")。
+        # 这意味着某条 JSON-RPC 消息（如 tool result）超过了 StreamReader limit。
+        # 非致命：CodeBuddy 可能已完成大部分工作，应继续做迭代后验证。
+        err_msg = str(e)
+        if "Separator is found" in err_msg or "chunk is longer than limit" in err_msg:
+            result.buffer_overflow_count += 1
+            result.buffer_overflow_errors.append(
+                f"[{time.strftime('%H:%M:%S')}] {err_msg[:200]}"
+            )
+            elapsed = time.time() - result.start_time
+            print(f"[{elapsed//60:.0f}m{elapsed%60:02.0f}] ⚠️  ACP buffer overflow "
+                  f"(#{result.buffer_overflow_count}), 跳过此消息，继续验证")
+        else:
+            result.error = err_msg
+            result.status = "failed"
     except Exception as e:
         result.error = str(e)
         result.status = "failed"
@@ -773,6 +894,7 @@ async def run_iteration(
 
     # ─── 迭代后验证 ──────────────────────────────────────────────────
 
+    # buffer overflow 不阻止验证（result.error 未设置）
     if not result.error:
         # 1. 获取变更文件列表
         result.changed_files = get_changed_files()
@@ -797,6 +919,8 @@ async def run_iteration(
             result.status = "failed"  # 测试数下降 = 禁止行为 #9
         elif result.high_risk_files_touched:
             result.status = "partial"  # 高风险变更需审批
+        elif result.buffer_overflow_count > 0:
+            result.status = "partial"  # ACP 通信中断，结果可能不完整
         elif result.test_result and result.test_result.get("error"):
             result.status = "partial"
         else:
@@ -808,10 +932,13 @@ async def run_iteration(
     # 7. 补写 decision_log（如有需要）
     log_decision_if_needed(result)
 
-    # 8. Telegram 通知
+    # 8. 保存完整迭代快照到 iterations/iteration_N/
+    save_iteration_snapshot(result)
+
+    # 9. Telegram 通知
     notify_iteration_result(result)
 
-    # 9. 打印留痕状态
+    # 10. 打印留痕状态
     heartbeat_log(f"迭代完成 status={result.status}")
     print(f"  trajectory_updated_by_codebuddy: {result.trajectory_updated_by_codebuddy}")
     print(f"  decision_log_updated_by_codebuddy: {result.decision_log_updated_by_codebuddy}")
@@ -871,6 +998,8 @@ def main():
         for f in result.high_risk_files_touched:
             print(f"  ⚠️ {f}")
     print(f"测试数: {result.test_count_before} → {result.test_count_after}")
+    if result.buffer_overflow_count > 0:
+        print(f"⚠️  ACP buffer 溢出: {result.buffer_overflow_count} 次（非致命，验证仍执行）")
     print(f"trajectory 更新: {'CodeBuddy' if result.trajectory_updated_by_codebuddy else 'orchestrator 补写'}")
     print(f"decision_log 更新: {'CodeBuddy' if result.decision_log_updated_by_codebuddy else 'orchestrator 补写'}")
     if result.error:

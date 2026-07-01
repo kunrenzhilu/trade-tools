@@ -40,10 +40,16 @@ REOPTIMIZE_STRATEGIES: list[str] = [
 ]
 
 REOPTIMIZE_PARAM_GRIDS: dict[str, dict[str, list]] = {
-    "dual_ma":         {"fast": [5, 10], "slow": [20, 40, 60]},
-    "rsi_mean_revert": {"period": [14], "oversold": [30], "overbought": [70]},
-    "macd_cross":      {"fast": [12], "slow": [26], "signal_period": [9]},
-    "bollinger_band":  {"period": [20], "std_dev": [2.0]},
+    # 迭代 #2：从单点扩展为真网格。原单点网格（fast=[5,10], slow=[20,40,60]）
+    # 仅 6 个组合，无法充分探索参数空间。扩展后 4×5=20 个组合。
+    "dual_ma":         {"fast": [5, 10, 15, 20], "slow": [20, 30, 40, 60, 80]},
+    # 迭代 #2：从单点 [14,30,70] 扩展为 3×3×3=27 个组合，覆盖均值回归周期
+    # 与超买超卖阈值的常用范围。oversold/overbought 保持对称（25/75、30/70、35/65）。
+    "rsi_mean_revert": {"period": [7, 14, 21], "oversold": [25, 30, 35], "overbought": [65, 70, 75]},
+    # 迭代 #2：MACD 快/慢/信号周期网格 3×3×3=27 个组合，包含经典 12/26/9。
+    "macd_cross":      {"fast": [8, 12, 16], "slow": [21, 26, 32], "signal_period": [5, 9, 12]},
+    # 迭代 #2：布林带 3×3=9 个组合，覆盖常用 std_dev 范围 [1.5, 2.0, 2.5]。
+    "bollinger_band":  {"period": [15, 20, 25], "std_dev": [1.5, 2.0, 2.5]},
 }
 
 

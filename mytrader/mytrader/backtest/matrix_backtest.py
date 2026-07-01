@@ -60,7 +60,8 @@ class GroupBacktestResult:
     avg_max_drawdown_pct: float
     avg_win_rate_pct: float
     symbol_count: int
-    portfolio_sortino: float = 0.0   # 等权组合 Sortino（迭代 #1 新增）
+    portfolio_sortino: float = 0.0          # 等权组合 Sortino（迭代 #1 新增）
+    portfolio_max_drawdown: float = 0.0     # 等权组合最大回撤（迭代 #2 新增，Constitution L1 KPI）
 
 
 @dataclass
@@ -77,6 +78,49 @@ class MatrixBacktestReport:
 # ---------------------------------------------------------------------------
 # 核心函数
 # ---------------------------------------------------------------------------
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """NaN/None/非数值安全转 float（迭代 #2 新增）。
+
+    问题背景：vectorbt 在无交易场景下，`pf.stats()` 的 Win Rate / Sharpe 等
+    字段会返回 NaN。`float(NaN or 0.0)` 仍是 NaN（NaN 是 truthy），导致
+    JSON 序列化写出非法 JSON（NaN/Infinity 非 JSON 规范）。
+
+    处理顺序：
+        1. None → default
+        2. 数值类型但 NaN/Inf → default
+        3. 非数值（字符串等）尝试 float() 转换，失败 → default
+    """
+    if value is None:
+        return default
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not np.isfinite(f):   # 拦截 NaN / +Inf / -Inf
+        return default
+    return f
+
+
+def _safe_mean(values: Any, default: float = 0.0) -> float:
+    """空列表 / 全 NaN 安全的均值（迭代 #2 新增）。
+
+    问题背景：`np.mean([])` 会触发 RuntimeWarning 并返回 NaN；
+    `np.mean([NaN, NaN])` 直接返回 NaN。在 GroupBacktestResult 聚合时
+    若某组只有 1 个标的且其字段为 NaN，会导致下游 JSON 序列化失败。
+
+    行为：
+        - 空列表 / 全 NaN → default
+        - 部分 NaN → 自动忽略 NaN 后取均值（np.nanmean 语义）
+    """
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return default
+    mask = np.isfinite(arr)
+    if not mask.any():
+        return default
+    return float(arr[mask].mean())
+
 
 def _compute_sharpe(returns: pd.Series, periods_per_year: int = 252) -> float:
     """从日收益率序列计算年化 Sharpe Ratio。"""
@@ -186,11 +230,11 @@ def _backtest_one(
             symbol=str(df.index.name or ""),
             strategy=strategy_name,
             params=params,
-            sharpe=float(stats.get("Sharpe Ratio", 0.0) or 0.0),
-            total_return_pct=float(stats.get("Total Return [%]", 0.0) or 0.0),
-            max_drawdown_pct=float(stats.get("Max Drawdown [%]", 0.0) or 0.0),
-            win_rate_pct=float(stats.get("Win Rate [%]", 0.0) or 0.0),
-            total_trades=int(stats.get("Total Trades", 0) or 0),
+            sharpe=_safe_float(stats.get("Sharpe Ratio")),
+            total_return_pct=_safe_float(stats.get("Total Return [%]")),
+            max_drawdown_pct=_safe_float(stats.get("Max Drawdown [%]")),
+            win_rate_pct=_safe_float(stats.get("Win Rate [%]")),
+            total_trades=int(_safe_float(stats.get("Total Trades"), default=0.0)),
             daily_returns=daily_returns,
             sortino=_compute_sortino(daily_returns),
         )
@@ -224,6 +268,40 @@ def _portfolio_sortino_from_results(results: list[SingleBacktestResult]) -> floa
         return 0.0
     combined = pd.concat(valid, axis=1).mean(axis=1)
     return _compute_sortino(combined)
+
+
+def _portfolio_max_drawdown_from_results(
+    results: list[SingleBacktestResult],
+) -> float:
+    """等权合并组内日收益率序列，计算组合最大回撤（迭代 #2 新增，Constitution L1 KPI）。
+
+    与 `_portfolio_sharpe_from_results` 同语义：不能取各标的 DD 算术平均，
+    因为 DD 是路径依赖的比率。正确做法是先把��内日收益率等权合并为组合序列，
+    再 cumprod → cummax → drawdown → max。
+
+    返回值约定：百分比形式（与 `SingleBacktestResult.max_drawdown_pct` 一致，
+    vectorbt stats 中 `Max Drawdown [%]` 同样是百分数，例如 -15.2 表示 15.2% 回撤）。
+    本函数返回正值（0.0 ~ 100.0）便于聚合与 JSON 输出。
+
+    退化处理：
+        - 无有效日收益率 → 0.0
+        - 全 0 收益率（cumprod 恒为 1.0）→ 0.0
+    """
+    valid = [r.daily_returns for r in results if not r.daily_returns.empty]
+    if not valid:
+        return 0.0
+    combined = pd.concat(valid, axis=1).mean(axis=1).dropna()
+    if len(combined) < 2:
+        return 0.0
+    # 组合累计净值：初始 1.0，每日乘 (1 + r)
+    cumvalue = (1.0 + combined).cumprod()
+    peak = cumvalue.cummax()
+    drawdown = (cumvalue - peak) / peak   # 负值，0 表示无回撤
+    dd_max_pct = float(drawdown.min())    # 最负值，例如 -0.152
+    if not np.isfinite(dd_max_pct):
+        return 0.0
+    # 转为正百分数（与 vectorbt Max Drawdown [%] 的口径一致但取正号）
+    return abs(dd_max_pct) * 100.0
 
 
 def _optimize_ensemble_weights(
@@ -444,17 +522,20 @@ class MatrixBacktest:
                     strategy=strategy,
                     params=best_params,
                     portfolio_sharpe=best_sharpe,
-                    avg_total_return_pct=float(
-                        np.mean([r.total_return_pct for r in best_results])
+                    avg_total_return_pct=_safe_mean(
+                        [r.total_return_pct for r in best_results]
                     ),
-                    avg_max_drawdown_pct=float(
-                        np.mean([r.max_drawdown_pct for r in best_results])
+                    avg_max_drawdown_pct=_safe_mean(
+                        [r.max_drawdown_pct for r in best_results]
                     ),
-                    avg_win_rate_pct=float(
-                        np.mean([r.win_rate_pct for r in best_results])
+                    avg_win_rate_pct=_safe_mean(
+                        [r.win_rate_pct for r in best_results]
                     ),
                     symbol_count=len(best_results),
                     portfolio_sortino=best_sortino,
+                    portfolio_max_drawdown=_portfolio_max_drawdown_from_results(
+                        best_results
+                    ),
                 ))
 
         if not group_results:
@@ -483,6 +564,7 @@ class MatrixBacktest:
                 "weight": round(weight, 4),
                 "backtest_sharpe": round(gr.portfolio_sharpe if gr else 0.0, 4),
                 "backtest_sortino": round(gr.portfolio_sortino if gr else 0.0, 4),
+                "backtest_max_drawdown": round(gr.portfolio_max_drawdown if gr else 0.0, 4),
                 "backtest_win_rate": round(gr.avg_win_rate_pct / 100 if gr else 0.5, 4),
             })
 

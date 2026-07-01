@@ -23,3 +23,26 @@
   4. 考虑将 `test_send_test_message` 改为 mock 或移到单独的 smoke test 目录
 
 - **用户反馈**: 用户在 16:12 收到两条 Telegram 消息，要求记录问题，不中断当前迭代。
+
+---
+
+### [2026-07-01 UTC] 迭代 #2 — portfolio_max_drawdown 符号约定
+
+- **困境描述**: `_portfolio_max_drawdown_from_results` 的返回值符号选择存在歧义。vectorbt `pf.stats()["Max Drawdown [%]"]` 返回负值（例如 -15.2 表示 15.2% 回撤），而 `SingleBacktestResult.max_drawdown_pct` 沿用了这一负值约定。本次新增的 `portfolio_max_drawdown` 字段应保持一致（负值）还是取正值便于聚合和 JSON 输出？
+
+- **涉及 AI Constitution 条款**:
+  - L1: KPI 必须可解释、可比较 — 符号约定不一致会增加跨字段比较的认知负担
+  - L7: 代码规范 — 一致性优先
+
+- **决策逻辑**: 选择返回**正值百分数**（0.0 ~ 100.0），理由：
+  1. Constitution L1 的 DD≤20% 约束是正数表述，正值便于直接比较（`if dd > 20: alert`）
+  2. `backtest_max_drawdown` 字段输出到 JSON 供实盘监控读取，正值更符合外部消费者直觉
+  3. 聚合时（如跨组比较）正值可直接取 max，避免符号混乱
+  4. 与 `avg_max_drawdown_pct`（取各标的 `max_drawdown_pct` 算术平均，目前是负值）存在符号差异，但 `portfolio_max_drawdown` 是新字段，无历史包袱
+
+  代价：与 `SingleBacktestResult.max_drawdown_pct`（负值）和 `GroupBacktestResult.avg_max_drawdown_pct`（负值）符号不一致。但这两个旧字段本次迭代不改动（避免破坏性变更），后续迭代可统一为正值约定。
+
+- **决策结果**: `_portfolio_max_drawdown_from_results` 返回 `abs(dd_max_pct) * 100.0`（正值）。`GroupBacktestResult.portfolio_max_drawdown` 和 JSON 输出的 `backtest_max_drawdown` 均为正值。
+
+- **后续待办**: 后续迭代可考虑统一所有 `*_max_drawdown_*` 字段为正值约定，并更新相关测试和文档。
+

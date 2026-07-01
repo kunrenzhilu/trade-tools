@@ -16,7 +16,10 @@ from mytrader.strategy.indicators import atr as compute_atr
 
 # 波动率分层阈值（ATR% = ATR / close，近 60 日均值）
 _VOL_HIGH_THRESHOLD = 0.03   # ATR% > 3% → high
-_VOL_LOW_THRESHOLD  = 0.01   # ATR% < 1% → low；否则 mid
+# 迭代 #2：从 0.01 调到 0.02。原因：516 标的中 ATR% < 0.01 的仅 2 个，
+# 导致 low_vol 组只有 1 个标的、无分散化效应，组合 Sharpe/Sortino 退化为
+# 单标的指标。0.02 阈值下 low_vol 组约 30~50 只标的，分散化更充分。
+_VOL_LOW_THRESHOLD  = 0.02   # ATR% < 2% → low；否则 mid
 
 
 def compute_volatility_tier(df: pd.DataFrame, lookback: int = 20) -> str:

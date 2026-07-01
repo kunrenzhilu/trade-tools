@@ -19,8 +19,11 @@ from mytrader.backtest.matrix_backtest import (
     _backtest_one,
     _compute_sharpe,
     _compute_sortino,
+    _portfolio_max_drawdown_from_results,
     _portfolio_sharpe_from_results,
     _portfolio_sortino_from_results,
+    _safe_float,
+    _safe_mean,
     SingleBacktestResult,
 )
 
@@ -195,6 +198,92 @@ class TestHelpers:
             f"组合 Sortino({portfolio_sortino:.4f}) 与算术平均({arithmetic_avg:.4f}) "
             f"差异应 >1e-6，否则说明实现退化为算术平均"
         )
+
+    # ── _safe_float / _safe_mean（迭代 #2 新增）─────────────────────────────
+
+    def test_safe_float_handles_nan(self):
+        """NaN 是 truthy，`NaN or 0.0` 仍为 NaN；_safe_float 必须返回 default。"""
+        nan = float("nan")
+        assert _safe_float(nan) == 0.0
+        assert _safe_float(nan, default=-1.0) == -1.0
+
+    def test_safe_float_handles_none(self):
+        assert _safe_float(None) == 0.0
+        assert _safe_float(None, default=3.14) == 3.14
+
+    def test_safe_float_handles_inf(self):
+        assert _safe_float(float("inf")) == 0.0
+        assert _safe_float(float("-inf")) == 0.0
+
+    def test_safe_float_passes_normal_numbers(self):
+        assert _safe_float(1.5) == 1.5
+        assert _safe_float(0) == 0.0
+        assert _safe_float(-2.7) == -2.7
+        assert _safe_float("3.14") == 3.14   # 字符串数字可转
+
+    def test_safe_float_handles_non_numeric(self):
+        assert _safe_float("abc") == 0.0
+        assert _safe_float([1, 2, 3]) == 0.0
+        assert _safe_float(object()) == 0.0
+
+    def test_safe_mean_empty_list(self):
+        """空列表返回 default（np.mean([]) 会触发 RuntimeWarning 并返回 NaN）。"""
+        assert _safe_mean([]) == 0.0
+        assert _safe_mean([], default=2.0) == 2.0
+
+    def test_safe_mean_all_nan(self):
+        """全 NaN 列表返回 default。"""
+        assert _safe_mean([float("nan"), float("nan")]) == 0.0
+
+    def test_safe_mean_partial_nan(self):
+        """部分 NaN 自动忽略（nanmean 语义）。"""
+        result = _safe_mean([1.0, float("nan"), 3.0])
+        assert abs(result - 2.0) < 1e-9
+
+    def test_safe_mean_normal(self):
+        assert abs(_safe_mean([1.0, 2.0, 3.0]) - 2.0) < 1e-9
+
+    # ── _portfolio_max_drawdown_from_results（迭代 #2 新增）────────────────
+
+    def test_portfolio_max_drawdown_no_returns(self):
+        """无有效日收益率 → 0.0。"""
+        results: list[SingleBacktestResult] = []
+        assert _portfolio_max_drawdown_from_results(results) == 0.0
+
+    def test_portfolio_max_drawdown_all_positive(self):
+        """全正收益 → 无回撤，返回 0.0。"""
+        r = pd.Series([0.001] * 100)
+        results = [SingleBacktestResult("S1", "s", {}, 0.0, 0, 0, 0, 0, r)]
+        assert _portfolio_max_drawdown_from_results(results) == 0.0
+
+    def test_portfolio_max_drawdown_known_value(self):
+        """已知值验算：先涨后跌回测组合 DD。
+
+        组合等权日收益率 = r。cumvalue 从 1.0 涨到 1.05，再跌到 0.95。
+        peak = 1.05, trough = 0.95, DD = (0.95 - 1.05) / 1.05 ≈ -9.524%。
+        """
+        # 10 天 +1% → cumvalue 涨到 1.01^10 ≈ 1.1046
+        # 10 天 -1% → cumvalue 跌到 1.1046 * 0.99^10 ≈ 0.9994
+        # peak=1.1046, trough=0.9994, DD = (0.9994 - 1.1046) / 1.1046 ≈ -9.52%
+        returns = pd.Series([0.01] * 10 + [-0.01] * 10)
+        results = [SingleBacktestResult("S1", "s", {}, 0.0, 0, 0, 0, 0, returns)]
+        dd = _portfolio_max_drawdown_from_results(results)
+        assert dd > 0.0, "存在回撤时应返回正值"
+        assert 8.0 < dd < 11.0, f"DD 应在 9.5% 附近，实际 {dd:.4f}%"
+
+    def test_portfolio_max_drawdown_returns_positive_pct(self):
+        """返回值为正百分数（与 backtest_max_drawdown 输出口径一致）。"""
+        np.random.seed(42)
+        # 模拟一个带回撤的序列
+        r = pd.Series(np.concatenate([
+            np.random.normal(0.002, 0.005, 50),
+            np.random.normal(-0.003, 0.008, 30),
+            np.random.normal(0.001, 0.004, 50),
+        ]))
+        results = [SingleBacktestResult("S1", "s", {}, 0.0, 0, 0, 0, 0, r)]
+        dd = _portfolio_max_drawdown_from_results(results)
+        assert dd >= 0.0
+        assert isinstance(dd, float)
 
     def test_backtest_one_with_open(self):
         """传入 open= 参数，回测正常运行。"""
@@ -424,3 +513,64 @@ class TestMatrixBacktest:
             assert isinstance(gr.portfolio_sortino, float), (
                 f"portfolio_sortino 应为 float，实际 {type(gr.portfolio_sortino)}"
             )
+
+    # ── 迭代 #2 新增：portfolio_max_drawdown 字段 + backtest_max_drawdown 输出 ──
+
+    def test_group_results_have_portfolio_max_drawdown(self, mock_store, mock_universe):
+        """GroupBacktestResult.portfolio_max_drawdown 是非负浮点数。"""
+        mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=1)
+        report = mb.run(
+            strategies=["dual_ma"],
+            param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+        )
+        for gr in report.group_results:
+            assert isinstance(gr.portfolio_max_drawdown, float), (
+                f"portfolio_max_drawdown 应为 float，实际 {type(gr.portfolio_max_drawdown)}"
+            )
+            assert gr.portfolio_max_drawdown >= 0.0, (
+                f"portfolio_max_drawdown 应非负，实际 {gr.portfolio_max_drawdown}"
+            )
+
+    def test_output_file_contains_max_drawdown(self, mock_store, mock_universe, tmp_path):
+        """strategy_weights.json 每个权重条目含 backtest_max_drawdown 字段。"""
+        output = tmp_path / "weights_with_dd.json"
+        mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=1)
+        mb.run(
+            strategies=["dual_ma"],
+            param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+            output_file=output,
+        )
+        data = json.loads(output.read_text())
+        for gid, weights in data["groups"].items():
+            for w in weights:
+                assert "backtest_max_drawdown" in w, (
+                    f"{gid}: 权重条目缺少 backtest_max_drawdown 字段，"
+                    f"实际 keys={list(w.keys())}"
+                )
+                assert isinstance(w["backtest_max_drawdown"], (int, float)), (
+                    f"{gid}: backtest_max_drawdown 应为数值，"
+                    f"实际 {type(w['backtest_max_drawdown'])}"
+                )
+
+    def test_output_file_no_nan(self, mock_store, mock_universe, tmp_path):
+        """输出的 JSON 文件不能包含 NaN（否则非法 JSON）。
+
+        迭代 #2 修复的核心问题：vectorbt 无交易场景下 Win Rate 返回 NaN，
+        `float(NaN or 0.0)` 仍为 NaN（NaN 是 truthy），导致 JSON 序列化写出
+        非法 JSON（NaN/Infinity 非 JSON 规范）。_safe_float 修复后不应再出现。
+        """
+        output = tmp_path / "weights_no_nan.json"
+        mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=1)
+        mb.run(
+            strategies=["dual_ma"],
+            param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+            output_file=output,
+        )
+        # 用严格模式解析 JSON：json.loads 默认接受 NaN，需用 parse_constant 拦截
+        raw = output.read_text()
+        # 替换 NaN/Infinity 为哨兵字符串，再用 json 解析检测
+        import re as _re
+        bad_tokens = _re.findall(r"\bNaN\b|\bInfinity\b|\b-Infinity\b", raw)
+        assert not bad_tokens, (
+            f"JSON 中发现非法 token: {bad_tokens}（应为有限数值）"
+        )

@@ -709,6 +709,102 @@ def save_iteration_snapshot(result: IterationResult):
     print(f"  快照已保存: {snapshot_dir}")
 
 
+def save_iteration_summary_template(
+    result: IterationResult,
+    rules: ConstitutionRules,
+    summary_text: str = "",
+):
+    """在 iterations/iteration_N/ 中生成 summary.md 模板。
+
+    Orchestrator 自动生成骨架（含客观数据），Meta-Agent 负责补充判断和评估。
+    如果 summary.md 已存在（Meta-Agent 已手写），不覆盖。
+
+    Args:
+        result: 迭代结果
+        rules: Constitution 规则
+        summary_text: 额外的摘要文本（可选，通常由 Meta-Agent 在 orchestrator 外写入）
+    """
+    iter_num = get_next_iteration_number() - 1
+    if iter_num < 1:
+        iter_num = 1
+    snapshot_dir = ITERATIONS_DIR / f"iteration_{iter_num}"
+    summary_file = snapshot_dir / "summary.md"
+
+    if summary_file.exists():
+        # Meta-Agent 已手写 summary，不覆盖
+        print(f"  summary.md 已存在，跳过模板生成")
+        return
+
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    duration = result.end_time - result.start_time if result.end_time else 0
+
+    # 客观数据（orchestrator 自动填写）
+    test_info = "N/A"
+    if result.test_result and not result.test_result.get("error"):
+        test_info = f"{result.test_result.get('passed', 0)} passed, {result.test_result.get('failed', 0)} failed"
+
+    files_changed_str = "\n".join(f"- {f}" for f in result.changed_files[:15]) if result.changed_files else "- (无)"
+    if len(result.changed_files) > 15:
+        files_changed_str += f"\n- ... ({len(result.changed_files)} files total)"
+
+    violations_str = "\n".join(f"- ❌ {v}" for v in result.violations) if result.violations else "- ✅ 无违规"
+
+    template = f"""# Iteration #{iter_num} Summary
+
+> **自动生成**: {now}（orchestrator 模板，Meta-Agent 需补充判断部分）
+> **Spec**: `iterations/iteration_{iter_num}/spec.md`
+
+## Requested
+
+{result.task[:200]}
+
+## Delivered
+
+### Files Changed
+{files_changed_str}
+
+### Tests
+- Before: {result.test_count_before}
+- After: {result.test_count_after}
+- Result: {test_info}
+
+### Duration
+{duration:.0f}s ({duration/60:.1f}min)
+
+### Status: {result.status}
+
+## Meta-Agent Judgment
+
+> ⚠️ 以下部分由 Meta-Agent 填写（orchestrator 仅生成骨架）
+
+### Technical: [PASS/FAIL/PARTIAL]
+- [补充测试分析]
+
+### Business Impact: [HIGH/MEDIUM/LOW/NONE]
+- [补充业务指标变化]
+
+### Strategic Fit: [GOOD/NEUTRAL/POOR]
+- [补充策略评估]
+
+## Bugs Fixed by Meta-Agent
+- [如有补充]
+
+## Gate Status
+| Gate | Condition | Result |
+|------|-----------|--------|
+| [补充] | [补充] | [补充] |
+
+## Next Steps
+- [补充下一轮迭代方向，作为下一轮 Plan 的输入]
+
+## Lessons Learned
+- [补充]
+"""
+
+    summary_file.write_text(template, encoding="utf-8")
+    print(f"  summary 模板已生成: {summary_file}")
 
 
 
@@ -935,10 +1031,13 @@ async def run_iteration(
     # 8. 保存完整迭代快照到 iterations/iteration_N/
     save_iteration_snapshot(result)
 
-    # 9. Telegram 通知
+    # 9. 生成 summary.md 模板（Meta-Agent 后续补充判断）
+    save_iteration_summary_template(result, rules)
+
+    # 10. Telegram 通知
     notify_iteration_result(result)
 
-    # 10. 打印留痕状态
+    # 11. 打印留痕状态
     heartbeat_log(f"迭代完成 status={result.status}")
     print(f"  trajectory_updated_by_codebuddy: {result.trajectory_updated_by_codebuddy}")
     print(f"  decision_log_updated_by_codebuddy: {result.decision_log_updated_by_codebuddy}")

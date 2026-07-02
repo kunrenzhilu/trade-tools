@@ -64,83 +64,129 @@ Before assigning any task, answer these questions:
 | P3 | System works but needs optimization | Parameter grid expansion |
 | P4 | Nice to have | Code cleanup, docs |
 
-### Phase 1: Task Definition
+### Phase 1: Plan (Spec Generation)
 
-When defining a task for CodeBuddy, the prompt must include:
+**Before** any code is written, Meta-Agent must produce a spec document that CodeBuddy will follow.
 
-1. **Business objective** (not just technical task)
-   - ❌ "Add Sortino calculation to matrix_backtest.py"
-   - ✅ "We need to measure Sortino (our primary KPI) to know if our strategies are any good. Currently we can't. Add Sortino calculation so we can evaluate strategy quality."
+#### Workflow
 
-2. **Quantifiable success criteria**
-   - ❌ "Make the backtest better"
-   - ✅ "After this change, `strategy_weights.json` should contain `backtest_sortino` for each strategy. Running `--reoptimize` should produce weights where at least 2 strategies appear per group."
+1. **Read the previous iteration's summary** (if it exists):
+   - `iterations/iteration_{N-1}/summary.md` — contains what was done, what worked, what's next
+   - This is the primary input for deciding what to do in iteration N
 
-3. **Risk classification** (per Constitution L8)
-   - Low risk: bug fix, metric addition, test improvement, doc update → auto-deploy
-   - High risk: risk param change, execution logic, new Alpha source, architecture change → design only, user approval needed
+2. **Assess the current situation** (Phase 0 output + previous summary):
+   - What is the highest-leverage next action?
+   - What gaps remain from the last iteration?
+   - What does Constitution require next?
 
-4. **Scope boundary**
-   - Explicitly state what NOT to do
-   - "Do not change the optimization objective from Sharpe to Sortino — that's a separate decision"
+3. **Generate spec document** → write to `iterations/iteration_N/spec.md`:
+   - **Background**: Why this iteration is needed (reference previous summary, GPT feedback, etc.)
+   - **Problem statement**: What specific problem are we solving?
+   - **Design**: Detailed technical design (classes, functions, data flow, test plan)
+   - **Success criteria**: Quantifiable pass/fail conditions
+   - **Risk classification**: Low/high per Constitution L8
+   - **Scope boundary**: What NOT to do
+   - **Implementation order**: Ordered steps with dependencies
 
-5. **Verification requirement**
-   - What command proves it works? (`python main.py --reoptimize`, `pytest`, etc.)
-   - What file should exist or change after this?
+#### Spec requirements
 
-### Phase 2: Execution (Delegate to cb-acp-dev)
+The spec must be detailed enough that CodeBuddy can implement it without asking questions. It should include:
+- Class/function signatures with type hints
+- Test case descriptions
+- Integration points with existing code
+- Expected log output format
+- File paths for new/modified files
 
-Use the `cb-acp-dev` skill to run the iteration:
+#### Spec → CodeBuddy handoff
 
+The orchestrator task prompt should reference the spec file:
 ```bash
 /Users/rickouyang/miniforge3/envs/py312trade/bin/python alignment/orchestrator.py \
-    --task "<the task you defined>" \
+    --task "按 iterations/iteration_N/spec.md 进行开发。先读 spec 文件理解完整需求，然后实施..." \
     --max-turns <appropriate> \
     --timeout <appropriate>
 ```
 
-**Do NOT modify orchestrator.py during this phase.** If you find infrastructure issues, note them for later — don't context-switch into fixing tools while a development iteration is running.
+### Phase 2: Execution (Delegate to cb-acp-dev)
 
-### Phase 3: Result Judgment
+Run the orchestrator with the spec-guided task. **Do NOT modify orchestrator.py during this phase.** If you find infrastructure issues, note them for the summary — don't context-switch into fixing tools while a development iteration is running.
 
-After CodeBuddy completes, judge the result from **three perspectives**:
+Monitor via heartbeat log. If ACP buffer overflow occurs, the orchestrator will log it but continue (non-fatal).
 
-#### A. Technical Quality (Is the code correct?)
-- Tests pass? Test count increased or stayed same?
-- No Constitution violations (RL, black-box, DD threshold)?
-- Code follows project conventions (pure functions, shift(1), UTC)?
+### Phase 3: Summary (Result Judgment + Documentation)
 
-#### B. Business Impact (Did this move us toward the goal?)
-- **This is the most important check, and the one most likely to be skipped.**
-- Did the actual trading metrics improve? (Run `--reoptimize` if strategy-related)
-- Did the system get closer to the Sortino/DD/return targets?
-- Is the system more deployable now than before?
+**After** CodeBuddy completes (or ACP crashes), Meta-Agent must produce a summary document.
 
-#### C. Strategic Fit (Was this the right thing to do?)
-- Could the time have been better spent on a different task?
-- Did this create technical debt that will slow future iterations?
-- Did this unlock or block future work?
+#### Workflow
 
-**Judgment template:**
+1. **Independent verification** (do NOT trust CodeBuddy's self-report):
+   - Run `pytest` — actual test count and pass/fail
+   - Run `--reoptimize` if strategy-related — actual Sortino/DD/Sharpe numbers
+   - Check `git diff` — what actually changed vs what was requested
+   - Fix any test bugs CodeBuddy introduced (common pattern)
 
-```
-## Iteration #N Judgment
+2. **Judge the result** from three perspectives:
 
+   **A. Technical Quality (Is the code correct?)**
+   - Tests pass? Test count increased or stayed same?
+   - No Constitution violations (RL, black-box, Portfolio DD threshold)?
+   - Code follows project conventions (pure functions, shift(1), UTC)?
+
+   **B. Business Impact (Did this move us toward the goal?)**
+   - Did the actual trading metrics improve? (Run `--reoptimize` if strategy-related)
+   - Did the system get closer to the Sortino/DD/return targets?
+   - Is the system more deployable now than before?
+
+   **C. Strategic Fit (Was this the right thing to do?)**
+   - Could the time have been better spent on a different task?
+   - Did this create technical debt that will slow future iterations?
+   - Did this unlock or block future work?
+
+3. **Write summary** → `iterations/iteration_N/summary.md`:
+   - **What was requested** (link to spec.md)
+   - **What was delivered** (files changed, tests added, actual metrics)
+   - **Meta-Agent judgment** (Technical/Business/Strategic scores)
+   - **Bugs found and fixed by Meta-Agent** (if any)
+   - **Gate status** (Gate 1/2/3 pass/fail with numbers)
+   - **Next steps** (what the next iteration should focus on — this is the input for the next Plan phase)
+   - **Lessons learned** (what worked, what didn't, what to do differently)
+
+#### Summary template
+
+```markdown
+# Iteration #N Summary
+
+## Requested
+[Link to spec.md, one-line description]
+
+## Delivered
+- Files changed: [list]
+- Tests: [before] → [after]
+- Key metrics: [Sortino/DD/Sharpe if applicable]
+
+## Meta-Agent Judgment
 ### Technical: PASS/FAIL/PARTIAL
-- Tests: [count] → [count]
-- Violations: [list]
+[Test results, violations, code quality]
 
 ### Business Impact: HIGH/MEDIUM/LOW/NONE
-- What changed in actual trading metrics: [specific numbers]
-- Distance to goal before: [metric] → after: [metric]
-- Unintended consequences: [list]
+[Specific metric changes, distance to goal]
 
 ### Strategic Fit: GOOD/NEUTRAL/POOR
-- This was the [Nth] highest priority task
-- Next highest priority was: [alternative]
-- ROI assessment: [was this worth doing now?]
+[Was this the right priority? ROI assessment]
 
-### Decision: DEPLOY / HOLD / REVERT
+## Bugs Fixed by Meta-Agent
+[List any test bugs or runtime errors Meta-Agent fixed independently]
+
+## Gate Status
+| Gate | Condition | Result |
+|------|-----------|--------|
+| [gate] | [threshold] | [actual] |
+
+## Next Steps
+[What the next iteration should focus on — primary input for next Plan phase]
+
+## Lessons Learned
+[What worked, what didn't]
 ```
 
 ### Phase 4: Next Iteration Planning

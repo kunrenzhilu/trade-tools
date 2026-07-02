@@ -71,9 +71,15 @@
 | 交易频率 | 中长线 |
 | 目标收益 | 年化 **20%-30%**（20%为锚，稳健优先）|
 | 收益底线 | 年化 **10%**（低于此线系统无意义）|
-| 最大回撤 | **≤ 20%**（硬性约束，不可突破）|
-| 首要 KPI | **Sortino 比率**（在 DD≤20% 约束下优化）|
+| 最大回撤 | **Portfolio-level ≤ 20%**（硬性约束，约束最终投资组合，非 per-group 等权组合）|
+| 首要 KPI | **Sortino 比率**（在 Portfolio DD≤20% 约束下优化）|
 | 次要 KPI | **Calmar 比率** |
+
+> **DD 约束层级说明**（迭代 #4 修正，基于 GPT+DeepSeek 反馈）：
+> - DD≤20% 约束的是 **最终投资组合**（Top-5 持仓组合），不是 per-group 等权组合
+> - per-group DD 是 **Risk Characteristic**（风险特征），用于策略选择参考，不是合规判定
+> - per-group DD > 20% 不等于违规；Portfolio DD > 20% 才是违规
+> - 实测数据：NDX_high_vol per-group DD=22%，但 Portfolio DD=6.65%（远低于 20%）
 
 ### Trade-off 态度
 - **回撤约束 > 收益**（不接受突破 DD 换收益）
@@ -223,14 +229,20 @@ Agent System 作为用户分身，负责诊断和提案
 
 ### 策略上线验证流水线
 ```
-Backtest (≥5年) → Walk-Forward (4轮) → Paper Trade (≥1月) → Live
+Backtest (≥5年) → Walk-Forward (4轮) → Portfolio Backtest → Paper Trade (≥1月) → Live
 ```
 
 | 阶段 | 门槛 |
 |------|------|
-| Backtest | ≥ **5 年**历史数据（覆盖一轮牛熊）|
-| Walk-Forward | **4 轮**，每轮 1 年训练 + 6 个月验证 |
+| Backtest | ≥ **5 年**历史数据（覆盖一轮牛熊），per-group Sortino/DD 作为 Risk Characteristic |
+| Walk-Forward | **4 轮**，每轮 1.5 年训练 + 6 个月验证，无单轮 >15% loss |
+| Portfolio Backtest | 模拟 SignalRanker + CandidateSelector 全链路，**Portfolio DD ≤ 20%** 硬约束检查 |
 | Paper Trade | ≥ **1 个月** |
+
+> **Portfolio Backtest 说明**（迭代 #4 新增）：
+> - 验证最终投资组合（Top-5 持仓组合）的真实 DD/Sortino/Sharpe
+> - per-group DD 不阻塞此阶段；只有 Portfolio DD > 20% 才判定为违规
+> - 这是 Backtest 和 Paper Trade 之间的关键验证层
 
 ### 硬性规则
 - 所有策略必须完整测试后上线

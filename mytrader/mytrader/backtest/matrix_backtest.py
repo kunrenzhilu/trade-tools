@@ -875,6 +875,9 @@ class MatrixBacktest:
                  if r.group_id == group_id and r.strategy == strategy),
                 None,
             )
+            # 迭代 #4：新增 backtest_dd_status 字段（'pass' / 'dd_constrained'）
+            # 作为风险 metadata 标记，与 dd_constrained bool 同义但更可读
+            backtest_dd_status = "dd_constrained" if dd_constrained else "pass"
             weights_list.append({
                 "strategy": strategy,
                 "params": params,
@@ -886,6 +889,12 @@ class MatrixBacktest:
                 # 迭代 #3：标记该组是否用了 DD fallback（无合规候选）
                 # 同组所有策略条目共享同一 dd_constrained 值
                 "dd_constrained": dd_constrained,
+                # 迭代 #4：backtest_dd_status — 风险 metadata 字段
+                # 'pass' = 该组有合规候选（DD ≤ 20%）
+                # 'dd_constrained' = fallback 触发（无合规候选，按最低 DD 取 top-K）
+                # 下游消费方（PortfolioBacktester / 风控观测）可读此字段判断
+                # 该组权重的可靠性，作为风险信号标记
+                "backtest_dd_status": backtest_dd_status,
             })
 
         return weights_list

@@ -104,7 +104,7 @@ mytrader/
 │   ├── phase1_backtest.py
 │   └── phase5_e2e.py           # [Phase 5] 端到端干跑脚本
 ├── reports/                    # 回测输出（.gitignore）
-├── tests/                      # 467 个测试
+├── tests/                      # 525 个测试（不含 live 集成测试，迭代 #4 后）
 └── mytrader/
     ├── data/                   # Module 01 — Data Layer ✅
     │   ├── providers/
@@ -123,7 +123,8 @@ mytrader/
     │   └── matrix_runner.py    # [Phase 5] StrategyMatrixRunner
     ├── backtest/               # Module 07 — Backtest ✅
     │   ├── runner.py           # BacktestRunner（含 daily_returns）
-    │   └── matrix_backtest.py  # [Phase 5] MatrixBacktest
+    │   ├── matrix_backtest.py  # [Phase 5] MatrixBacktest（含 backtest_dd_status 风险 metadata）
+    │   └── portfolio_backtest.py  # [迭代 #4] PortfolioBacktester（组合层级回测）
     ├── signal/                 # Module 03 — Signal Filter ✅
     │   ├── filters/
     │   └── ranker.py           # [Phase 5] SignalRanker
@@ -185,7 +186,7 @@ mytrader/
 | **Phase 5** | ✅ 完成 | 85 | MarketDataStore + UniverseManager + 矩阵扫描 + 矩阵回测 + Walk-Forward |
 | **Phase 6** | 🔲 待开发 | — | AlpacaBroker auto 端到端验证 + 对账真实集成 + 港股支持 |
 
-**当前总测试数：467 passed，0 failed**
+**当前总测试数：525 passed，0 failed**（不含 5 个 IBKR live 集成测试，迭代 #4 后）
 
 > 各阶段详细实现见 **[dev_records.md](.codebuddy/notes/dev_records.md)**
 

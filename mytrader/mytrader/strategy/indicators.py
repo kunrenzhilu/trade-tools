@@ -62,6 +62,11 @@ def bollinger_bands(
         (upper, middle, lower)
     """
     bb = ta.bbands(close, length=period, std=std_dev)
+    if bb is None or not hasattr(bb, "columns"):
+        # pandas-ta 在数据不足（len < period）或全 NaN 时返回 None
+        raise ValueError(
+            f"bbands returned None — data may be too short (len={len(close)}, period={period})"
+        )
     # 从 pandas-ta 返回的 DataFrame 中按前缀匹配列名（避免手动拼列名因格式化差异而 KeyError）
     uppers = [c for c in bb.columns if c.startswith("BBU_")]
     middles = [c for c in bb.columns if c.startswith("BBM_")]

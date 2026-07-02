@@ -1,7 +1,7 @@
 {
   "_meta": {
-    "generated_at": "2026-07-01T06:04:02.240068+00:00",
-    "backtest_window": "2021-07-02 ~ 2026-07-01",
+    "generated_at": "2026-07-01T21:17:34.919503+00:00",
+    "backtest_window": "2021-07-03 ~ 2026-07-02",
     "reoptimize_freq": "monthly",
     "survivorship_bias_warning": "使用当前成分股回测，S&P 500 5年成分变动约100只(~20%)，均值回归组(SPX_low_vol)结果可能系统性偏高"
   },
@@ -14,12 +14,13 @@
           "oversold": 30,
           "overbought": 65
         },
-        "weight": 0.5298,
-        "backtest_sharpe": 0.9806,
-        "backtest_sortino": 1.5657,
-        "backtest_max_drawdown": 7.3709,
-        "backtest_win_rate": 0.7672,
-        "dd_constrained": false
+        "weight": 0.5262,
+        "backtest_sharpe": 0.9677,
+        "backtest_sortino": 1.5506,
+        "backtest_max_drawdown": 7.3712,
+        "backtest_win_rate": 0.7719,
+        "dd_constrained": false,
+        "backtest_dd_status": "pass"
       },
       {
         "strategy": "bollinger_band",
@@ -27,12 +28,13 @@
           "period": 25,
           "std_dev": 1.5
         },
-        "weight": 0.4702,
-        "backtest_sharpe": 0.8704,
-        "backtest_sortino": 1.3496,
+        "weight": 0.4738,
+        "backtest_sharpe": 0.8714,
+        "backtest_sortino": 1.3511,
         "backtest_max_drawdown": 9.3546,
-        "backtest_win_rate": 0.7089,
-        "dd_constrained": false
+        "backtest_win_rate": 0.7093,
+        "dd_constrained": false,
+        "backtest_dd_status": "pass"
       }
     ],
     "SPX_high_vol": [
@@ -42,12 +44,13 @@
           "period": 15,
           "std_dev": 1.5
         },
-        "weight": 0.5115,
-        "backtest_sharpe": 0.6712,
-        "backtest_sortino": 1.0294,
+        "weight": 0.5017,
+        "backtest_sharpe": 0.6715,
+        "backtest_sortino": 1.0298,
         "backtest_max_drawdown": 14.898,
         "backtest_win_rate": 0.6632,
-        "dd_constrained": false
+        "dd_constrained": false,
+        "backtest_dd_status": "pass"
       },
       {
         "strategy": "rsi_mean_revert",
@@ -56,56 +59,47 @@
           "oversold": 35,
           "overbought": 75
         },
-        "weight": 0.4885,
-        "backtest_sharpe": 0.6411,
-        "backtest_sortino": 0.9435,
-        "backtest_max_drawdown": 19.4925,
-        "backtest_win_rate": 0.6591,
-        "dd_constrained": false
+        "weight": 0.4983,
+        "backtest_sharpe": 0.6668,
+        "backtest_sortino": 0.9855,
+        "backtest_max_drawdown": 18.0227,
+        "backtest_win_rate": 0.6714,
+        "dd_constrained": false,
+        "backtest_dd_status": "pass"
       }
     ],
     "NDX_high_vol": [
       {
-        "strategy": "bollinger_band",
+        "strategy": "rsi_mean_revert",
         "params": {
-          "period": 25,
-          "std_dev": 1.5
+          "period": 21,
+          "oversold": 30,
+          "overbought": 75
         },
-        "weight": 0.4247,
-        "backtest_sharpe": 0.7249,
-        "backtest_sortino": 1.1013,
-        "backtest_max_drawdown": 21.9606,
-        "backtest_win_rate": 0.7131,
-        "dd_constrained": true
-      },
-      {
-        "strategy": "dual_ma",
-        "params": {
-          "fast": 20,
-          "slow": 80
-        },
-        "weight": 0.5753,
-        "backtest_sharpe": 0.982,
-        "backtest_sortino": 1.4021,
-        "backtest_max_drawdown": 22.2166,
-        "backtest_win_rate": 0.372,
-        "dd_constrained": true
+        "weight": 1.0,
+        "backtest_sharpe": 0.8218,
+        "backtest_sortino": 1.2312,
+        "backtest_max_drawdown": 18.4532,
+        "backtest_win_rate": 0.7581,
+        "dd_constrained": false,
+        "backtest_dd_status": "pass"
       }
     ],
     "SPX_low_vol": [
       {
         "strategy": "rsi_mean_revert",
         "params": {
-          "period": 14,
+          "period": 21,
           "oversold": 25,
           "overbought": 65
         },
-        "weight": 0.567,
-        "backtest_sharpe": 1.1384,
-        "backtest_sortino": 1.8197,
-        "backtest_max_drawdown": 4.7776,
-        "backtest_win_rate": 0.8876,
-        "dd_constrained": false
+        "weight": 0.5833,
+        "backtest_sharpe": 1.2177,
+        "backtest_sortino": 1.9962,
+        "backtest_max_drawdown": 1.0705,
+        "backtest_win_rate": 0.3488,
+        "dd_constrained": false,
+        "backtest_dd_status": "pass"
       },
       {
         "strategy": "bollinger_band",
@@ -113,12 +107,13 @@
           "period": 25,
           "std_dev": 1.5
         },
-        "weight": 0.433,
-        "backtest_sharpe": 0.8696,
-        "backtest_sortino": 1.3018,
+        "weight": 0.4167,
+        "backtest_sharpe": 0.8699,
+        "backtest_sortino": 1.3024,
         "backtest_max_drawdown": 9.7659,
         "backtest_win_rate": 0.7421,
-        "dd_constrained": false
+        "dd_constrained": false,
+        "backtest_dd_status": "pass"
       }
     ],
     "NDX_mid_vol": [
@@ -129,12 +124,13 @@
           "oversold": 25,
           "overbought": 65
         },
-        "weight": 0.5935,
-        "backtest_sharpe": 1.0869,
-        "backtest_sortino": 1.705,
+        "weight": 0.5939,
+        "backtest_sharpe": 1.0891,
+        "backtest_sortino": 1.7276,
         "backtest_max_drawdown": 4.035,
-        "backtest_win_rate": 0.7966,
-        "dd_constrained": false
+        "backtest_win_rate": 0.8127,
+        "dd_constrained": false,
+        "backtest_dd_status": "pass"
       },
       {
         "strategy": "bollinger_band",
@@ -142,12 +138,13 @@
           "period": 15,
           "std_dev": 1.5
         },
-        "weight": 0.4065,
-        "backtest_sharpe": 0.7443,
-        "backtest_sortino": 1.109,
+        "weight": 0.4061,
+        "backtest_sharpe": 0.7446,
+        "backtest_sortino": 1.1094,
         "backtest_max_drawdown": 10.792,
         "backtest_win_rate": 0.6738,
-        "dd_constrained": false
+        "dd_constrained": false,
+        "backtest_dd_status": "pass"
       }
     ],
     "NDX_low_vol": [
@@ -158,12 +155,13 @@
           "oversold": 35,
           "overbought": 65
         },
-        "weight": 0.5448,
-        "backtest_sharpe": 1.1768,
-        "backtest_sortino": 1.9528,
-        "backtest_max_drawdown": 10.7112,
-        "backtest_win_rate": 0.8196,
-        "dd_constrained": false
+        "weight": 0.5454,
+        "backtest_sharpe": 1.1775,
+        "backtest_sortino": 1.9616,
+        "backtest_max_drawdown": 10.7092,
+        "backtest_win_rate": 0.8152,
+        "dd_constrained": false,
+        "backtest_dd_status": "pass"
       },
       {
         "strategy": "bollinger_band",
@@ -171,12 +169,13 @@
           "period": 25,
           "std_dev": 1.5
         },
-        "weight": 0.4552,
-        "backtest_sharpe": 0.9834,
-        "backtest_sortino": 1.5717,
+        "weight": 0.4546,
+        "backtest_sharpe": 0.9816,
+        "backtest_sortino": 1.5688,
         "backtest_max_drawdown": 12.7388,
         "backtest_win_rate": 0.7286,
-        "dd_constrained": false
+        "dd_constrained": false,
+        "backtest_dd_status": "pass"
       }
     ]
   }

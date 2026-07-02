@@ -391,6 +391,46 @@ def _run_reoptimize(config: "Any", logger: "Any") -> None:
     except Exception as exc:
         logger.error(f"[WalkForward] failed: {exc}", exc_info=True)
 
+    # 迭代 #4：PortfolioBacktest（组合层级回测）
+    # 在 MatrixBacktest + Walk-Forward 之后运行，验证组合层 KPI（Sortino/DD）
+    # 输出 Constitution L1 关键指标到日志，用于决策"是否进入 paper trading"
+    try:
+        from mytrader.backtest.portfolio_backtest import (
+            PortfolioBacktester,
+            PortfolioBacktestConfig,
+        )
+        from datetime import date as _date
+        from datetime import timedelta as _timedelta
+
+        logger.info("[Reoptimize] starting PortfolioBacktest...")
+        # 回测近 1 年（与 Walk-Forward 验证期最后一段对齐）
+        pb_end = _date.today() - _timedelta(days=1)
+        pb_start = pb_end - _timedelta(days=365)
+        pb_cfg = PortfolioBacktestConfig()
+        pb = PortfolioBacktester(
+            store=store,
+            universe=universe,
+            weights_file=output,
+            config=pb_cfg,
+        )
+        pb_result = pb.run(start=pb_start, end=pb_end)
+        logger.info(
+            f"[Portfolio Backtest] "
+            f"DD={pb_result.max_drawdown_pct:.2f}%, "
+            f"Sortino={pb_result.sortino_ratio:.4f}, "
+            f"Sharpe={pb_result.sharpe_ratio:.4f}, "
+            f"Annual Return={pb_result.annualized_return_pct:.2f}%, "
+            f"DD Violation={'YES' if pb_result.dd_violation else 'NO'}"
+        )
+        if pb_result.dd_violation:
+            logger.warning(
+                f"[Portfolio Backtest] DD Violation: max_dd={pb_result.max_drawdown_pct:.2f}% "
+                f"> 20% threshold (Constitution L1). "
+                f"Recommend: review group weights before paper trading."
+            )
+    except Exception as exc:
+        logger.error(f"[Portfolio Backtest] failed: {exc}", exc_info=True)
+
     # 热加载（如果 StrategyMatrixRunner 已在运行）
     try:
         from mytrader.strategy.matrix_runner import StrategyMatrixRunner

@@ -101,3 +101,57 @@
 - **决策结果 (P1.2)**: 验证期将所有组的回测日收益率按等权合并为一个 portfolio 序列，计算 Sortino 和 max DD。
 
 ---
+
+### [2026-07-02 UTC] 迭代 #4 — PortfolioBacktest 复用 vs 重写 + backtest_dd_status 字段位置
+
+- **困境描述 (P0)**: spec 要求"复用现有组件，不重写 StrategyMatrixRunner/SignalRanker/CandidateSelector"。但 PortfolioBacktester 需要在每日切片数据上生成信号（防前视偏差），而 StrategyMatrixRunner.run_symbol 内部直接读 store.get_latest_n_bars——这会拿到 store 中的全量历史数据，无法限定到"截至当日"。
+
+  两种实现方式：
+  - 解读 A: 直接调用 `self._matrix_runner.run_symbol(sym)` — 简单但破坏防前视偏差（runner 读全量数据）
+  - 解读 B: 复用 runner 的策略调用逻辑（直接调 STRATEGY_REGISTRY），但用传入的切片数据 — 维持防前视偏差但代码有重复
+
+- **涉及 AI Constitution 条款**:
+  - L7: 验证流水线 — 必须保证回测防前视偏差
+  - L1: 决策可解释 — 回测结果必须可信（前视偏差会让回测过于乐观）
+  - Constitution 决策权重矩阵：正确性 > 代码 DRY
+
+- **决策逻辑 (P0)**: 采用解读 B。理由：
+  1. 防前视偏差是 Constitution L7 的硬要求，不能为了代码 DRY 而牺牲正确性
+  2. 重复的部分仅是"策略调用 + 信号有效期检查"约 20 行，不是核心逻辑
+  3. SignalRanker 和 CandidateSelector 完全复用（无重复），只有 StrategyMatrixRunner 的信号生成部分因前视偏差要求需要绕过
+  4. 未来可重构 StrategyMatrixRunner.run_symbol 支持传入数据切片参数，但这是更大的变更，本次迭代不引入
+
+- **决策结果 (P0)**: PortfolioBacktester._generate_signals 复用 STRATEGY_REGISTRY 直接调用策略函数，绕过 runner.run_symbol 的 store 读取。SignalRanker 和 CandidateSelector 完全复用。
+
+- **困境描述 (P1b)**: spec 说"在 _write_weights 中新增 backtest_dd_status 字段"。但 _write_weights 函数体只是 `json.dump(report.groups)`，真正的字段构建在 _run_group。应该在哪里添加？
+
+- **决策逻辑 (P1b)**: 在 `_run_group` 构建 weights_list 时添加 `backtest_dd_status` 字段。理由：
+  1. _write_weights 是序列化函数，不应包含业务逻辑
+  2. 在 _run_group 添加字段使 in-memory report 和 JSON 输出都包含该字段，下游消费方更灵活
+  3. 与现有 `dd_constrained` bool 字段并列，一致性好
+  4. spec 的"在 _write_weights 中新增"是结果导向（JSON 中要有此字段），不是实现位置约束
+
+- **决策结果 (P1b)**: 在 _run_group 的 weights_list 构建中添加 `backtest_dd_status` 字段，值为 `'pass'` 或 `'dd_constrained'`，与现有 `dd_constrained` bool 一致。
+
+- **困境描述 (P0.2)**: PortfolioBacktester 的 max_drawdown_pct 符号约定——正值还是负值？vectorbt 返回负值，但迭代 #2 已确定正值约定。
+
+- **决策逻辑 (P0.2)**: 沿用迭代 #2 正值约定（0.0~100.0）。理由：
+  1. 与 `matrix_backtest._portfolio_max_drawdown_from_results` 一致
+  2. 与 `GroupBacktestResult.portfolio_max_drawdown` 一致
+  3. dd_violation 判定 `max_dd > 20.0` 直观
+  4. 避免引入新的符号约定差异
+
+- **决策结果 (P0.2)**: `PortfolioBacktestResult.max_drawdown_pct` 返回正值百分数，与迭代 #2 决策一致。
+
+- **困境描述 (P0.3)**: PortfolioBacktester.run() 的回测时间窗口——用近 1 年还是与 MatrixBacktest 一样 5 年？
+
+- **决策逻辑 (P0.3)**: 近 1 年。理由：
+  1. PortfolioBacktest 是验证组合层"近期"表现的工具，不是策略参数优化（MatrixBacktest 的职责）
+  2. 1 年数据足以计算 Sharpe/Sortino/DD 等指标（252 个交易日）
+  3. 与 Walk-Forward 最后一个验证期（6 个月）形成互补：WF 是样本外验证，PortfolioBacktest 是近期样本内验证
+  4. 5 年回测会让早期信号对当前组合权重不具代表性（权重是离线优化的，会月度更新）
+
+- **决策结果 (P0.3)**: main._run_reoptimize 中调用 PortfolioBacktester.run(start=today-365, end=today-1)，回测近 1 年数据。end 用 today-1 避免当日数据未结算。
+
+---
+

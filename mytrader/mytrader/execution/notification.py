@@ -13,6 +13,8 @@ import json
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import TextIO
 from typing import Any
 
 from loguru import logger
@@ -127,6 +129,16 @@ class NotificationService:
         # 冷却期：{key -> last_sent_timestamp}
         self._cooldown: dict[str, float] = {}
 
+        # Telegram 消息日志文件（记录所有发出的消息，便于追溯用户收到的内容）
+        self._tg_log_path = Path.home() / ".mytrader" / "telegram.log"
+        try:
+            self._tg_log_path.parent.mkdir(parents=True, exist_ok=True)
+            # 测试文件可写性
+            self._tg_log_path.open("a").close()
+        except Exception:
+            logger.warning(f"Cannot write telegram log to {self._tg_log_path}")
+            self._tg_log_path = None
+
     # ------------------------------------------------------------------ #
     # 公共接口
     # ------------------------------------------------------------------ #
@@ -209,6 +221,23 @@ class NotificationService:
         """
         self._send_all(text, cooldown_key=None)
 
+    def _write_tg_log(self, text: str, sent: bool) -> None:
+        """将发出的消息记录到 ~/.mytrader/telegram.log。
+
+        格式：[timestamp] [SENT/FAILED] message
+
+        用于追溯用户收到了哪些消息，便于调试和审计。
+        """
+        if not self._tg_log_path:
+            return
+        try:
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            status = "SENT" if sent else "FAILED"
+            with self._tg_log_path.open("a", encoding="utf-8") as f:
+                f.write(f"[{ts}] [{status}]\n{text}\n{'='*60}\n")
+        except Exception as exc:
+            logger.debug(f"Failed to write telegram log: {exc}")
+
     # ------------------------------------------------------------------ #
     # 内部方法
     # ------------------------------------------------------------------ #
@@ -242,3 +271,6 @@ class NotificationService:
         else:
             logger.info(f"Notification sent (channels={'tg' if self._telegram else ''}"
                         f"{'ww' if self._wechat else ''}): {text[:100]}")
+
+        # 记录到 telegram.log（所有发出的消息，含时间戳和发送状态）
+        self._write_tg_log(text, sent)

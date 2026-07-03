@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -504,3 +505,130 @@ class TestBuildOrchestrator:
         assert orch._universe is not None
         assert orch._matrix_runner is not None
         assert orch._signal_ranker is not None
+
+
+# ---------------------------------------------------------------------------
+# 迭代 #5 新增：Pending 订单刷新（_refresh_pending_orders）
+# ---------------------------------------------------------------------------
+
+class TestRefreshPendingOrders:
+    """spec §4.3 测试清单。"""
+
+    def _make_orchestrator_with_broker(
+        self,
+        broker: Any,
+    ) -> ScanOrchestrator:
+        """构造一个用指定 broker 的 Orchestrator（Phase 4 模式）。"""
+        cfg = MagicMock()
+        cfg.watchlist.symbols = ["AAPL"]
+        cfg.watchlist.lookback_days = 90
+        cfg.strategy.name = "dual_ma"
+        cfg.strategy.params = {"fast": 10, "slow": 30}
+
+        data_provider = MagicMock()
+        df = _make_ohlcv()
+        data_provider.get_ohlcv.return_value = df
+
+        pipeline = MagicMock()
+        # 让 pipeline 返回空，避免触发后续下单流程
+        from mytrader.signal.models import FilterResult
+        pipeline.run.return_value = ([], FilterResult(original_signal_count=0))
+
+        risk_manager = MagicMock()
+        tracker = MagicMock()
+        from mytrader.portfolio.models import Portfolio
+        tracker.portfolio = Portfolio(cash=100_000.0)
+        tracker.open_positions = {}
+
+        notification = MagicMock()
+
+        return ScanOrchestrator(
+            config=cfg,
+            data_provider=data_provider,
+            pipeline=pipeline,
+            risk_manager=risk_manager,
+            broker=broker,
+            tracker=tracker,
+            notification=notification,
+        )
+
+    def test_refresh_pending_orders_processes_newly_filled_order_once(self):
+        """同一订单被 refresh 多次返回，tracker.process_order 只调用一次。"""
+        from datetime import datetime, timezone
+
+        # 构造一个 OrderResult，状态为 FILLED
+        filled_order = OrderResult(
+            client_order_id="repeat_001",
+            symbol="AAPL",
+            direction=SignalDirection.BUY,
+            quantity=10,
+            fill_price=150.0,
+            commission=0.0,
+            status=OrderStatus.FILLED,
+            filled_at=datetime.now(timezone.utc),
+        )
+
+        broker = MagicMock()
+        # refresh 返回同一个 filled 订单（即使重复）
+        broker.refresh_pending_orders.return_value = [filled_order, filled_order]
+
+        orch = self._make_orchestrator_with_broker(broker)
+
+        # 第一次 refresh：应处理一次
+        count1 = orch._refresh_pending_orders()
+        assert count1 == 1
+        orch._tracker.process_order.assert_called_once_with(filled_order)
+
+        # 第二次 refresh：同一 client_order_id 已在 _processed_order_ids 中，不应重复处理
+        count2 = orch._refresh_pending_orders()
+        # 第二次返回 0（因为 client_order_id 已处理）
+        assert count2 == 0
+        # tracker.process_order 仍然只被调用一次
+        orch._tracker.process_order.assert_called_once()
+
+    def test_refresh_pending_orders_noop_when_broker_not_supported(self):
+        """PaperBroker 或普通 mock 无 refresh_pending_orders 时不抛异常。"""
+        # 不给 broker 添加 refresh_pending_orders 方法
+        broker = MagicMock(spec=["submit", "cancel", "get_order"])
+        orch = self._make_orchestrator_with_broker(broker)
+
+        # 不应抛异常，返回 0
+        count = orch._refresh_pending_orders()
+        assert count == 0
+
+    def test_refresh_pending_orders_warning_but_scan_continues_on_broker_error(self):
+        """broker.refresh_pending_orders 抛异常时，扫描仍继续。"""
+        broker = MagicMock()
+        broker.refresh_pending_orders.side_effect = Exception("API error")
+        orch = self._make_orchestrator_with_broker(broker)
+
+        # 不应抛异常
+        count = orch._refresh_pending_orders()
+        assert count == 0
+
+        # 扫描仍能执行（验证不阻塞）
+        summary = orch.morning_scan()
+        assert isinstance(summary, ScanSummary)
+
+    def test_refresh_skips_non_filled_orders(self):
+        """refresh 返回的 PENDING/REJECTED 订单不交给 tracker。"""
+        from datetime import datetime, timezone
+
+        pending_order = OrderResult(
+            client_order_id="p_001",
+            symbol="AAPL",
+            direction=SignalDirection.BUY,
+            quantity=10,
+            fill_price=0.0,
+            commission=0.0,
+            status=OrderStatus.PENDING,
+            filled_at=datetime.now(timezone.utc),
+        )
+        broker = MagicMock()
+        broker.refresh_pending_orders.return_value = [pending_order]
+        orch = self._make_orchestrator_with_broker(broker)
+
+        count = orch._refresh_pending_orders()
+        assert count == 0
+        orch._tracker.process_order.assert_not_called()
+

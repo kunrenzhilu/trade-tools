@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import httpx
 import pytest
 from alpaca.trading.client import TradingClient
@@ -156,9 +158,10 @@ class TestTelegramBot:
         token = config.notification.telegram_bot_token
         chat_id = config.notification.telegram_chat_id
 
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         text = (
             "✅ *MyTrader 集成测试*\n\n"
-            f"测试时间：2026-06-20\n"
+            f"测试时间：{ts}\n"
             "系统状态：Telegram Bot 连接正常\n"
             "如果你看到这条消息，说明通知推送已成功配置。"
         )

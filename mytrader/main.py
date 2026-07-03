@@ -443,6 +443,13 @@ def _build_reconciliation_callback(components: "Any", sync_fn: "Any" = None) -> 
     """构建对账回调（盘后 16:30 ET）。
 
     盘后流程：先同步当日行情数据，再做持仓对账。
+
+    迭代 #5 修复（P0-C）：
+        - ReconciliationService 构造参数从 `tracker=` 改为 `portfolio_tracker=`
+        - 调用从 `svc.reconcile()` 改为 `svc.run()`
+        - 判断从 `report.has_diff` 改为 `not report.is_clean`
+        - 兼容 components.notification / bus 为 None 的场景
+        - 末尾 best-effort 写出 paper daily metrics（P0-D）
     """
     from loguru import logger
 
@@ -457,26 +464,30 @@ def _build_reconciliation_callback(components: "Any", sync_fn: "Any" = None) -> 
         try:
             from mytrader.portfolio.reconciliation import ReconciliationService
             svc = ReconciliationService(
-                tracker=components.tracker,
+                portfolio_tracker=components.tracker,
                 broker=components.broker,
-                event_bus=components.bus,
+                event_bus=getattr(components, "bus", None),
                 auto_sync=False,
             )
-            report = svc.reconcile()
-            if report.has_diff:
+            report = svc.run()
+            if not report.is_clean:
+                diff_syms = [d.symbol for d in report.diffs]
                 logger.warning(
-                    f"[Reconciliation] {len(report.diffs)} diff(s) found: "
-                    f"{[d.symbol for d in report.diffs]}"
+                    f"[Reconciliation] {len(report.diffs)} diff(s) found: {diff_syms}"
                 )
             else:
-                logger.info("[Reconciliation] No diffs — positions match")
+                logger.info(
+                    f"[Reconciliation] No diffs — positions match "
+                    f"(local={report.total_local}, broker={report.total_broker})"
+                )
 
             # 无论有无差异都推送对账报告
-            if components.notification:
+            notification = getattr(components, "notification", None)
+            if notification is not None:
                 try:
                     from datetime import datetime, timezone
                     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                    if report.has_diff:
+                    if not report.is_clean:
                         diff_syms = [d.symbol for d in report.diffs]
                         text = (
                             "⚠️ *持仓对账报告*\n"
@@ -492,11 +503,25 @@ def _build_reconciliation_callback(components: "Any", sync_fn: "Any" = None) -> 
                             f"时间：{ts}\n"
                             "持仓一致，无差异"
                         )
-                    components.notification.send_message(text)
+                    notification.send_message(text)
                 except Exception as exc:
                     logger.warning(f"[Reconciliation] notification failed: {exc}")
         except Exception as exc:
-            logger.error(f"[Reconciliation] Failed: {exc}")
+            # 对账失败不能让 scheduler 崩溃（Constitution L8 运行时故障处理策略）
+            logger.error(f"[Reconciliation] Failed: {exc}", exc_info=True)
+
+        # 3. 迭代 #5 P0-D：best-effort 写出 paper daily metrics
+        #    失败不影响对账已完成的状态
+        try:
+            from mytrader.monitor.paper_metrics import collect_paper_daily_metrics
+            collect_paper_daily_metrics(
+                broker=components.broker,
+                tracker=components.tracker,
+                scan_summary=None,
+                data_status=None,
+            )
+        except Exception as exc:
+            logger.warning(f"[Reconciliation] paper metrics collection failed: {exc}")
 
     return on_reconciliation
 

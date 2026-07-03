@@ -212,3 +212,157 @@ class TestAlpacaBrokerCancel:
         broker = AlpacaBroker(api_key="k", secret_key="s", mode="semi_auto")
         result = broker.cancel("nonexistent_id")
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# 迭代 #5 新增：get_positions / get_order_by_client_order_id / refresh_pending
+# ---------------------------------------------------------------------------
+
+class TestAlpacaBrokerGetPositions:
+    def test_get_positions_maps_alpaca_positions_to_reconciliation_format(self):
+        """get_positions 返回 ReconciliationService 兼容的 [{symbol, quantity, ...}]。"""
+        mock_client = MagicMock()
+        # 构造 mock position 列表（Alpaca SDK Position 对象属性）
+        pos_aapl = MagicMock()
+        pos_aapl.symbol = "AAPL"
+        pos_aapl.qty = "10"
+        pos_aapl.market_value = "1500.00"
+        pos_aapl.avg_entry_price = "148.50"
+        pos_aapl.current_price = "150.00"
+        pos_aapl.unrealized_pl = "15.00"
+
+        pos_msft = MagicMock()
+        pos_msft.symbol = "MSFT"
+        pos_msft.qty = "5.5"  # 小数也支持（zero_pct 后会 int 化）
+        pos_msft.market_value = "2000.00"
+        pos_msft.avg_entry_price = "360.00"
+        pos_msft.current_price = "400.00"
+        pos_msft.unrealized_pl = "220.00"
+
+        mock_client.get_all_positions.return_value = [pos_aapl, pos_msft]
+
+        broker = AlpacaBroker(
+            api_key="k", secret_key="s", paper=True,
+            mode="semi_auto", client=mock_client
+        )
+        positions = broker.get_positions()
+
+        assert len(positions) == 2
+        # quantity 必须为 int（ReconciliationService 兼容）
+        aapl = next(p for p in positions if p["symbol"] == "AAPL")
+        assert aapl["quantity"] == 10
+        assert isinstance(aapl["quantity"], int)
+        assert aapl["market_value"] == pytest.approx(1500.0)
+        assert aapl["avg_entry_price"] == pytest.approx(148.50)
+
+        msft = next(p for p in positions if p["symbol"] == "MSFT")
+        assert msft["quantity"] == 5  # int(5.5) = 5
+        assert isinstance(msft["quantity"], int)
+
+    def test_get_positions_returns_empty_on_api_error(self):
+        """API 异常时不崩溃，返回空列表。"""
+        mock_client = MagicMock()
+        mock_client.get_all_positions.side_effect = Exception("API timeout")
+
+        broker = AlpacaBroker(
+            api_key="k", secret_key="s", paper=True,
+            mode="semi_auto", client=mock_client
+        )
+        positions = broker.get_positions()
+        assert positions == []
+
+    def test_get_positions_skips_malformed_entries(self):
+        """缺 symbol/qty 的条目被跳过，不抛异常。"""
+        mock_client = MagicMock()
+        bad_pos = MagicMock()
+        bad_pos.symbol = None
+        bad_pos.qty = "10"
+        good_pos = MagicMock()
+        good_pos.symbol = "AAPL"
+        good_pos.qty = "5"
+        mock_client.get_all_positions.return_value = [bad_pos, good_pos]
+
+        broker = AlpacaBroker(
+            api_key="k", secret_key="s", paper=True,
+            mode="semi_auto", client=mock_client
+        )
+        positions = broker.get_positions()
+        assert len(positions) == 1
+        assert positions[0]["symbol"] == "AAPL"
+
+
+class TestAlpacaBrokerRefreshPending:
+    def test_refresh_pending_orders_updates_filled_order(self):
+        """本地 pending 订单在远端变为 filled 后，refresh 应更新本地缓存为 FILLED。"""
+        mock_client = MagicMock()
+        # 第一次 submit 返回 pending_new
+        mock_client.submit_order.return_value = make_mock_alpaca_order("pending_new", 0.0)
+        # get_order_by_client_id 返回 filled + filled_avg_price
+        filled_order = make_mock_alpaca_order("filled", 152.5)
+        mock_client.get_order_by_client_id.return_value = filled_order
+
+        broker = AlpacaBroker(
+            api_key="k", secret_key="s", paper=True,
+            mode="auto", client=mock_client
+        )
+        intent = make_intent(order_id="refresh_001")
+        broker.submit(intent, make_df())
+
+        # 本地缓存应为 PENDING
+        cached = broker.get_order("refresh_001")
+        assert cached is not None
+        assert cached.status == OrderStatus.PENDING
+
+        # refresh
+        refreshed = broker.refresh_pending_orders()
+        assert len(refreshed) == 1
+        assert refreshed[0].status == OrderStatus.FILLED
+        assert refreshed[0].fill_price == pytest.approx(152.5)
+
+        # 本地缓存也被更新为 FILLED
+        assert broker.get_order("refresh_001").status == OrderStatus.FILLED
+
+    def test_get_order_by_client_order_id_falls_back_to_cache_when_remote_query_fails(self):
+        """远端异常时不崩溃，返回本地缓存。"""
+        mock_client = MagicMock()
+        mock_client.submit_order.return_value = make_mock_alpaca_order("pending_new", 0.0)
+        mock_client.get_order_by_client_id.side_effect = Exception("API timeout")
+
+        broker = AlpacaBroker(
+            api_key="k", secret_key="s", paper=True,
+            mode="auto", client=mock_client
+        )
+        intent = make_intent(order_id="fallback_001")
+        broker.submit(intent, make_df())
+
+        # 查询：远端异常 → 返回缓存（仍为 PENDING）
+        result = broker.get_order_by_client_order_id("fallback_001")
+        assert result is not None
+        assert result.status == OrderStatus.PENDING  # 未被远端更新
+
+    def test_refresh_pending_returns_empty_when_no_pending(self):
+        """无 PENDING 订单时返回空列表。"""
+        mock_client = MagicMock()
+        broker = AlpacaBroker(
+            api_key="k", secret_key="s", paper=True,
+            mode="semi_auto", client=mock_client
+        )
+        # 没有任何订单提交过
+        assert broker.refresh_pending_orders() == []
+
+    def test_refresh_pending_skips_terminal_orders(self):
+        """FILLED/REJECTED 订单不会触发远端查询。"""
+        mock_client = MagicMock()
+        mock_client.submit_order.return_value = make_mock_alpaca_order("filled", 150.0)
+
+        broker = AlpacaBroker(
+            api_key="k", secret_key="s", paper=True,
+            mode="auto", client=mock_client
+        )
+        intent = make_intent(order_id="terminal_001")
+        broker.submit(intent, make_df())
+
+        # refresh 不应调用 get_order_by_client_id
+        refreshed = broker.refresh_pending_orders()
+        assert refreshed == []
+        mock_client.get_order_by_client_id.assert_not_called()

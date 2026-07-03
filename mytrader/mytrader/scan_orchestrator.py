@@ -128,6 +128,10 @@ class ScanOrchestrator:
         self._matrix_runner: Any = None
         self._signal_ranker: Any = None
 
+        # 迭代 #5：pending 订单幂等去重集合
+        # 同一 client_order_id 被刷新为 FILLED 后只应调用 tracker.process_order 一次
+        self._processed_order_ids: set[str] = set()
+
     # ------------------------------------------------------------------
     # Public 扫描入口
     # ------------------------------------------------------------------
@@ -215,11 +219,76 @@ class ScanOrchestrator:
             logger.warning(f"[Orchestrator] scan result notification failed: {exc}")
 
     # ------------------------------------------------------------------
+    # 迭代 #5：Pending 订单刷新
+    #
+    # 问题（P0-B）：AlpacaBroker._submit_auto() 提交后只解析一次状态。若订单
+    # 初始状态是 new/accepted/pending_new，本地 cached 为 PENDING，
+    # ScanOrchestrator 只在 FILLED 时调用 tracker.process_order()，导致真实
+    # paper 账户可能已成交但本地 tracker 仍为空仓。
+    #
+    # 修复：每次扫描开始前刷新 broker 端 pending 订单，对新变为 FILLED 的订单
+    # 调用 tracker.process_order()。幂等性通过 _processed_order_ids 集合保证。
+    # 不提交新订单、不取消订单，只做状态同步。
+    # ------------------------------------------------------------------
+
+    def _refresh_pending_orders(self) -> int:
+        """刷新 broker pending 订单；对新变为 FILLED 的订单更新 tracker。
+
+        Returns:
+            本轮新转为 FILLED 并交给 tracker 处理的订单数。
+        """
+        refresh_fn = getattr(self._broker, "refresh_pending_orders", None)
+        if not callable(refresh_fn):
+            # PaperBroker 等不支持 refresh，直接跳过（不抛异常）
+            return 0
+
+        try:
+            refreshed_orders = refresh_fn()
+        except Exception as exc:
+            logger.warning(
+                f"[Orchestrator] broker.refresh_pending_orders failed: {exc}; "
+                f"scan continues"
+            )
+            return 0
+
+        filled_count = 0
+        for order_result in refreshed_orders or []:
+            # 只处理新变为 FILLED 的订单，且未处理过
+            from mytrader.execution.models import OrderStatus as _OS
+            if order_result.status != _OS.FILLED:
+                continue
+            oid = order_result.client_order_id
+            if not oid or oid in self._processed_order_ids:
+                continue
+            try:
+                self._tracker.process_order(order_result)
+                self._processed_order_ids.add(oid)
+                filled_count += 1
+                logger.info(
+                    f"[Orchestrator] pending order {oid} ({order_result.symbol}) "
+                    f"confirmed FILLED via refresh; tracker updated"
+                )
+            except Exception as exc:
+                # tracker 失败不能让扫描失败；下次扫描会重试
+                logger.warning(
+                    f"[Orchestrator] tracker.process_order failed for {oid}: {exc}"
+                )
+        if filled_count:
+            logger.info(
+                f"[Orchestrator] refresh_pending_orders: {filled_count} new FILLED"
+            )
+        return filled_count
+
+    # ------------------------------------------------------------------
     # Internal scan logic
     # ------------------------------------------------------------------
 
     def _run_scan(self, scan_type: str) -> ScanSummary:
         """盘前/盘中扫描：Phase 5 链路或 Phase 4 降级。"""
+        # 迭代 #5：扫描开始前先刷新 broker pending 订单
+        # （将 paper 账户已成交但本地仍 PENDING 的订单补交给 tracker）
+        self._refresh_pending_orders()
+
         if self._use_phase5 and self._matrix_runner is not None:
             return self._run_scan_phase5(scan_type)
 
@@ -499,6 +568,9 @@ class ScanOrchestrator:
 
     def _run_eod_check(self) -> ScanSummary:
         """EOD：检查持仓是否触碰止损/止盈，生成平仓单。"""
+        # 迭代 #5：EOD 前也刷新一次 pending，避免止损判断基于过时持仓
+        self._refresh_pending_orders()
+
         self._sync_risk_state()
         summary = ScanSummary(scan_type="eod")
 

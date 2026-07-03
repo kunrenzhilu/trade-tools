@@ -155,3 +155,67 @@
 
 ---
 
+### [2026-07-03 UTC] 迭代 #5 — metadata parity 实现位置 + pending order 刷新策略
+
+- **困境描述 (P0-A)**: spec §4.1 提出统一线上与回测 signal indicators，建议 "抽出共享 metadata 构建方法"。实现位置有两种选择：
+  - 解读 A: 作为 `StrategyMatrixRunner` 的实例方法 `_build_signal_indicators(self, meta, entry, weight)`，访问 `self._signal_valid_bars` 等实例状态
+  - 解读 B: 作为 module-level function `build_matrix_signal_indicators(meta, entry, weight)`，无状态、可独立测试、可被任意模块（含 PortfolioBacktester）调用
+
+- **涉及 AI Constitution 条款**:
+  - L7: 验证流水线 — metadata parity 必须可独立测试
+  - L5: 架构边界 — 减少模块间耦合
+  - Constitution 决策权重矩阵：可测试性 > OOP 纯度
+
+- **决策逻辑 (P0-A)**: 采用解读 B。理由：
+  1. `PortfolioBacktester._generate_signals()` 不能调用 `StrategyMatrixRunner` 实例方法（防前视偏差要求 PortfolioBacktester 用切片数据，而 StrategyMatrixRunner.run_symbol 读全量 store 数据）。如果 metadata helper 是实例方法，PortfolioBacktester 仍需绕过它或构造伪实例，引入新耦合。
+  2. helper 本身无状态（只读 meta + entry + weight），符合纯函数语义。
+  3. module-level function 可在 `tests/test_signal_parity.py` 中直接单元测试，无需构造 StrategyMatrixRunner 实例。
+  4. 默认值常量（`DEFAULT_BACKTEST_SHARPE` 等）也放 module-level，便于测试与文档引用。
+
+- **决策结果 (P0-A)**: `build_matrix_signal_indicators()` 作为 module-level function 放在 `matrix_runner.py` 顶部，PortfolioBacktester 显式 import 调用。`StrategyMatrixRunner.run_symbol()` 内部也调用同一函数。
+
+---
+
+- **困境描述 (P0-B)**: spec §4.3 要求 `ScanOrchestrator._refresh_pending_orders()` 在扫描开始时刷新 pending。spec 明确"不要让刷新失败中断扫描；记录 warning"，但实现细节有两处选择：
+  - 幂等性机制：在 orchestrator 内维护 `_processed_order_ids: set[str]` vs 查询 tracker 现有订单
+  - 刷新失败的处理：返回 0 + warning vs 抛异常让上层处理
+
+- **涉及 AI Constitution 条款**:
+  - L8: 运行时故障处理策略 — 监控/执行链路不能因单个组件失败而崩溃
+  - L7: 测试纪律 — 幂等性必须有测试覆盖
+  - L1: 决策可解释 — 同一订单不应被 tracker 处理两次
+
+- **决策逻辑 (P0-B)**:
+  1. **幂等性**：使用 `_processed_order_ids: set[str]` 集合而非查询 tracker。理由：
+     - tracker 当前不暴露 "已处理订单列表" 查询接口；新增查询接口会修改 PortfolioTracker 公共 API，超出本次 scope
+     - 集合查找 O(1)，无性能问题
+     - 集合在 orchestrator 实例生命周期内有效（一个 orchestrator 实例对应一次系统运行）��重启后会重置 — 但重启场景下 broker._submitted 也会重建，paper 账户的 FILLED 订单可由 reconciliation callback 兜底处理
+  2. **刷新失败处理**：返回 0 + warning，不抛异常。理由：
+     - spec 明确"不要让刷新失败中断扫描"
+     - 扫描主流程（信号生成 → 风控 → 下单）与 pending 刷新是独立关注点，二者解耦更稳健
+     - 下次扫描会再次尝试刷新，最终一致性可保证
+
+  附带决策：refresh 只处理 PENDING → FILLED 转换，不处理 PENDING → CANCELLED/REJECTED。理由：
+  - CANCELLED/REJECTED 不影响 tracker 持仓，无需 process_order
+  - 减少代码复杂度
+  - 如需观测 CANCELLED 状态，可从 broker.order_history 查询
+
+- **决策结果 (P0-B)**:
+  - `_processed_order_ids: set[str]` 在 ScanOrchestrator.__init__ 中初始化
+  - `refresh_pending_orders()` 异常 → 返回 0 + logger.warning
+  - broker 不支持 refresh_pending_orders（PaperBroker）→ 返回 0，不抛异常
+  - 非 FILLED 状态的刷新结果不调用 tracker.process_order
+
+---
+
+
+### [2026-07-03 12:01 UTC] 迭代 #5 — 高风险文件触及
+
+- **困境描述**: CodeBuddy 的代码变更触及了 Constitution L8 定义的高风险目录
+- **涉及 AI Constitution 条款**: L8 高风险变更 / 禁止行为
+- **决策逻辑**: Orchestrator 自动检测到合规风险
+- **决策结果**: 需用户审批后才能合并
+        - **详情**: mytrader/mytrader/execution/alpaca_broker.py
+- **用户反馈**: 待用户确认
+
+---

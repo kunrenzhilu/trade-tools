@@ -28,6 +28,71 @@ from mytrader.strategy.registry import STRATEGY_REGISTRY
 from mytrader.universe.manager import UniverseManager
 
 
+# ---------------------------------------------------------------------------
+# 共享 metadata 构建器（迭代 #5 新增）
+#
+# 线上 StrategyMatrixRunner 与 PortfolioBacktester 必须使用同一份逻辑
+# 构建 Signal.indicators，避免线上与回测 metadata 分叉导致 CandidateSelector
+# 的 sector_exposure 约束行为不一致（曾导致 73 候选 → 2 approved）。
+#
+# 缺字段时返回安全默认值，不抛异常，保证：
+#   - strategy_weights.json 中字段缺失时回测/线上仍能运行
+#   - CandidateSelector 收到的 sector 永远是真实板块或 "Unknown"
+# ---------------------------------------------------------------------------
+
+# 默认值集中常量，便于测试与文档引用
+DEFAULT_BACKTEST_SHARPE: float = 0.0
+DEFAULT_BACKTEST_SORTINO: float = 0.0
+DEFAULT_BACKTEST_WIN_RATE: float = 0.0
+DEFAULT_BACKTEST_MAX_DD: float = 0.0
+DEFAULT_BACKTEST_DD_STATUS: str = "unknown"
+DEFAULT_SECTOR: str = "Unknown"
+
+
+def build_matrix_signal_indicators(
+    meta: Any,
+    entry: dict[str, Any],
+    weight: float,
+) -> dict[str, Any]:
+    """从 SymbolMeta + weights entry 构建线上/回测共用的 Signal.indicators。
+
+    Args:
+        meta:   UniverseManager.get_symbol_meta() 返回的 SymbolMeta（或 None）
+        entry:  strategy_weights.json 中单条策略配置（dict）
+        weight: 该策略在组内的权重（已 float() 化）
+
+    Returns:
+        indicators dict，包含以下字段（顺序稳定，便于 parity 测试）：
+            group_id, sector, backtest_sharpe, backtest_sortino,
+            backtest_max_drawdown, backtest_dd_status, backtest_win_rate, weight
+    """
+    sector = DEFAULT_SECTOR
+    group_id = ""
+    if meta is not None:
+        # 不抛异常：meta.sector 可能为 None/空字符串
+        meta_sector = getattr(meta, "sector", None)
+        if meta_sector:
+            sector = str(meta_sector)
+        meta_group = getattr(meta, "group_id", None)
+        if meta_group:
+            group_id = str(meta_group)
+
+    return {
+        "group_id": group_id,
+        "sector": sector,
+        "backtest_sharpe": float(entry.get("backtest_sharpe", DEFAULT_BACKTEST_SHARPE)),
+        "backtest_sortino": float(entry.get("backtest_sortino", DEFAULT_BACKTEST_SORTINO)),
+        "backtest_max_drawdown": float(
+            entry.get("backtest_max_drawdown", DEFAULT_BACKTEST_MAX_DD)
+        ),
+        "backtest_dd_status": str(
+            entry.get("backtest_dd_status", DEFAULT_BACKTEST_DD_STATUS)
+        ),
+        "backtest_win_rate": float(entry.get("backtest_win_rate", DEFAULT_BACKTEST_WIN_RATE)),
+        "weight": float(weight),
+    }
+
+
 @dataclass
 class MatrixScanResult:
     """单次矩阵扫描结果。"""
@@ -170,12 +235,7 @@ class StrategyMatrixRunner:
                     timestamp=now,
                     confidence=confidence,
                     strategy_name=strategy_name,
-                    indicators={
-                        "group_id": meta.group_id,
-                        "backtest_sharpe": entry.get("backtest_sharpe", 0.0),
-                        "backtest_win_rate": entry.get("backtest_win_rate", 0.0),
-                        "weight": weight,
-                    },
+                    indicators=build_matrix_signal_indicators(meta, entry, weight),
                 )
             )
 

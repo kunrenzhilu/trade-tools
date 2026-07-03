@@ -43,7 +43,10 @@ from mytrader.risk.candidate_selector import (
 )
 from mytrader.signal.ranker import SignalRanker
 from mytrader.strategy.base import Signal, SignalDirection
-from mytrader.strategy.matrix_runner import StrategyMatrixRunner
+from mytrader.strategy.matrix_runner import (
+    StrategyMatrixRunner,
+    build_matrix_signal_indicators,
+)
 from mytrader.universe.manager import UniverseManager
 
 
@@ -506,13 +509,10 @@ class PortfolioBacktester:
                         timestamp=now,
                         confidence=confidence,
                         strategy_name=strategy_name,
-                        indicators={
-                            "group_id": meta.group_id,
-                            "sector": meta.sector,
-                            "backtest_sharpe": entry.get("backtest_sharpe", 0.0),
-                            "backtest_win_rate": entry.get("backtest_win_rate", 0.5),
-                            "weight": weight,
-                        },
+                        # 迭代 #5：复用 matrix_runner.build_matrix_signal_indicators
+                        # 保证线上扫描与组合回测 signal metadata 完全一致
+                        # （P0-A：曾因 sector=Unknown 导致 73 候选 → 2 approved）
+                        indicators=build_matrix_signal_indicators(meta, entry, weight),
                     )
                 )
 

@@ -886,10 +886,11 @@ async def run_iteration(
 ) -> IterationResult:
     """执行一次完整的迭代循环
 
-    等待策略：time-based（确定性，简单可靠）:
-    - 等满 timeout_seconds，不提前退出
+    等待策略：process-based（CodeBuddy 退出即结束）:
+    - 每 5 秒检查 CodeBuddy 子进程是否仍在运行
+    - 子进程退出 → 立即进入后置验证
+    - timeout_seconds 仅作为最大保护上限（防止进程僵死）
     - 每 30 秒打印心跳（agentPhase + 距上次 session_update 多久）
-    - session_update 实时刷新 last_update_time（用于心跳显示，不改变退出逻辑）
     """
 
     iteration_id = str(uuid4())[:8]
@@ -951,15 +952,25 @@ async def run_iteration(
             )
             heartbeat_log(f"prompt 已发送, stop_reason={prompt_response.stop_reason}")
 
-            # time-based 等待（确定性，不提前退出）
-            elapsed = 0
+            # process-based 等待（CodeBuddy 进程退出即结束）
             check_interval = 5
             heartbeat_interval = 30
             last_heartbeat = time.time()
+            start = time.time()
 
-            while elapsed < timeout_seconds:
+            while True:
+                # CodeBuddy 进程已退出？
+                if proc.returncode is not None:
+                    elapsed = time.time() - start
+                    heartbeat_log(f"CodeBuddy 进程已退出 (rc={proc.returncode}, elapsed={elapsed:.0f}s)")
+                    break
+
+                elapsed = time.time() - start
+                if elapsed > timeout_seconds:
+                    heartbeat_log(f"timeout 到达 ({timeout_seconds}s)，强制退出")
+                    break
+
                 await asyncio.sleep(check_interval)
-                elapsed += check_interval
 
                 if time.time() - last_heartbeat > heartbeat_interval:
                     heartbeat_log("心跳")

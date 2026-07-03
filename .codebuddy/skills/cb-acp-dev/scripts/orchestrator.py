@@ -751,15 +751,25 @@ async def run_iteration(
             )
             heartbeat_log(f"prompt 已发送, stop_reason={prompt_response.stop_reason}")
 
-            # time-based 等待（确定性，不提前退出）
-            elapsed = 0
+            # process-based 等待（CodeBuddy 进程退出即结束）
             check_interval = 5
             heartbeat_interval = 30
             last_heartbeat = time.time()
+            start = time.time()
 
-            while elapsed < timeout_seconds:
+            while True:
+                # CodeBuddy 进程已退出？
+                if proc.returncode is not None:
+                    elapsed = time.time() - start
+                    heartbeat_log(f"CodeBuddy 进程已退出 (rc={proc.returncode}, elapsed={elapsed:.0f}s)")
+                    break
+
+                elapsed = time.time() - start
+                if elapsed > timeout_seconds:
+                    heartbeat_log(f"timeout 到达 ({timeout_seconds}s)，强制退出")
+                    break
+
                 await asyncio.sleep(check_interval)
-                elapsed += check_interval
 
                 if time.time() - last_heartbeat > heartbeat_interval:
                     heartbeat_log("心跳")

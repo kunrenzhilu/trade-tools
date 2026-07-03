@@ -237,9 +237,48 @@ mytrader/
     ├── alerter.py             # 多渠道告警发送
     ├── health_checker.py      # 系统健康检查
     ├── logger_setup.py        # loguru 配置
+    ├── paper_metrics.py       # [迭代 #5] PaperDailyMetrics 日报（spec §4.5）
     └── dashboard/             # 可选 Streamlit Dashboard
         └── app.py
 ```
+
+### 9.1 PaperDailyMetrics（迭代 #5 新增）
+
+paper trading 期间每日盘后（reconciliation callback 末尾）写出结构化 JSON 日报到
+`reports/paper/daily/YYYY-MM-DD.json`，用于一个月后计算 paper Sortino/DD 并区分
+策略问题与系统问题。
+
+```python
+@dataclass
+class PaperDailyMetrics:
+    date: str                              # YYYY-MM-DD
+    account: dict[str, Any]               # equity / cash / buying_power
+    signals: dict[str, int]               # raw / buy_candidates / sell / approved
+    orders: dict[str, int]                # submitted / filled / pending / rejected
+    positions: dict[str, int]             # local_count / broker_count / diff_count
+    risk: dict[str, float]                # daily_return / rolling_dd
+    data: dict[str, Any]                 # symbols / latest_bar
+```
+
+调用方式：
+
+```python
+from mytrader.monitor.paper_metrics import collect_paper_daily_metrics
+
+collect_paper_daily_metrics(
+    broker=components.broker,
+    tracker=components.tracker,
+    scan_summary=None,           # 可选：当日 ScanSummary
+    data_status=None,             # 可选：数据新鲜度
+    output_dir="reports/paper/daily",
+)
+```
+
+**安全约束**：
+- 缺 broker account API 时填 0/None，记录 warning，不崩溃
+- 写文件前 mkdir parents=True
+- UTF-8、indent=2、ensure_ascii=False
+- `_sanitize()` 递归剔除敏感字段（api_key / secret / token / password）—— 双层防御：`_collect_*` 函数白名单读取 + `_sanitize` 兜底递归剔除
 
 ---
 

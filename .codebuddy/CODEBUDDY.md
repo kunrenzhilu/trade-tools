@@ -104,7 +104,8 @@ mytrader/
 │   ├── phase1_backtest.py
 │   └── phase5_e2e.py           # [Phase 5] 端到端干跑脚本
 ├── reports/                    # 回测输出（.gitignore）
-├── tests/                      # 525 个测试（不含 live 集成测试，迭代 #4 后）
+│   └── paper/daily/             # [迭代 #5] PaperDailyMetrics JSON 归档
+├── tests/                      # 562 个测试（不含 live 集成测试，迭代 #5 后）
 └── mytrader/
     ├── data/                   # Module 01 — Data Layer ✅
     │   ├── providers/
@@ -121,10 +122,12 @@ mytrader/
     │   ├── strategies/         # dual_ma / rsi / macd / bollinger
     │   ├── ensemble.py
     │   └── matrix_runner.py    # [Phase 5] StrategyMatrixRunner
+    │                           # [迭代 #5] build_matrix_signal_indicators 共享 helper
     ├── backtest/               # Module 07 — Backtest ✅
     │   ├── runner.py           # BacktestRunner（含 daily_returns）
     │   ├── matrix_backtest.py  # [Phase 5] MatrixBacktest（含 backtest_dd_status 风险 metadata）
     │   └── portfolio_backtest.py  # [迭代 #4] PortfolioBacktester（组合层级回测）
+    │                               # [迭代 #5] 复用 build_matrix_signal_indicators
     ├── signal/                 # Module 03 — Signal Filter ✅
     │   ├── filters/
     │   └── ranker.py           # [Phase 5] SignalRanker
@@ -133,7 +136,7 @@ mytrader/
     │   ├── constraints.py
     │   └── candidate_selector.py  # [Phase 5] 约束递补选股
     ├── execution/              # Module 05 — Execution Engine ✅
-    │   ├── alpaca_broker.py
+    │   ├── alpaca_broker.py    # [迭代 #5] get_positions / refresh_pending_orders / get_order_by_client_order_id
     │   ├── ibkr_broker.py
     │   └── notification.py
     ├── portfolio/              # Module 06 — Portfolio Tracker ✅
@@ -143,8 +146,10 @@ mytrader/
     │   ├── container.py
     │   └── scheduler.py        # 含月度 Walk-Forward job
     ├── monitor/                # Module 08 — Monitor Layer ✅
-    │   └── dashboard/app.py    # [Phase 4] Streamlit Dashboard
+    │   ├── dashboard/app.py    # [Phase 4] Streamlit Dashboard
+    │   └── paper_metrics.py    # [迭代 #5] PaperDailyMetrics 日报（spec §4.5）
     └── scan_orchestrator.py    # [Phase 4] 扫描编排器
+                                # [迭代 #5] _refresh_pending_orders + _processed_order_ids 幂等集合
 ```
 
 ---
@@ -184,9 +189,10 @@ mytrader/
 | **Phase 3** | ✅ 完成 | 142 | AlpacaBroker + IBKRBroker + 通知 + 调度器 + Monitor + 对账 |
 | **Phase 4** | ✅ 完成 | 38 | AlpacaDataProvider + ScanOrchestrator + Streamlit Dashboard |
 | **Phase 5** | ✅ 完成 | 85 | MarketDataStore + UniverseManager + 矩阵扫描 + 矩阵回测 + Walk-Forward |
+| **Iter #5** | ✅ 完成 | 37 | Paper Trading Integrity & Parity（signal metadata parity + AlpacaBroker 只读 + reconciliation 修复 + paper metrics） |
 | **Phase 6** | 🔲 待开发 | — | AlpacaBroker auto 端到端验证 + 对账真实集成 + 港股支持 |
 
-**当前总测试数：525 passed，0 failed**（不含 5 个 IBKR live 集成测试，迭代 #4 后）
+**当前总测试数：562 passed，0 failed**（不含 5 个 IBKR live 集成测试 pre-existing failures，迭代 #5 后）
 
 > 各阶段详细实现见 **[dev_records.md](.codebuddy/notes/dev_records.md)**
 

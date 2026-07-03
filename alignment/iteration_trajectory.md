@@ -470,3 +470,146 @@ tests/test_portfolio_backtest.py: 27 passed
 > - CodeBuddy 自行更新了 trajectory ✅
 
 ---
+
+## 迭代 #5 — Paper Trading Integrity & Parity
+
+- **日期**: 2026-07-03 UTC
+- **类型**: Bug 修复（P0-A/B/C）+ 功能新增（P0-D）+ 测试补全
+- **变更摘要**: 统一线上 StrategyMatrixRunner 与 PortfolioBacktester 的 signal metadata parity（修复 sector=Unknown 导致 73 候选 → 2 approved）；为 AlpacaBroker 增加 get_positions / get_order_by_client_order_id / refresh_pending_orders 只读能力；在 ScanOrchestrator 加 _refresh_pending_orders 实现订单生命周期闭环；修复 main.py reconciliation callback 调用接口；新增 paper daily metrics 模块
+- **状态**: passed
+- **测试数**: 525 → 562（+37 新测试）
+
+### 变更详情
+
+**P0-A: 统一 Signal metadata** (`mytrader/strategy/matrix_runner.py`, `mytrader/backtest/portfolio_backtest.py`)
+- 新增 module-level `build_matrix_signal_indicators(meta, entry, weight)` helper
+- 在 matrix_runner.py 中新增默认值常量：`DEFAULT_BACKTEST_SHARPE/SORTINO/MAX_DD/DD_STATUS/WIN_RATE/SECTOR`
+- `StrategyMatrixRunner.run_symbol()` 与 `PortfolioBacktester._generate_signals()` 都改为调用同一 helper
+- 线上 Signal.indicators 现在统一包含：`group_id / sector / backtest_sharpe / backtest_sortino / backtest_max_drawdown / backtest_dd_status / backtest_win_rate / weight`
+- 缺字段时返回安全默认值（不抛异常），`meta=None` 时 sector="Unknown"
+
+**P0-B: AlpacaBroker 只读状态能力** (`mytrader/execution/alpaca_broker.py`)
+- `get_positions() -> list[dict]`：读取 Alpaca 当前持仓，返回 ReconciliationService 兼容格式 `[{symbol, quantity, ...}]`
+  - `quantity` 强制 int（兼容 ReconciliationService）
+  - 异常时返回空列表（不抛）
+  - 兼容 SDK 对象和 dict 两种 position 结构
+- `get_order_by_client_order_id(oid) -> OrderResult | None`：本地为 PENDING 时尝试远端拉取
+  - 优先 `client.get_order_by_client_id`，fallback `get_order_by_client_order_id`
+  - 远端异常返回本地缓存 + warning
+  - 通过 `_rebuild_order_result_from_alpaca()` 复用 `_parse_alpaca_order()` 解析逻辑
+- `refresh_pending_orders() -> list[OrderResult]`：刷新所有本地 PENDING 订单
+  - 不提交新订单，不取消订单
+  - 终态订单（FILLED/REJECTED/CANCELLED）跳过
+
+**P0-B+: ScanOrchestrator pending 刷新** (`mytrader/scan_orchestrator.py`)
+- 新增 `_refresh_pending_orders() -> int`
+- 在 `_run_scan()` 与 `_run_eod_check()` 开头调用
+- 幂等性：维护 `self._processed_order_ids: set[str]`，同一 client_order_id 只调用 tracker.process_order 一次
+- broker 不支持 refresh 时不抛异常（PaperBroker 兼容）
+- broker.refresh 抛异常时扫描仍继续（warning + 返回 0）
+
+**P0-C: 修复 Reconciliation callback** (`main.py::_build_reconciliation_callback`)
+- 构造参数：`tracker=` → `portfolio_tracker=`
+- 调用：`svc.reconcile()` → `svc.run()`
+- 判断：`report.has_diff` → `not report.is_clean`
+- 兼容 `components.notification / bus` 为 None 的场景
+- 对账失败用 `logger.error(..., exc_info=True)`，不让 scheduler 崩溃
+- `components.bus` 用 `getattr(components, "bus", None)` 安全访问（避免 AttributeError）
+
+**P0-D: Paper daily metrics** (`mytrader/monitor/paper_metrics.py` 新增)
+- `PaperDailyMetrics` dataclass：date / account / signals / orders / positions / risk / data
+- `collect_paper_daily_metrics()` 函数接口：写出 JSON 到 `reports/paper/daily/YYYY-MM-DD.json`
+- JSON 结构按 spec §4.5 定义稳定字段
+- 缺 broker account API 时填 0/None，记录 warning（不崩溃）
+- 敏感字段过滤：`_sanitize()` 递归剔除 api_key / secret / token / password 等
+- 写文件前 mkdir parents=True
+- 在 main.py reconciliation callback 末尾 best-effort 调用
+
+**测试新增**: 37 个新测试
+1. `tests/test_signal_parity.py`（10 测试）：metadata 完整性、默认值安全性、parity 一致性、CandidateSelector 不再压 Unknown sector
+2. `tests/test_alpaca_broker.py`（+9 测试）：get_positions 映射、异常处理、refresh_pending 订单状态更新、cache fallback、terminal 订单跳过
+3. `tests/test_scan_orchestrator.py`（+4 测试）：pending 幂等、broker 不支持、异常不中断扫描、非 FILLED 跳过
+4. `tests/test_main_reconciliation.py`（7 测试）：service 构造参数、is_clean 读取、clean/diff 通知、None notification 容错、异常隔离、sync_fn 顺序、paper metrics 调用
+5. `tests/test_paper_metrics.py`（11 测试）：JSON 写出、目录创建、缺 API 不崩溃、订单状态计数、敏感字段过滤、_sanitize 单元测试、PaperDailyMetrics dataclass
+
+### 验证结果
+
+```
+Targeted tests (spec §8):
+  tests/test_signal_parity.py tests/test_portfolio_backtest.py tests/test_alpaca_broker.py
+  tests/test_scan_orchestrator.py tests/test_main_reconciliation.py tests/test_paper_metrics.py
+  → 75 passed, 0 failed
+
+Default pytest (excluding live):
+  → 562 passed, 0 failed, 103 warnings in 15.70s
+
+Live tests (pre-existing, 与本次无关):
+  → 11 passed, 5 failed (all IBKR connection errors, pre-existing)
+```
+
+### Constitution 合规
+- ✅ 未突破 DD 20% 约束（PORTFOLIO_MAX_DRAWDOWN_PCT=20.0 未改动）
+- ✅ 测试覆盖率提升（+37 测试，全部通过）
+- ✅ 未引入黑箱策略（复用现有 StrategyMatrixRunner / PortfolioBacktester 逻辑）
+- ✅ 未引入 RL
+- ✅ 文档与代码同步（trajectory + decision_log + CODEBUDDY + design docs 更新）
+- ✅ 未触发真实下单（AlpacaBroker 新方法只读，不提交新订单）
+- ✅ 未在测试中调用真实 broker 下单（全部 Mock）
+- ✅ API key 未写入日志/metrics（_sanitize 兜底过滤）
+- ✅ 防前视偏差：metadata parity 修复不影响 PortfolioBacktester 的数据切片逻辑
+
+### Success Criteria 对照（spec §6）
+
+| # | 条件 | 状态 |
+|---|------|:----:|
+| 1 | 默认 pytest 通过；不依赖真实 Alpaca API | ✅ |
+| 2 | 新增/修改测试数不下降 | ✅ 525→562 |
+| 3 | StrategyMatrixRunner signal indicators 包含 8 个完整字段 | ✅ |
+| 4 | PortfolioBacktester 与 StrategyMatrixRunner metadata parity | ✅ |
+| 5 | AlpacaBroker.get_positions() 返回 ReconciliationService 兼容格式 | ✅ |
+| 6 | pending order refresh 能更新为 filled + 幂等处理 | ✅ |
+| 7 | reconciliation callback 调用 run() + is_clean | ✅ |
+| 8 | paper metrics JSON 能写出 + 不含敏感字段 | ✅ |
+| 9 | 更新 trajectory / decision_log / CODEBUDDY / design docs | ✅ |
+
+### Experience Learned
+- **metadata parity 是数据流一致性的核心**：之前 `matrix_runner.run_symbol()` 输出 `{group_id, backtest_sharpe, backtest_win_rate, weight}`，而 `PortfolioBacktester._generate_signals()` 输出 `{group_id, sector, backtest_sharpe, backtest_win_rate, weight}` —— 两者字段集合不同，导致回测和线上对 CandidateSelector 行为预测不一致。本次提取共享 helper 后，任何字段调整只需改一处。
+- **Alpaca SDK 多版本兼容**：`get_order_by_client_id` 在不同 SDK 版本中名字不同，使用 `hasattr` + try/except 兼容更稳健，避免硬依赖单一 SDK 版本。
+- **幂等性集合优于状态查询**：`_processed_order_ids: set[str]` 比每次查询 tracker 是否已处理该订单更简单且无依赖（不假设 tracker 暴露查询接口）。
+- **_sanitize 双层防御**：`_collect_*` 函数白名单读取（最小暴露） + `_sanitize` 兜底递归剔除（防御未来引入新字段时误泄敏感信息）—— 单层防御不足。
+- **paper metrics 设计取舍**：本次只提供模块与测试，集成点选在 reconciliation callback 末尾（已是每日盘后流程）。如果后续需要更精细的 daily return / rolling DD，需要扩展 PortfolioTracker 维护这两个指标。
+
+### 后续建议
+
+**P1 — AlpacaBroker auto 端到端验证**（Iteration #6 候选）
+- spec 明确"不修 orchestrator harness 的假 passed 问题；该问题留给 Iteration #6"
+- 在真实 paper 账户跑一次完整 morning_scan → eod_check 流程，验证 pending → FILLED 状态闭环
+- 需要至少 1 个月 paper 数据后才能验证 P0-D 的 metrics 是否能用于计算 paper Sortino/DD
+
+**P1 — PortfolioTracker 扩展 daily_pnl_pct / max_drawdown**
+- 当前 `_collect_risk()` 直接读 `portfolio.daily_pnl_pct / max_drawdown`，但 PortfolioTracker 未维护
+- 建议下次迭代在 PortfolioTracker 中维护 rolling 30 天 daily_returns + 计算 max_drawdown
+
+**P2 — ReconciliationService auto_sync**
+- 当前 `auto_sync=False`（保守，以券商为准的同步会静默覆盖本地记录）
+- 真实 paper 阶段建议先观察 1 个月，确认无 race condition 后再启用
+
+**L7 流水线状态**
+```
+✅ Backtest (≥5年, MatrixBacktest)
+✅ Walk-Forward (4 轮, 迭代 #3)
+✅ Portfolio Backtest (组合层验证, 迭代 #4)
+🔄 Paper Trade (≥1月, 本次迭代修复 paper 完整性 → 可进入 1 月验证)
+   ← 1 个月 paper 数据后用 PaperDailyMetrics 计算 Sortino/DD 判断策略质量
+```
+
+---
+> **Orchestrator 验证记录** (自动追加)
+> - 迭代状态: partial
+> - 测试: 0 passed, 0 failed
+> - 违规: 0 条
+> - 高风险文件: 1 个
+> - 测试数变化: 0 → 0
+> - CodeBuddy 自行更新了 trajectory ✅
+
+---

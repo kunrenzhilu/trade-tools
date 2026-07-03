@@ -227,7 +227,61 @@ class OrderResult:
 
 ### 7.5 Paper Trading 的局限性
 - Paper Trading 假设订单总是能成交，不反映真实流动性
-- 真实交易中，在低流动性股票上大单可能无法成交或造成大滑点
+- 真实��易中，在低流动性股票上大单可能无法成交或造成大滑点
+
+### 7.6 AlpacaBroker 只读状态能力（迭代 #5 新增）
+
+为支撑 paper trading 对账与 pending 订单生命周期闭环（修复 P0-B），
+`AlpacaBroker` 在迭代 #5 中新增以下只读/状态类方法。**关键约束：不提交新订单、不取消订单，只做状态同步。**
+
+```python
+class AlpacaBroker:
+    def get_positions(self) -> list[dict[str, Any]]:
+        """读取 Alpaca 当前持仓，返回 ReconciliationService 兼容结构。
+
+        Returns:
+            [{"symbol": "AAPL", "quantity": 10, "market_value": ..., "avg_entry_price": ...}, ...]
+
+        - quantity 强制 int（ReconciliationService 用 int 比较）
+        - 异常时返回空列表，不抛出（对账服务会处理空列表）
+        - 兼容 SDK Position 对象和 dict 两种 position 结构
+        """
+
+    def get_order_by_client_order_id(self, client_order_id: str) -> OrderResult | None:
+        """优先查询本地缓存；若本地为 PENDING，尝试从 Alpaca 拉取最新状态。
+
+        - 只对 PENDING 订单做远端拉取（FILLED/REJECTED/CANCELLED 是终态）
+        - 优先 client.get_order_by_client_id，fallback get_order_by_client_order_id
+        - 远端异常返回本地缓存 + warning，不抛出
+        - 远端变为 FILLED 时更新本地缓存 self._submitted
+        """
+
+    def refresh_pending_orders(self) -> list[OrderResult]:
+        """刷新所有本地 PENDING 订单，返回刷新后的订单列表。
+
+        - 遍历 self._submitted 中 status == PENDING 的订单
+        - 调用 get_order_by_client_order_id()
+        - 不提交新订单，不取消订单
+        - 不触发 live 风险行为，只做状态同步
+        """
+```
+
+**ScanOrchestrator 集成**：`_refresh_pending_orders()` 在每次扫描开始（`_run_scan` / `_run_eod_check`）前调用一次 broker refresh，对新变为 FILLED 的订单调用 `tracker.process_order()`。
+
+幂等性通过 `_processed_order_ids: set[str]` 保证：同一 `client_order_id` 不会被 `tracker.process_order` 重复调用。broker 不支持 `refresh_pending_orders`（如 PaperBroker）时返回 0，不抛异常。broker.refresh 抛异常时扫描仍继续。
+
+### 7.7 Alpaca 订单生命周期与本地缓存同步
+
+订单状态转换与本地缓存更新策略：
+
+| 状态 | 来源 | 本地缓存行为 |
+|------|------|-------------|
+| PENDING | `_submit_auto()` 提交后 SDK 返回 `new/accepted/pending_new` | 缓存为 PENDING |
+| FILLED | `refresh_pending_orders()` 拉取到 `filled + filled_avg_price` | 更新缓存为 FILLED + fill_price |
+| REJECTED | `_submit_auto()` 异常 / 远端 `rejected` | 缓存为 REJECTED |
+| CANCELLED | `cancel()` 主动取消 | 缓存为 CANCELLED |
+
+关键不变量：本地缓存中 `status == FILLED` 的订单数量应等于 `broker.get_positions()` 返回的有持仓标的数（在 reconciliation 视角下）。如不等，`ReconciliationService.run()` 会报告 diff。
 
 ---
 

@@ -446,6 +446,74 @@ Every orchestrator-driven iteration MUST save a complete snapshot to `iterations
 
 Both are mandatory. The trajectory is the "story"; the snapshot is the "evidence".
 
+## Monitoring Tools
+
+### `scripts/monitor.py` — Orchestrator 任务完成检测
+
+检查一个正在运行的 orchestrator 迭代是否已完成，输出结构化状态。
+
+**何时调用**：
+- 启动 orchestrator 后台迭代后，询问是否已完成 → 调用 `monitor.py --pid <pid>`
+- 需要判断是否可以进入验收阶段 → 调用 `monitor.py --pid <pid> --wait`
+- 没有活跃 PID 时，查看最近日志来判断 → 调用 `monitor.py --log <logfile>`
+
+**调用方式**：
+
+```bash
+# 单次检测（退出码 0=已完成，1=仍在运行）
+/Users/rickouyang/miniforge3/envs/py312trade/bin/python \
+    .codebuddy/skills/meta-agent/scripts/monitor.py \
+    --pid <orchestrator_pid> \
+    --log /tmp/mytrader_iteration_N_orchestrator.log \
+    --project /Users/rickouyang/Github/trade-tools
+
+# 持续等待直到完成（每 30 秒检测，最多等 7200 秒）
+/Users/rickouyang/miniforge3/envs/py312trade/bin/python \
+    .codebuddy/skills/meta-agent/scripts/monitor.py \
+    --pid <orchestrator_pid> \
+    --log /tmp/mytrader_iteration_N_orchestrator.log \
+    --project /Users/rickouyang/Github/trade-tools \
+    --wait
+
+# JSON 输出（供程序消费）
+/Users/rickouyang/miniforge3/envs/py312trade/bin/python \
+    .codebuddy/skills/meta-agent/scripts/monitor.py \
+    --pid <orchestrator_pid> --json
+```
+
+**检测逻辑**：
+
+| 信号 | 判定 |
+|------|------|
+| orchestrator 已输出最终状态 (status=passed/failed/partial) | **completed_by_orchestrator** |
+| CodeBuddy 已退出 (`cb_process_alive=False`) | **completed**（orchestrator 在收尾） |
+| agent idle > 120 秒 | **completed**（可能已完成但进程仍在） |
+| 日志 120 秒无更新 + CB CPU=0 | **stuck**（可能卡住） |
+| orchestrator 进程已退出 | **dead** |
+| 其他 | **running** |
+
+**典型使用场景**：
+
+```
+# 1. 启动后台迭代
+nohup python alignment/orchestrator.py --task "..." --timeout 3600 > /tmp/log 2>&1 &
+echo $PID  # 假设输出 12345
+
+# 2. 等待迭代完成
+python .codebuddy/skills/meta-agent/scripts/monitor.py --pid 12345 --log /tmp/log --wait
+
+# 3. 完成后验收
+# → 读取 iterations/iteration_N/result.json
+# → 运行独立 pytest
+# → 写 summary.md
+```
+
+**关键区别**：
+- 不依赖 `tail`/`ps` 手动判断，提供确定性状态
+- `--wait` 模式下自动轮询，meta-agent 无需多次手动检查
+- 综合进程、日志、git 三路信号判定完成/卡住/失败
+- 退出码语义清晰：0=已完成，1=运行中，2=卡住/异常
+
 ## Resources
 
 - `alignment/ai_constitution.md` — The supreme rules. All decisions must align.
@@ -455,3 +523,4 @@ Both are mandatory. The trajectory is the "story"; the snapshot is the "evidence
 - `.codebuddy/CODEBUDDY.md` — Project state, phase progress, environment info.
 - `mytrader/config/strategy_weights.json` — Current strategy weights (the actual output of the system).
 - `.codebuddy/skills/cb-acp-dev/` — Execution layer skill (ACP protocol, monitoring).
+- `.codebuddy/skills/meta-agent/scripts/monitor.py` — Orchestrator completion detector.

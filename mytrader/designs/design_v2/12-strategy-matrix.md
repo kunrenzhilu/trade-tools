@@ -167,8 +167,7 @@ def run_symbol(symbol, lookback_days=90):
             strategy_name=entry["strategy"],
             confidence=entry["weight"] * base_confidence,   # 权重影响置信度
             group_id=meta.group_id,
-            indicators={"backtest_sharpe": entry["backtest_sharpe"],
-                        "backtest_win_rate": entry["backtest_win_rate"]},
+            indicators=build_matrix_signal_indicators(meta, entry, weight),
         ))
     return signals
 ```
@@ -176,6 +175,43 @@ def run_symbol(symbol, lookback_days=90):
 > **信号有效期说明**：`signal_valid_bars=3` 表示信号在发出后 3 个交易日内仍有效。
 > 这与"持仓 1-5 天"的策略定位匹配：金叉信号 3 天前发出，趋势一般仍在延续，应允许入场。
 > 若担心追高，可将 N 调小（N=1 即退回到只看最后一根 bar 的严格模式）。
+
+### 6.1 Signal indicators 字段（迭代 #5 metadata parity）
+
+**问题背景**：迭代 #5 之前，线上 `StrategyMatrixRunner.run_symbol()` 输出的 `Signal.indicators` 与 `PortfolioBacktester._generate_signals()` 输出的字段集合不同：
+- 线上缺 `sector`：CandidateSelector 的 `max_sector_exposure_pct` 约束把所有线上候选归为 `Unknown`，导致 73 候选 → 2 approved
+- 缺 `backtest_sortino / backtest_max_drawdown / backtest_dd_status`：风控无法读取回测风险 metadata
+
+**修复**：抽出共享 helper（`mytrader/strategy/matrix_runner.py::build_matrix_signal_indicators`），线上与回测均调用同一函数：
+
+```python
+def build_matrix_signal_indicators(meta, entry, weight) -> dict[str, Any]:
+    """从 SymbolMeta + weights entry 构建 Signal.indicators。
+
+    线上 StrategyMatrixRunner.run_symbol 与 PortfolioBacktester._generate_signals
+    必须共用此 helper，避免 metadata 分叉导致 CandidateSelector 行为不一致。
+    """
+    return {
+        "group_id": ...,                # 来自 meta.group_id
+        "sector": ...,                  # 来自 meta.sector，缺省 "Unknown"
+        "backtest_sharpe": ...,          # 来自 entry，缺省 0.0
+        "backtest_sortino": ...,        # 迭代 #1 新增，缺省 0.0
+        "backtest_max_drawdown": ...,    # 迭代 #2 新增，缺省 0.0
+        "backtest_dd_status": ...,       # 迭代 #4 新增，"pass" | "dd_constrained" | "unknown"
+        "backtest_win_rate": ...,        # 来自 entry，缺省 0.0
+        "weight": ...,                  # 来自 entry.weight
+    }
+```
+
+**默认值常量**（module-level，便于测试引用）：
+- `DEFAULT_BACKTEST_SHARPE = 0.0`
+- `DEFAULT_BACKTEST_SORTINO = 0.0`
+- `DEFAULT_BACKTEST_MAX_DD = 0.0`
+- `DEFAULT_BACKTEST_DD_STATUS = "unknown"`
+- `DEFAULT_BACKTEST_WIN_RATE = 0.0`
+- `DEFAULT_SECTOR = "Unknown"`
+
+**测试**：`tests/test_signal_parity.py` 验证两条路径输出 key/value 完全一致。
 
 ---
 

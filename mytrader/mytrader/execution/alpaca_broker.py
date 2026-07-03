@@ -216,8 +216,209 @@ class AlpacaBroker:
         return list(self._submitted.values())
 
     # ------------------------------------------------------------------ #
+    # 迭代 #5 新增：只读/状态类能力
+    #
+    # 目的：支撑 paper trading 对账与 pending 订单生命周期闭环
+    #   - get_positions()：读取 Alpaca 当前持仓，返回 ReconciliationService
+    #                      兼容格式 [{symbol, quantity, ...}]
+    #   - get_order_by_client_order_id()：远程查询订单最新状态
+    #   - refresh_pending_orders()：刷新所有本地 PENDING 订单
+    #
+    # 安全约束：
+    #   - 不提交新订单
+    #   - 不取消订单
+    #   - 远端异常一律降级到本地缓存 + warning，不抛出
+    # ------------------------------------------------------------------ #
+
+    def get_positions(self) -> list[dict[str, Any]]:
+        """读取 Alpaca 当前持仓，返回 ReconciliationService 兼容结构。
+
+        Returns:
+            list[dict]，每条至少包含 {"symbol", "quantity"}：
+                [
+                    {"symbol": "AAPL", "quantity": 10, "market_value": ..., "avg_entry_price": ...},
+                    {"symbol": "MSFT", "quantity": 5, ...},
+                ]
+
+        不可用或异常时返回空列表，不抛出（对账服务会处理空列表）。
+        """
+        try:
+            client = self._get_client()
+            raw_positions = client.get_all_positions()
+        except Exception as exc:
+            logger.warning(
+                f"AlpacaBroker.get_positions failed: {exc}; returning empty list"
+            )
+            return []
+
+        result: list[dict[str, Any]] = []
+        for pos in raw_positions or []:
+            try:
+                symbol = getattr(pos, "symbol", None) or (
+                    pos.get("symbol") if isinstance(pos, dict) else None
+                )
+                raw_qty = (
+                    getattr(pos, "qty", None)
+                    if not isinstance(pos, dict)
+                    else pos.get("qty")
+                )
+                if symbol is None or raw_qty is None:
+                    continue
+                # 兼容 ReconciliationService：quantity 必须是 int
+                try:
+                    quantity = int(float(raw_qty))
+                except (ValueError, TypeError):
+                    continue
+
+                item: dict[str, Any] = {"symbol": str(symbol), "quantity": quantity}
+                # 可选字段：便于后续 metrics/observability
+                for src_field, dst_field in (
+                    ("market_value", "market_value"),
+                    ("avg_entry_price", "avg_entry_price"),
+                    ("current_price", "current_price"),
+                    ("unrealized_pl", "unrealized_pl"),
+                ):
+                    val = (
+                        getattr(pos, src_field, None)
+                        if not isinstance(pos, dict)
+                        else pos.get(src_field)
+                    )
+                    if val is not None:
+                        try:
+                            item[dst_field] = float(val)
+                        except (ValueError, TypeError):
+                            pass
+                result.append(item)
+            except Exception as exc:
+                logger.debug(f"AlpacaBroker.get_positions: skip malformed position: {exc}")
+                continue
+        return result
+
+    def get_order_by_client_order_id(self, client_order_id: str) -> OrderResult | None:
+        """优先查询本地缓存；若本地为 PENDING，尝试从 Alpaca 拉取最新状态。
+
+        Args:
+            client_order_id: 自定义幂等 ID（提交时传入 Alpaca 的 client_order_id）
+
+        Returns:
+            OrderResult | None — 不存在时返回 None；远端查询失败时返回本地缓存。
+        """
+        cached = self._submitted.get(client_order_id)
+        if cached is None:
+            return None
+
+        # 只对 PENDING 订单做远端拉取（FILLED/REJECTED/CANCELLED 是终态）
+        if cached.status != OrderStatus.PENDING:
+            return cached
+
+        try:
+            client = self._get_client()
+        except Exception as exc:
+            logger.debug(
+                f"AlpacaBroker.get_order_by_client_order_id: client init failed for "
+                f"{client_order_id}: {exc}; returning cached"
+            )
+            return cached
+
+        # SDK 不同版本方法名不同：优先 get_order_by_client_id，
+        # 失败时尝试 get_orders filter（保守兼容 mock）
+        alpaca_order = None
+        try:
+            if hasattr(client, "get_order_by_client_id"):
+                alpaca_order = client.get_order_by_client_id(client_order_id)
+            elif hasattr(client, "get_order_by_client_order_id"):
+                alpaca_order = client.get_order_by_client_order_id(client_order_id)
+            else:
+                logger.debug(
+                    "AlpacaBroker.get_order_by_client_order_id: "
+                    "client lacks client_order_id lookup; returning cached"
+                )
+                return cached
+        except Exception as exc:
+            logger.warning(
+                f"AlpacaBroker.get_order_by_client_order_id: remote query failed for "
+                f"{client_order_id}: {exc}; returning cached"
+            )
+            return cached
+
+        if alpaca_order is None:
+            return cached
+
+        # 复用 _parse_alpaca_order：需要 intent 保留原始字段
+        try:
+            updated = self._rebuild_order_result_from_alpaca(cached, alpaca_order)
+        except Exception as exc:
+            logger.warning(
+                f"AlpacaBroker.get_order_by_client_order_id: parse failed for "
+                f"{client_order_id}: {exc}; returning cached"
+            )
+            return cached
+
+        # 若远端变为终态，更新本地缓存
+        if updated.status != cached.status:
+            logger.info(
+                f"AlpacaBroker: order {client_order_id} status transition "
+                f"{cached.status.value} -> {updated.status.value}"
+            )
+            self._submitted[client_order_id] = updated
+        return self._submitted[client_order_id]
+
+    def refresh_pending_orders(self) -> list[OrderResult]:
+        """刷新所有本地 PENDING 订单，返回刷新后的订单列表。
+
+        - 遍历 self._submitted 中 status == OrderStatus.PENDING 的订单
+        - 调用 get_order_by_client_order_id()（可能远端拉取）
+        - 不提交新订单，不取消订单
+        - 不触发 live 风险行为，只做状态同步
+        """
+        pending_ids = [
+            oid for oid, r in self._submitted.items()
+            if r.status == OrderStatus.PENDING
+        ]
+        if not pending_ids:
+            return []
+
+        refreshed: list[OrderResult] = []
+        for oid in pending_ids:
+            updated = self.get_order_by_client_order_id(oid)
+            if updated is not None:
+                refreshed.append(updated)
+        return refreshed
+
+    # ------------------------------------------------------------------ #
     # 内部解析
     # ------------------------------------------------------------------ #
+
+    def _rebuild_order_result_from_alpaca(
+        self,
+        cached: OrderResult,
+        alpaca_order: Any,
+    ) -> OrderResult:
+        """用 cached 的 intent 字段 + 新 alpaca_order 重建 OrderResult。
+
+        _parse_alpaca_order 需要 intent: OrderIntent，但 refresh 流程中只有 cached
+        OrderResult；从 cached 重建一个最小 intent 字段集合即可（_parse_alpaca_order
+        只读 intent.client_order_id / symbol / direction / quantity /
+        stop_loss_price / take_profit_price / meta）。
+        """
+        # 用 cached 重建伪 intent，避免新增 _parse_alpaca_order 的第二个实现
+        from mytrader.risk.models import OrderIntent
+
+        pseudo_intent = OrderIntent(
+            symbol=cached.symbol,
+            direction=cached.direction,
+            quantity=cached.quantity,
+            entry_price=cached.fill_price or 0.0,
+            stop_loss_price=cached.stop_loss_price,
+            take_profit_price=cached.take_profit_price,
+            risk_amount=0.0,
+            position_value=0.0,
+            timestamp=cached.filled_at,
+            strategy_name="",
+            client_order_id=cached.client_order_id,
+            meta=dict(cached.meta),
+        )
+        return self._parse_alpaca_order(pseudo_intent, alpaca_order)
 
     def _parse_alpaca_order(self, intent: OrderIntent, alpaca_order: Any) -> OrderResult:
         """将 Alpaca 订单对象解析为 OrderResult。"""

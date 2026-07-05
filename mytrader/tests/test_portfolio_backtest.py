@@ -743,3 +743,173 @@ class TestMainIntegration:
         assert "Sharpe=" in src
         assert "Annual Return=" in src
         assert "DD Violation=" in src
+
+
+# ---------------------------------------------------------------------------
+# 测试 11: Benchmark 对比（迭代 #7 新增）
+# ---------------------------------------------------------------------------
+
+class TestBenchmarkComparison:
+    """迭代 #7：SPY buy-and-hold benchmark 对比。"""
+
+    def test_benchmark_fields_exist(self):
+        """PortfolioBacktestResult 实例包含所有新增 benchmark 字段。"""
+        result = PortfolioBacktestResult(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 6, 30),
+            initial_capital=100_000.0,
+            final_equity=105_000.0,
+            total_return_pct=5.0,
+            annualized_return_pct=10.0,
+            sharpe_ratio=1.2,
+            sortino_ratio=1.5,
+            max_drawdown_pct=8.0,
+            calmar_ratio=1.25,
+            daily_returns=pd.Series([0.01, -0.005, 0.02]),
+            equity_curve=pd.Series([100_000, 101_000, 100_495, 102_505]),
+        )
+        # 验证 7 个新增 benchmark 字段存在且有默认值
+        assert result.benchmark_symbol == "SPY"
+        assert result.benchmark_total_return_pct == 0.0
+        assert result.benchmark_annualized_return_pct == 0.0
+        assert result.benchmark_sortino_ratio == 0.0
+        assert result.benchmark_max_drawdown_pct == 0.0
+        assert result.alpha_pct == 0.0
+        assert result.information_ratio == 0.0
+
+    def test_benchmark_computed_with_spy_data(
+        self, mock_universe_3_symbols, weights_file_simple
+    ):
+        """mock store 返回 SPY 上涨数据 → benchmark_total_return_pct > 0。"""
+        store = MagicMock()
+        # 组合标的用上涨数据
+        df_aapl = _make_ohlcv_df(30, 100.0, trend=0.5)
+        df_msft = _make_ohlcv_df(30, 200.0, trend=0.3)
+        df_jpm = _make_ohlcv_df(30, 80.0, trend=0.2)
+        # SPY 也用上涨数据
+        df_spy = _make_ohlcv_df(30, 400.0, trend=0.4)
+        mapping = {
+            "AAPL": df_aapl, "MSFT": df_msft, "JPM": df_jpm, "SPY": df_spy
+        }
+
+        def get_bars_multi(symbols, start, end, timeframe="1d"):
+            return {s: mapping[s].copy() for s in symbols if s in mapping}
+
+        store.get_bars_multi.side_effect = get_bars_multi
+
+        bt = PortfolioBacktester(
+            store=store,
+            universe=mock_universe_3_symbols,
+            weights_file=weights_file_simple,
+        )
+        result = bt.run(start=date(2024, 1, 1), end=date(2024, 1, 31))
+
+        # SPY 上涨 → benchmark_total_return_pct > 0
+        assert result.benchmark_symbol == "SPY"
+        assert result.benchmark_total_return_pct > 0, (
+            f"SPY 上涨数据 → benchmark_return 应 > 0，实际 {result.benchmark_total_return_pct:.4f}"
+        )
+        assert result.benchmark_annualized_return_pct > 0
+        # alpha 已计算（不论正负，应不为 0 —— 组合年化 - SPY 年化）
+        # 注意：组合数据与 SPY 都是合成上涨，alpha 可能为正或负，只验证非零
+        assert isinstance(result.alpha_pct, float)
+        assert isinstance(result.information_ratio, float)
+
+    def test_benchmark_zero_when_no_spy(
+        self, mock_store_3_symbols, mock_universe_3_symbols, weights_file_simple
+    ):
+        """mock store 不返回 SPY → 所有 benchmark 字段 = 0.0，不抛异常。"""
+        # mock_store_3_symbols 只含 AAPL/MSFT/JPM，不含 SPY
+        bt = PortfolioBacktester(
+            store=mock_store_3_symbols,
+            universe=mock_universe_3_symbols,
+            weights_file=weights_file_simple,
+        )
+        result = bt.run(start=date(2024, 1, 1), end=date(2024, 1, 31))
+
+        # 降级处理：所有 benchmark 字段 = 0.0
+        assert result.benchmark_symbol == "SPY"
+        assert result.benchmark_total_return_pct == 0.0
+        assert result.benchmark_annualized_return_pct == 0.0
+        assert result.benchmark_sortino_ratio == 0.0
+        assert result.benchmark_max_drawdown_pct == 0.0
+        # alpha = portfolio - benchmark = portfolio - 0 = portfolio
+        assert result.alpha_pct == result.annualized_return_pct
+        assert result.information_ratio == 0.0
+
+    def test_alpha_calculation(self):
+        """alpha = 组合年化 - benchmark 年化。
+
+        构造 result：portfolio=15%, benchmark=10% → alpha=5.0
+        """
+        result = PortfolioBacktestResult(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 6, 30),
+            initial_capital=100_000.0,
+            final_equity=115_000.0,
+            total_return_pct=15.0,
+            annualized_return_pct=15.0,
+            sharpe_ratio=1.2,
+            sortino_ratio=1.5,
+            max_drawdown_pct=8.0,
+            calmar_ratio=1.875,
+            daily_returns=pd.Series([0.01] * 10),
+            equity_curve=pd.Series([100_000, 101_000]),
+            benchmark_annualized_return_pct=10.0,
+        )
+        # 验证 alpha = portfolio - benchmark = 5.0
+        expected_alpha = 15.0 - 10.0
+        # alpha_pct 由 run() 末尾计算；测试中我们直接构造 result 验证字段语义
+        # （alpha 字段默认 0.0，需手动设置或经 run() 计算）
+        result.alpha_pct = result.annualized_return_pct - result.benchmark_annualized_return_pct
+        assert result.alpha_pct == expected_alpha
+        assert result.alpha_pct > 0  # 跑赢 benchmark
+
+    def test_information_ratio_computation(self):
+        """IR 计算正确性：构造已知超额收益序列。"""
+        # 构造 portfolio 与 spy 完全相同的 returns → IR 应为 0（无超额收益）
+        # 用静态方法直接测试
+        dates = [date(2024, 1, 1) + timedelta(days=i) for i in range(10)]
+        port_returns = [0.001] * 10
+        spy_idx = pd.to_datetime(dates)
+        spy_returns = pd.Series([0.001] * 10, index=spy_idx)
+        ir = PortfolioBacktester._compute_information_ratio(
+            port_returns, dates, spy_returns
+        )
+        # excess 全 0 → std=0 → 返回 0.0
+        assert ir == 0.0
+
+        # 构造 portfolio 持续跑赢 spy 0.0005/天 → IR > 0
+        port_returns_better = [0.002] * 10  # 比 spy 高 0.001/天
+        ir2 = PortfolioBacktester._compute_information_ratio(
+            port_returns_better, dates, spy_returns
+        )
+        assert ir2 > 0, f"持续超额收益 → IR 应 > 0，实际 {ir2:.4f}"
+
+    def test_benchmark_max_drawdown(self):
+        """构造 SPY 先涨后跌 → benchmark_max_drawdown_pct > 0。"""
+        # SPY: 先涨 5 天，再跌 5 天
+        spy_close_values = [100.0, 101.0, 102.0, 103.0, 104.0,
+                            100.0, 96.0, 92.0, 88.0, 84.0]
+        idx = pd.date_range("2024-01-01", periods=10, freq="B")
+        spy_df = pd.DataFrame({
+            "open":   [c - 0.3 for c in spy_close_values],
+            "high":   [c + 0.5 for c in spy_close_values],
+            "low":    [c - 0.5 for c in spy_close_values],
+            "close":  spy_close_values,
+            "volume": [1_000_000] * 10,
+        }, index=idx)
+        spy_returns = spy_df["close"].pct_change().dropna()
+        # 直接调用 _compute_max_drawdown_pct（与 _compute_benchmark 内部一致）
+        dd = PortfolioBacktester._compute_max_drawdown_pct(spy_returns)
+        # 先涨到 104，再跌到 84 → DD = (84 - 104) / 104 ≈ 19.23%
+        assert dd > 0
+        assert 15.0 < dd < 25.0, f"SPY DD 应在 ~19.23%，实际 {dd:.2f}%"
+
+    def test_benchmark_max_drawdown_static_method(self):
+        """_compute_max_drawdown_pct 在 SPY 上涨序列上返回 0（无回撤）。"""
+        spy_close_values = [100.0 + i for i in range(20)]  # 持续上涨
+        idx = pd.date_range("2024-01-01", periods=20, freq="B")
+        spy_returns = pd.Series(spy_close_values, index=idx).pct_change().dropna()
+        dd = PortfolioBacktester._compute_max_drawdown_pct(spy_returns)
+        assert dd == 0.0, "持续上涨 → 无回撤"

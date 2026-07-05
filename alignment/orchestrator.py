@@ -17,6 +17,7 @@ Orchestrator — CodeBuddy 监控循环
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -35,7 +36,15 @@ from acp.interfaces import Client
 
 # ─── 路径常量 ───────────────────────────────────────────────────────────
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# 自动检测项目根目录：从本文件所在位置向上查找同时包含 `mytrader/` 和 `.codebuddy/` 的目录。
+# 这样 alignment/orchestrator.py 和 .codebuddy/skills/cb-acp-dev/scripts/orchestrator.py
+# 可以保持字节级同步，无需为路径常量写不同分支。
+_FILE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT: Path = _FILE_DIR
+for _candidate in [_FILE_DIR, *_FILE_DIR.parents]:
+    if (_candidate / "mytrader").is_dir() and (_candidate / ".codebuddy").is_dir():
+        PROJECT_ROOT = _candidate
+        break
 MYTRADER_ROOT = PROJECT_ROOT / "mytrader"
 ALIGNMENT_DIR = PROJECT_ROOT / "alignment"
 CONSTITUTION_FILE = ALIGNMENT_DIR / "ai_constitution.md"
@@ -292,20 +301,61 @@ HIGH_RISK_PATTERNS = {
 
 
 def get_changed_files() -> list[str]:
-    """获取 git diff 变更文件列表"""
+    """获取变更文件列表（tracked modified + untracked）。
+
+    基于 `git status --porcelain` 解析，能捕获 `git diff` 漏掉的 untracked 新文件。
+    失败时 fallback 到 `git diff --name-only HEAD`。
+    """
     try:
         result = subprocess.run(
-            ["git", "diff", "--name-only"],
+            ["git", "status", "--porcelain=v1"],
             capture_output=True,
             text=True,
             cwd=str(PROJECT_ROOT),
             timeout=10,
         )
-        if result.stdout.strip():
-            return [f for f in result.stdout.strip().split("\n") if f]
-        return []
+        if result.returncode != 0:
+            raise RuntimeError(f"git status rc={result.returncode}: {result.stderr[:200]}")
+
+        changed: list[str] = []
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                continue
+            # porcelain 格式: "XY path" 或 "XY path -> dest"
+            # X = staged, Y = working tree；?? = untracked, M = modified, A = added
+            if len(line) < 4:
+                continue
+            path_part = line[3:]
+            # 处理 rename: "old -> new" → 取 new
+            if " -> " in path_part:
+                path_part = path_part.split(" -> ", 1)[1]
+            # 去掉引号包裹（路径含空格时 git 会包引号）
+            if path_part.startswith('"') and path_part.endswith('"'):
+                path_part = path_part[1:-1]
+            changed.append(path_part)
+        # 去重（同一文件可能 staged + working 均有变更）
+        seen: set[str] = set()
+        unique: list[str] = []
+        for f in changed:
+            if f not in seen:
+                seen.add(f)
+                unique.append(f)
+        return unique
     except Exception:
-        return []
+        # fallback: 只看 tracked diff
+        try:
+            result = subprocess.run(
+                ["git", "diff", "--name-only", "HEAD"],
+                capture_output=True,
+                text=True,
+                cwd=str(PROJECT_ROOT),
+                timeout=10,
+            )
+            if result.stdout.strip():
+                return [f for f in result.stdout.strip().split("\n") if f]
+            return []
+        except Exception:
+            return []
 
 
 def check_git_diff_violations(changed_files: list[str]) -> tuple[list[str], list[str]]:
@@ -333,80 +383,258 @@ def check_git_diff_violations(changed_files: list[str]) -> tuple[list[str], list
 
         content = full_path.read_text(encoding="utf-8", errors="ignore")
 
-        # 检查禁止的代码模式
+        # 测试文件和 harness 文件不检查高风险参数变更模式
+        # 测试数据中常含 max_drawdown=18 等赋值；harness 文件（orchestrator 自身）包含正则定义
+        is_test_file = "/tests/" in filepath or filepath.startswith("tests/")
+        is_harness_file = filepath.startswith("alignment/") or filepath.startswith(".codebuddy/")
+
+        # 检查禁止的代码模式（所有 .py 文件都检查）
         for pattern_name, (pattern, message) in FORBIDDEN_CODE_PATTERNS.items():
             if pattern.search(content):
                 violations.append(f"{filepath}: {message}")
 
-        # 检查高风险代码模式
-        for pattern_name, pattern in HIGH_RISK_PATTERNS.items():
-            if pattern.search(content):
-                violations.append(
-                    f"{filepath}: 高风险参数变更 ({pattern_name})，需用户审批"
-                )
+        # 检查高风险代码模式（仅非测试、非 harness 文件）
+        if not is_test_file and not is_harness_file:
+            for pattern_name, pattern in HIGH_RISK_PATTERNS.items():
+                if pattern.search(content):
+                    violations.append(
+                        f"{filepath}: 高风险参数变更 ({pattern_name})，需用户审批"
+                    )
 
     return violations, high_risk_files
 
 
-def count_tests() -> int:
-    """收集当前测试数量（仅收集，不运行）"""
-    try:
-        result = subprocess.run(
-            [PYTHON_BIN, "-m", "pytest", "--co", "-q"],
-            capture_output=True,
-            text=True,
-            cwd=str(MYTRADER_ROOT),
-            timeout=30,
-        )
-        count = 0
-        for line in result.stdout.strip().split("\n"):
-            if "::" in line:
-                count += 1
-        return count
-    except Exception:
-        return -1
+# ─── pytest harness ──────────────────────────────────────────────────────
 
 
-def run_tests() -> dict:
-    """运行 pytest 并返回结果"""
-    try:
-        result = subprocess.run(
-            [PYTHON_BIN, "-m", "pytest", "--tb=short", "-q"],
-            capture_output=True,
-            text=True,
-            cwd=str(MYTRADER_ROOT),
-            timeout=120,
-        )
-        # 解析 "478 passed, 5 failed" 格式
-        summary_line = ""
-        for line in result.stdout.strip().split("\n"):
-            if "passed" in line or "failed" in line or "error" in line:
-                summary_line = line
+def build_pytest_command(*, collect_only: bool = False) -> list[str]:
+    """构造统一的 pytest 命令。
+
+    默认 live 测试由 `mytrader/pyproject.toml` 的 `addopts = "-q -m 'not live'"` 隔离，
+    因此本命令不再显式添加 `-m 'not live'`，避免与 pyproject 重复导致参数冲突。
+
+    Args:
+        collect_only: True 则仅收集不运行（用于 count_tests）；False 则运行测试。
+    """
+    cmd = [PYTHON_BIN, "-m", "pytest"]
+    if collect_only:
+        cmd += ["--collect-only", "-q"]
+    else:
+        cmd += ["--tb=short", "-q"]
+    return cmd
+
+
+def parse_pytest_summary(output: str) -> dict[str, Any]:
+    """解析 pytest 输出的末尾 summary 行。
+
+    支持以下格式（pytest 8.x）：
+      - "562 passed, 103 warnings in 15.70s"
+      - "562 passed, 5 failed, 103 warnings in 20.1s"
+      - "1 error, 10 passed in 2.0s"
+      - "no tests ran in 0.01s"
+      - "562/578 tests collected (16 deselected) in 1.63s"  (--collect-only)
+
+    Returns:
+        dict 至少包含 passed/failed/errors/warnings/summary 字段。
+    """
+    passed = 0
+    failed = 0
+    errors = 0
+    warnings = 0
+    summary = ""
+    collected = None  # collect-only summary 的数量（如有）
+
+    if output:
+        # 从后向前找最后一个包含 pytest summary 关键模式的非空行。
+        # 严格匹配 "N passed/failed/error/warning" 形态，避免误匹配
+        # `-- Docs: .../capture-warnings.html`（含 "warning" 子串但非 summary）。
+        summary_patterns = [
+            re.compile(r"\d+\s+passed", re.IGNORECASE),
+            re.compile(r"\d+\s+failed", re.IGNORECASE),
+            re.compile(r"\d+\s+errors?", re.IGNORECASE),
+            re.compile(r"\d+\s+warnings?", re.IGNORECASE),
+            re.compile(r"no tests ran", re.IGNORECASE),
+            re.compile(r"\d+\s*/\s*\d+\s+tests?\s+collected", re.IGNORECASE),
+            re.compile(r"\d+\s+tests?\s+collected", re.IGNORECASE),
+            re.compile(r"\d+\s+items?\s+collected", re.IGNORECASE),
+        ]
+        for line in reversed(output.strip().splitlines()):
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            if any(p.search(line_stripped) for p in summary_patterns):
+                summary = line_stripped
                 break
 
-        passed = 0
-        failed = 0
-        errors = 0
-        for m in re.finditer(r"(\d+)\s+(passed|failed|error)", summary_line):
-            count = int(m.group(1))
-            status = m.group(2)
+    if summary:
+        # collect-only 格式: "562/578 tests collected (16 deselected) in 1.63s"
+        m = re.search(r"(\d+)\s*/\s*\d+\s+tests?\s+collected", summary)
+        if m:
+            collected = int(m.group(1))
+
+        # 常规 summary: "N passed[, N failed][, N errors][, N warnings] in Xs"
+        for match in re.finditer(r"(\d+)\s+(passed|failed|errors?|warnings?)", summary):
+            count = int(match.group(1))
+            status = match.group(2).lower().rstrip("s")  # 归一化为单数
             if status == "passed":
                 passed = count
             elif status == "failed":
                 failed = count
             elif status == "error":
                 errors = count
+            elif status == "warning":
+                warnings = count
+
+        # "no tests ran" 特殊处理
+        if "no tests ran" in summary.lower():
+            passed = 0
+            failed = 0
+            errors = 0
+
+    return {
+        "passed": passed,
+        "failed": failed,
+        "errors": errors,
+        "warnings": warnings,
+        "summary": summary,
+        "collected": collected,  # 仅 collect-only 模式有意义
+    }
+
+
+def has_test_failures(test_result: dict | None) -> bool:
+    """判定 pytest 结果是否包含失败（用于状态判定）。
+
+    失败条件：
+        - test_result 为 None
+        - test_result.error 存在（subprocess 异常等）
+        - exit_code != 0
+        - failed > 0
+        - errors > 0
+    """
+    if not test_result:
+        return True
+    if test_result.get("error"):
+        return True
+    if int(test_result.get("exit_code", 1)) != 0:
+        return True
+    if int(test_result.get("failed", 0)) > 0:
+        return True
+    if int(test_result.get("errors", 0)) > 0:
+        return True
+    return False
+
+
+def count_tests() -> int:
+    """收集当前测试数量（仅收集，不运行）。
+
+    解析顺序：
+        1. 优先从 stdout/stderr 的 `N tests collected` / `N collected` 解析
+        2. fallback 统计包含 `::` 的 nodeid 行
+        3. fallback 统计 `tests/xxx.py: N` 行并求和（pytest 8.x `-q` collect 格式）
+        4. 命令 exit_code 非 0 → 返回 -1（不假装 0）
+    """
+    try:
+        cmd = build_pytest_command(collect_only=True)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(MYTRADER_ROOT),
+            timeout=60,
+        )
+        if result.returncode != 0:
+            return -1
+
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        # summary 行可能在 stdout 或 stderr（pytest 版本差异）
+        combined = stdout + "\n" + stderr
+        summary = parse_pytest_summary(combined)
+
+        # 1. collect-only summary 中解析到 collected 数量
+        if summary.get("collected") is not None:
+            return int(summary["collected"])
+
+        # 2. 尝试解析 "N tests collected" / "N items collected" 形态
+        m = re.search(
+            r"(\d+)\s+tests?\s+collected|(\d+)\s+items?\s+collected|(\d+)\s+collected\s+in",
+            combined,
+        )
+        if m:
+            for grp in m.groups():
+                if grp:
+                    return int(grp)
+
+        # 3. fallback: 统计包含 `::` 的 nodeid 行（仅看 stdout）
+        nodeid_count = sum(1 for line in stdout.splitlines() if "::" in line)
+        if nodeid_count > 0:
+            return nodeid_count
+
+        # 4. fallback: pytest 8.x `-q --collect-only` 的 "tests/xxx.py: N" 格式
+        #    严格匹配相对路径（排除 site-packages 的 __init__.py:6 警告行）
+        per_file_count = 0
+        for line in stdout.splitlines():
+            stripped = line.strip()
+            # 仅匹配不以 / 或 . 开头的相对路径（即项目内文件）
+            if stripped.startswith(("/", ".")):
+                continue
+            m = re.match(r"^(tests/)?[^:\s]+\.py:\s*(\d+)\s*$", stripped)
+            if m:
+                per_file_count += int(m.group(2))
+        if per_file_count > 0:
+            return per_file_count
+
+        # 5. 什么都没收集到 → 0（仅在输出明确为 "no tests collected" 时合理）
+        return 0
+    except Exception:
+        return -1
+
+
+def run_tests() -> dict:
+    """运行 pytest 并返回结果。
+
+    Returns:
+        dict 包含 passed/failed/errors/warnings/exit_code/summary/stdout_tail/stderr_tail/command。
+        subprocess 异常时返回 {"error": str(e), "exit_code": -1, "command": cmd}。
+    """
+    cmd = build_pytest_command(collect_only=False)
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(MYTRADER_ROOT),
+            timeout=300,
+        )
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        combined = stdout + "\n" + stderr
+        summary = parse_pytest_summary(combined)
 
         return {
-            "passed": passed,
-            "failed": failed,
-            "errors": errors,
+            "passed": summary["passed"],
+            "failed": summary["failed"],
+            "errors": summary["errors"],
+            "warnings": summary["warnings"],
             "exit_code": result.returncode,
-            "summary": summary_line,
-            "stdout_tail": result.stdout[-500:],
+            "summary": summary["summary"],
+            "stdout_tail": stdout[-2000:],
+            "stderr_tail": stderr[-500:],
+            "command": cmd,
         }
     except Exception as e:
-        return {"error": str(e)}
+        return {
+            "error": str(e),
+            "exit_code": -1,
+            "command": cmd,
+            "passed": 0,
+            "failed": 0,
+            "errors": 0,
+            "warnings": 0,
+            "summary": "",
+            "stdout_tail": "",
+            "stderr_tail": str(e),
+        }
 
 
 # ─── 留痕检查 ────────────────────────────────────────────────────────────
@@ -675,7 +903,7 @@ def save_iteration_snapshot(result: IterationResult):
     response_text = "\n---\n".join(result.text_responses) if result.text_responses else "(无文本输出)"
     (snapshot_dir / "full_response.md").write_text(response_text, encoding="utf-8")
 
-    # 3. code_diff.patch — git diff 快照
+    # 3. code_diff.patch — git diff 快照（tracked 文件的变更）
     try:
         diff_result = subprocess.run(
             ["git", "diff", "HEAD"],
@@ -688,6 +916,37 @@ def save_iteration_snapshot(result: IterationResult):
     except Exception as e:
         diff_content = f"(git diff 失败: {e})"
     (snapshot_dir / "code_diff.patch").write_text(diff_content, encoding="utf-8")
+
+    # 3a. git_status.txt — 完整 `git status --porcelain=v1` 输出
+    #     用于捕获 untracked 新文件（`git diff HEAD` 会漏掉这些）。
+    untracked_files: list[dict[str, Any]] = []
+    try:
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain=v1"],
+            capture_output=True,
+            text=True,
+            cwd=str(PROJECT_ROOT),
+            timeout=15,
+        )
+        status_content = status_result.stdout if status_result.stdout else "(git status 无输出)"
+        untracked_files = _collect_untracked_files(status_content)
+    except Exception as e:
+        status_content = f"(git status 失败: {e})"
+    (snapshot_dir / "git_status.txt").write_text(status_content, encoding="utf-8")
+
+    # 3b. untracked_files.json — untracked 文件路径、大小、sha256
+    if untracked_files:
+        (snapshot_dir / "untracked_files.json").write_text(
+            json.dumps(untracked_files, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+
+    # 3c. untracked_diff.patch — 对文本型 untracked 文件生成 diff 形式快照
+    untracked_diff = _build_untracked_diff(untracked_files)
+    if untracked_diff:
+        (snapshot_dir / "untracked_diff.patch").write_text(
+            untracked_diff, encoding="utf-8"
+        )
 
     # 4. prompt_template.md — 记录任务描述（prompt 本身在 build_constitution_prompt 中构造）
     (snapshot_dir / "prompt_template.md").write_text(
@@ -706,7 +965,178 @@ def save_iteration_snapshot(result: IterationResult):
             encoding="utf-8",
         )
 
+    # 6. gate_status.json — 机器可读的 gate/harness 健康状态
+    #    让 Meta-Agent 不只依赖 markdown summary 判定迭代质量。
+    _write_gate_status(result, snapshot_dir, iter_num, untracked_files)
+
     print(f"  快照已保存: {snapshot_dir}")
+
+
+# untracked 文件快照过滤规则（避免泄露敏感文件 / 收集过大文件）
+_UNTRACKED_SKIP_DIRS = (".codebuddy/teams/", "__pycache__/", ".git/", "node_modules/")
+_UNTRACKED_SKIP_SUFFIXES = (".pyc", ".pyo", ".swp")
+_UNTRACKED_MAX_SIZE = 1024 * 1024  # 1MB
+_UNTRACKED_SENSITIVE_NAME_PARTS = (".env", "secret", "token", "key", "credential")
+
+
+def _is_sensitive_path(path_str: str) -> bool:
+    lower = path_str.lower()
+    for part in _UNTRACKED_SENSITIVE_NAME_PARTS:
+        if part in lower:
+            return True
+    return False
+
+
+def _collect_untracked_files(porcelain_output: str) -> list[dict[str, Any]]:
+    """从 `git status --porcelain=v1` 输出解析 untracked 文件（?? 前缀）。
+
+    Returns:
+        list of {path, size, sha256}；敏感文件仅记录路径，不读内容。
+    """
+    files: list[dict[str, Any]] = []
+    for line in porcelain_output.splitlines():
+        if len(line) < 4:
+            continue
+        xy = line[:2]
+        if xy != "??":
+            continue
+        path_part = line[3:]
+        if " -> " in path_part:
+            path_part = path_part.split(" -> ", 1)[1]
+        if path_part.startswith('"') and path_part.endswith('"'):
+            path_part = path_part[1:-1]
+
+        # 跳过黑名单目录/后缀
+        if any(path_part.startswith(d) for d in _UNTRACKED_SKIP_DIRS):
+            continue
+        if any(path_part.endswith(s) for s in _UNTRACKED_SKIP_SUFFIXES):
+            continue
+        if _is_sensitive_path(path_part):
+            # 仍记录路径，但不读内容
+            files.append({
+                "path": path_part,
+                "size": None,
+                "sha256": None,
+                "sensitive": True,
+            })
+            continue
+
+        full_path = PROJECT_ROOT / path_part
+        if not full_path.exists() or not full_path.is_file():
+            continue
+        try:
+            stat = full_path.stat()
+            if stat.st_size > _UNTRACKED_MAX_SIZE:
+                files.append({
+                    "path": path_part,
+                    "size": stat.st_size,
+                    "sha256": None,
+                    "skipped_reason": "file_too_large",
+                })
+                continue
+            content = full_path.read_bytes()
+            sha = hashlib.sha256(content).hexdigest()
+            files.append({
+                "path": path_part,
+                "size": stat.st_size,
+                "sha256": sha,
+                "sensitive": False,
+            })
+        except Exception as e:
+            files.append({
+                "path": path_part,
+                "size": None,
+                "sha256": None,
+                "error": str(e),
+            })
+    return files
+
+
+def _build_untracked_diff(untracked_files: list[dict[str, Any]]) -> str:
+    """对文本型 untracked 文件生成类似 `git diff` 的 patch。
+
+    跳过：敏感文件、过大文件、二进制文件（基于内容嗅探）。
+    """
+    patches: list[str] = []
+    for info in untracked_files:
+        if info.get("sensitive"):
+            continue
+        if info.get("skipped_reason") == "file_too_large":
+            continue
+        if info.get("sha256") is None:
+            continue
+
+        path_str = info["path"]
+        full_path = PROJECT_ROOT / path_str
+        try:
+            content_bytes = full_path.read_bytes()
+        except Exception:
+            continue
+        # 简单二进制检测：包含 NUL 字节视为二进制
+        if b"\x00" in content_bytes:
+            continue
+        try:
+            content = content_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+
+        # 构造类似 git diff 的 patch
+        patches.append(
+            f"diff --git a/{path_str} b/{path_str}\n"
+            f"new file mode 100644\n"
+            f"--- /dev/null\n"
+            f"+++ b/{path_str}\n"
+            f"@@ -0,0 +1,{len(content.splitlines())} @@\n"
+            + "".join(f"+{line}\n" for line in content.splitlines())
+        )
+    return "".join(patches)
+
+
+def _write_gate_status(
+    result: IterationResult,
+    snapshot_dir: Path,
+    iter_num: int,
+    untracked_files: list[dict[str, Any]],
+) -> None:
+    """写出 iterations/iteration_N/gate_status.json — 机器可读的 gate/harness 健康状态。"""
+    test_result = result.test_result or {}
+    gate = {
+        "iteration": iter_num,
+        "iteration_id": result.iteration_id,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "status": result.status,
+        "tests": {
+            "count_before": result.test_count_before,
+            "count_after": result.test_count_after,
+            "passed": int(test_result.get("passed", 0) or 0),
+            "failed": int(test_result.get("failed", 0) or 0),
+            "errors": int(test_result.get("errors", 0) or 0),
+            "warnings": int(test_result.get("warnings", 0) or 0),
+            "exit_code": int(test_result.get("exit_code", -1) or 0),
+            "summary": test_result.get("summary", ""),
+            "has_test_failures": has_test_failures(result.test_result),
+        },
+        "snapshot": {
+            "changed_files_count": len(result.changed_files),
+            "includes_untracked": len(untracked_files) > 0,
+            "untracked_count": len(untracked_files),
+            "git_status_file": "git_status.txt",
+            "untracked_files_file": "untracked_files.json" if untracked_files else None,
+            "untracked_diff_file": "untracked_diff.patch" if untracked_files else None,
+        },
+        "compliance": {
+            "violations": result.violations,
+            "high_risk_files_touched": result.high_risk_files_touched,
+            "buffer_overflow_count": result.buffer_overflow_count,
+        },
+        "trajectory_updated_by_codebuddy": result.trajectory_updated_by_codebuddy,
+        "decision_log_updated_by_codebuddy": result.decision_log_updated_by_codebuddy,
+        "error": result.error,
+    }
+    (snapshot_dir / "gate_status.json").write_text(
+        json.dumps(gate, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
 
 
 def save_iteration_summary_template(
@@ -1019,17 +1449,17 @@ async def run_iteration(
         result.trajectory_updated_by_codebuddy = check_trajectory_updated(result.start_time)
         result.decision_log_updated_by_codebuddy = check_decision_log_updated(result.start_time)
 
-        # 5. 判定状态
+        # 5. 判定状态（严格使用 pytest exit_code + failed + errors + error 字段）
         if result.violations:
             result.status = "failed"
+        elif has_test_failures(result.test_result):
+            result.status = "failed"  # 测试失败 / exit_code != 0 / subprocess error
         elif result.test_count_after < result.test_count_before and result.test_count_before > 0:
             result.status = "failed"  # 测试数下降 = 禁止行为 #9
         elif result.high_risk_files_touched:
             result.status = "partial"  # 高风险变更需审批
         elif result.buffer_overflow_count > 0:
             result.status = "partial"  # ACP 通信中断，结果可能不完整
-        elif result.test_result and result.test_result.get("error"):
-            result.status = "partial"
         else:
             result.status = "passed"
 

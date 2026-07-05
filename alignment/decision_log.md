@@ -219,3 +219,121 @@
 - **用户反馈**: 待用户确认
 
 ---
+
+### [2026-07-04 UTC] 迭代 #7 — SignalRanker 评分权重调整的边界判定
+
+- **困境描述**: spec §7 将本次迭代评为"中风险"（修改 SignalRanker 评分逻辑会改变选股排名），但同时声明不属于"高风险变更"（高风险 = risk param / execution logic / validation thresholds）。需要在 L8 框架下判定：评分权重从 `backtest_sharpe` 切换为 `backtest_sortino + backtest_dd_penalty` 是否需要用户审批？
+
+- **涉及 AI Constitution 条款**:
+  - L1: Sortino 首要 KPI — 当前评分用 Sharpe 与 L1 不一致
+  - L7: 测试纪律 — 评分切换需测试覆盖，避免静默回归
+  - L8: 高风险变更定义 — 评分权重是否属于"risk param"？
+
+- **决策逻辑**:
+  1. **评分权重不属于 risk param**：risk param 指的是 DD 阈值（20%）、仓位上限（20%）、止损止盈等直接影响单笔交易风险的参数。评分权重是"选股排名的内部权重"，影响候选顺序但不直接决定下单数量或止损位。
+  2. **评分权重不属于 execution logic**：execution logic 指的是 AlpacaBroker 下单、RiskManager 仓位计算等。SignalRanker 在执行链路之前，输出 RankedSignal 候选列表，由 CandidateSelector 决定是否执行。
+  3. **评分权重不属于 validation thresholds**：validation thresholds 指的是 Walk-Forward DD 15%、Gate 1 Sortino 0.5 等流水线门槛。
+  4. **结论**：评分权重调整属于"中风险"变更（影响选股排名但不触及风控参数），符合 L8 自动部署条件，但应在 decision_log 中记录。
+
+- **决策结果**: 评分权重调整属于中风险变更，自动执行；记录到 decision_log；不触发真实交易（spec §3 明确）；测试通过后即可合并。
+
+- **后续待办**:
+  1. Meta-Agent 在验收阶段运行 `--reoptimize` 验证排名变化（spec §3 明确不在本次迭代内运行）
+  2. 观察评分切换后 portfolio Sortino / DD 是否有显著变化
+  3. 如有显著退化（Sortino < 1.5 或 DD > 12%），考虑回退或调整权重
+
+---
+
+### [2026-07-04 UTC] 迭代 #7 — benchmark 降级时的 alpha 语义
+
+- **困境描述**: 当 SPY 数据不可用时，spec §4.2 要求所有 benchmark 字段降级为 0.0。但 `alpha_pct = portfolio_annualized - benchmark_annualized` 在 benchmark=0 时退化为 `portfolio_annualized`，这是否合理？
+
+- **涉及 AI Constitution 条款**:
+  - L1: KPI 必须可解释 — "alpha=15%" 在无 benchmark 时是否误导？
+  - L7: 代码规范 — 降级语义应明确
+
+- **决策逻辑**:
+  1. **降级是合理的**：无 benchmark 时，"超额收益"概念不成立，但 `alpha = portfolio - 0 = portfolio` 在数学上等价于"绝对收益"，可作为降级信号
+  2. **日志可识别**：`[PortfolioBacktest]` 日志会输出 `Benchmark(SPY) Return=0.00%`，运维人员看到 benchmark=0 即可判断降级发生
+  3. **不抛异常**：spec §4.2 明确要求不抛异常，降级为 0.0 是 spec 要求
+  4. **测试覆盖**：`test_benchmark_zero_when_no_spy` 显式验证 `alpha == portfolio_annualized_return_pct`，语义明确
+
+- **决策结果**: 降级时 alpha = portfolio_annualized_return（语义为"绝对收益"），不抛异常，由日志和测试覆盖。
+
+---
+
+### [2026-07-04 UTC] 迭代 #8 — trend_period 参数网格固定为 [200]
+
+- **困境描述**: `rsi_trend_filter` 策略的参数网格设计中，`trend_period`（SMA 趋势过滤周期）是否应纳入参数网格搜索。常见趋势周期有 50/100/200，全搜索（4 参数 3×3×3×3=81 组合）会大幅膨胀计算规模，但固定为 200 可能错过更优的趋势周期。
+
+- **涉及 AI Constitution 条款**:
+  - L9: Evolution — 系统应支持参数化迭代，不写死
+  - L5: "为未来尚未确定的需求进行 over-engineering" — 禁止
+  - Decision Weight Matrix: 实证优先 > 理论完备
+
+- **决策逻辑**: 固定 `trend_period=200`，不纳入参数网格。理由：
+  1. 200 日 SMA 是市场共识的趋势判定线（年线），无需网格搜索
+  2. 50/100/200 的行为差异主要反映趋势时滞（越短越敏感，越长越滞后），不是策略品质差异——这不是需要搜索的"最优参数"，而是"你想跟踪多长周期的趋势"的策略选择
+  3. 如果纳入搜索，81 个组合规模膨胀 3 倍（27 vs 81），ROI 低
+  4. 如果后续实证发现 50/100 在特定波动率组中表现更好，可改为按组配置（group-based），而不是全局搜索
+
+- **决策结果**: `REOPTIMIZE_PARAM_GRIDS["rsi_trend_filter"]` 中 `trend_period` 固定为 `[200]`。后续实证可扩展为按组配置。
+
+---
+
+### [2026-07-05 UTC] 迭代 #9 — Sortino > 0.5 门槛值选择 + 三级 Fallback 设计
+
+- **困境描述**: 将 top-K 排序从 Sortino 改为 Alpha 后，需要决定是否保留 Sortino 作为过滤条件，以及门槛值取多少。同时需要决定当无候选通过门槛时的降级策略。
+
+- **涉及 AI Constitution 条款**:
+  - L1: KPI — Sortino 仍是 Constitution L1 首要 KPI，不能完全弃用
+  - L5: 不过度工程 — 三级 fallback 是否过度复杂？
+  - Decision Weight Matrix: 实证优先 > 理论完备
+
+- **决策逻辑**:
+
+  1. **保留 Sortino 作为过滤而非排序**：
+     - Alpha 排序直接优化超额收益目标（年化 20-30%）
+     - 但 Alpha 高不等于下行质量好（可能"高 alpha 高下行波动"）
+     - Sortino > 0.5 作为最低质量门槛，排除垃圾策略
+     - 这不违反 L1：Sortino 仍是 KPI，只是从"排序指标"变成"过滤指标"
+
+  2. **门槛值 0.5 的依据**：
+     - Sortino > 1.5 是优秀策略标准（design_v2 §5）
+     - Sortino > 0.5 是"基本可用"的下限（低于 0.5 说明下行风险未被充分补偿）
+     - 0.5 不是硬约束，而是 Tier 1 过滤条件；Tier 2 会放宽
+     - 如实证发现 0.5 过严（排除太多候选），可调整为 0.3 或按组分配置
+
+  3. **三级 Fallback 设计**：
+     - Tier 1: DD ≤ 20% AND Sortino > 0.5 → Alpha 降序（理想路径）
+     - Tier 2: 仅 DD ≤ 20% → Alpha 降序（放宽 Sortino，WARNING 日志）
+     - Tier 3: DD 升序 → dd_constrained=True（DD fallback，与迭代 #3 一致）
+     - 为什么不只用 Tier 1？因为 Sortino > 0.5 可能全部候选都不满足（如熊市期间），需要 fallback 保证回测不阻塞
+     - 为什么不直接用 Tier 2？因为 Sortino 门槛在正常市场环境下能过滤垃圾策略
+     - 三级设计在"严格性"和"鲁棒性"之间平衡
+
+- **决策结果**: 
+  - 保留 Sortino 作为过滤指标（门槛 0.5）
+  - 三级 Fallback：Tier 1 严格 → Tier 2 放宽 Sortino → Tier 3 DD fallback
+  - 门槛值 0.5 可配置（`MIN_SORTINO_THRESHOLD` 常量），后续实证可调整
+
+---
+
+### [2026-07-05 UTC] 迭代 #9 — SPY 降级时 alpha=0 的语义一致性
+
+- **困境描述**: 当 SPY 数据不可用时，`_compute_alpha` 返回 0.0。所有候选 alpha=0 → 排序退化为原顺序。这与迭代 #7 的 PortfolioBacktest 降级决策一致，但需确认 MatrixBacktest 层的语义。
+
+- **涉及 AI Constitution 条款**:
+  - L7: 代码规范 — 降级语义应明确
+  - L1: KPI 必须可解释
+
+- **决策逻辑**:
+  1. **与迭代 #7 一致**：PortfolioBacktest 在 SPY 不可用时 benchmark=0，alpha=portfolio_return。MatrixBacktest 层同理：alpha=0 表示"无法计算超额收益"
+  2. **不抛异常**：spec §4.1 明确要求降级不阻塞回测
+  3. **退化为原顺序**：Python `sorted` 是稳定排序，所有 alpha=0 时保持策略列表顺序（`strategies=["dual_ma", "rsi_mean_revert", ...]` 的顺序），这是可接受的降级
+  4. **ensemble weights 退化**：`max(0, 0.01)` 归一化 → 等权，符合直觉
+  5. **日志可识别**：`_get_spy_returns` 在 SPY 不可用时输出 WARNING
+
+- **决策结果**: SPY 不可用时 alpha=0.0，所有候选 alpha 相等 → 稳定排序保留原顺序 → ensemble 退化为等权。与迭代 #7 降级策略一致。
+
+---

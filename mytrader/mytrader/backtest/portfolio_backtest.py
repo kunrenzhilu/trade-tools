@@ -110,6 +110,13 @@ class PortfolioBacktestResult:
         holdings_history:         每日持仓快照列表（按交易日）
         dd_violation:             DD 是否超过 20% 硬约束
         group_exposure_history:   每日按 group_id 的暴露度快照
+        benchmark_symbol:          Benchmark 标的（默认 SPY，迭代 #7）
+        benchmark_total_return_pct:    Benchmark 同期总收益（百分数）
+        benchmark_annualized_return_pct: Benchmark 年化收益（百分数）
+        benchmark_sortino_ratio:       Benchmark Sortino Ratio
+        benchmark_max_drawdown_pct:    Benchmark 最大回撤（百分数，正值）
+        alpha_pct:                     超额收益 = 组合年化 - benchmark 年化（百分数）
+        information_ratio:             信息比率（年化）
     """
 
     start_date: date
@@ -127,6 +134,14 @@ class PortfolioBacktestResult:
     holdings_history: list[dict[str, Any]] = field(default_factory=list)
     dd_violation: bool = False
     group_exposure_history: list[dict[str, Any]] = field(default_factory=list)
+    # Benchmark 对比（Iteration #7 新增）
+    benchmark_symbol: str = "SPY"
+    benchmark_total_return_pct: float = 0.0
+    benchmark_annualized_return_pct: float = 0.0
+    benchmark_sortino_ratio: float = 0.0
+    benchmark_max_drawdown_pct: float = 0.0
+    alpha_pct: float = 0.0
+    information_ratio: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -410,12 +425,40 @@ class PortfolioBacktester:
             group_exposure_history=self._group_exposure_history,
         )
 
+        # ── Benchmark: SPY buy-and-hold（迭代 #7）──
+        # 数据不可用时降级为 0.0，不抛异常（spec §4.2）
+        benchmark_result = self._compute_benchmark(
+            start, end, daily_returns_list, date_list
+        )
+        result.benchmark_symbol = benchmark_result.get("symbol", "SPY")
+        result.benchmark_total_return_pct = benchmark_result.get(
+            "total_return_pct", 0.0
+        )
+        result.benchmark_annualized_return_pct = benchmark_result.get(
+            "annualized_return_pct", 0.0
+        )
+        result.benchmark_sortino_ratio = benchmark_result.get(
+            "sortino_ratio", 0.0
+        )
+        result.benchmark_max_drawdown_pct = benchmark_result.get(
+            "max_drawdown_pct", 0.0
+        )
+        result.alpha_pct = (
+            result.annualized_return_pct - result.benchmark_annualized_return_pct
+        )
+        result.information_ratio = benchmark_result.get(
+            "information_ratio", 0.0
+        )
+
         logger.info(
             f"[PortfolioBacktest] done: final=${final_equity:,.0f}, "
             f"total_return={total_return_pct:.2f}%, "
             f"annualized={annualized_return_pct:.2f}%, "
             f"sharpe={sharpe:.4f}, sortino={sortino:.4f}, "
-            f"max_dd={max_dd:.2f}%, dd_violation={dd_violation}"
+            f"max_dd={max_dd:.2f}%, dd_violation={dd_violation}, "
+            f"benchmark={result.benchmark_symbol} "
+            f"return={result.benchmark_annualized_return_pct:.2f}%, "
+            f"alpha={result.alpha_pct:.2f}%, ir={result.information_ratio:.4f}"
         )
 
         return result
@@ -575,6 +618,125 @@ class PortfolioBacktester:
             "group_exposure_value": {k: float(v) for k, v in group_exposure.items()},
             "group_exposure_pct": group_exposure_pct,
         })
+
+    def _compute_benchmark(
+        self,
+        start: date,
+        end: date,
+        portfolio_daily_returns: list[float],
+        dates: list[date],
+    ) -> dict[str, Any]:
+        """计算 SPY buy-and-hold benchmark 指标（迭代 #7）。
+
+        从 MarketDataStore 拉取 SPY 同期数据，计算：
+            - total_return_pct / annualized_return_pct
+            - sortino_ratio / max_drawdown_pct（与组合层同口径）
+            - information_ratio（基于 portfolio - spy 的超额收益序列）
+
+        降级处理：SPY 数据不可用时所有字段保持 0.0，不抛异常（spec §4.2）。
+
+        Args:
+            start:                   回测起始日期
+            end:                     回测结束日期
+            portfolio_daily_returns: 组合日收益率序列（与 dates 对齐）
+            dates:                   交易日日期序列
+
+        Returns:
+            dict with benchmark metrics。失败时仅含 "symbol"。
+        """
+        benchmark_symbol = "SPY"
+        try:
+            spy_bars = self._store.get_bars_multi([benchmark_symbol], start, end)
+            spy_df = spy_bars.get(benchmark_symbol)
+            if spy_df is None or spy_df.empty:
+                logger.warning(
+                    "[PortfolioBacktest] SPY data unavailable, benchmark skipped"
+                )
+                return {"symbol": benchmark_symbol}
+
+            spy_close = spy_df["close"].astype(float)
+            if len(spy_close) < 2:
+                logger.warning(
+                    "[PortfolioBacktest] SPY data too short, benchmark skipped"
+                )
+                return {"symbol": benchmark_symbol}
+
+            spy_returns = spy_close.pct_change().dropna()
+
+            # SPY total / annualized return
+            spy_final = float(spy_close.iloc[-1])
+            spy_initial = float(spy_close.iloc[0])
+            spy_total_return_pct = (
+                (spy_final / spy_initial) - 1.0
+            ) * 100.0 if spy_initial > 0 else 0.0
+
+            n_spy = len(spy_returns)
+            years_spy = n_spy / 252.0 if n_spy > 0 else 0.0
+            if years_spy > 0 and spy_final > 0 and spy_initial > 0:
+                spy_annualized_pct = (
+                    (spy_final / spy_initial) ** (1.0 / years_spy) - 1.0
+                ) * 100.0
+            else:
+                spy_annualized_pct = 0.0
+
+            # Sortino / Max DD（复用 matrix_backtest helper，与组合层同口径）
+            spy_sortino = _compute_sortino(spy_returns)
+            spy_max_dd = self._compute_max_drawdown_pct(spy_returns)
+
+            # Information Ratio：基于超额收益序列
+            # 将 SPY returns 对齐到 portfolio 的交易日历
+            ir = self._compute_information_ratio(
+                portfolio_daily_returns, dates, spy_returns
+            )
+
+            return {
+                "symbol": benchmark_symbol,
+                "total_return_pct": float(spy_total_return_pct),
+                "annualized_return_pct": float(spy_annualized_pct),
+                "sortino_ratio": float(spy_sortino),
+                "max_drawdown_pct": float(spy_max_dd),
+                "information_ratio": float(ir),
+            }
+        except Exception as e:
+            logger.warning(
+                f"[PortfolioBacktest] benchmark computation failed: {e}"
+            )
+            return {"symbol": benchmark_symbol}
+
+    @staticmethod
+    def _compute_information_ratio(
+        portfolio_daily_returns: list[float],
+        portfolio_dates: list[date],
+        spy_returns: pd.Series,
+    ) -> float:
+        """计算年化信息比率。
+
+        IR = mean(excess_returns) / std(excess_returns) * sqrt(252)
+        excess_returns = portfolio_returns - spy_returns（按日期对齐）
+        """
+        if not portfolio_daily_returns or len(spy_returns) == 0:
+            return 0.0
+
+        # 组合 returns 转为 pd.Series，index 用 portfolio_dates
+        port_idx = pd.to_datetime(portfolio_dates)
+        port_series = pd.Series(
+            portfolio_daily_returns, index=port_idx, dtype=float
+        )
+
+        # 对齐：取两序列 index 的交集（inner join）
+        aligned = pd.concat(
+            [port_series.rename("port"), spy_returns.rename("spy")],
+            axis=1,
+            join="inner",
+        ).dropna()
+        if aligned.empty or len(aligned) < 5:
+            return 0.0
+
+        excess = aligned["port"] - aligned["spy"]
+        std = excess.std()
+        if std <= 0 or not np.isfinite(std):
+            return 0.0
+        return float(excess.mean() / std * np.sqrt(252))
 
     @staticmethod
     def _compute_max_drawdown_pct(daily_returns: pd.Series) -> float:

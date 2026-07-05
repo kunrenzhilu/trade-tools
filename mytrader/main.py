@@ -35,6 +35,7 @@ from pathlib import Path
 REOPTIMIZE_STRATEGIES: list[str] = [
     "dual_ma",
     "rsi_mean_revert",
+    "rsi_trend_filter",
     "macd_cross",
     "bollinger_band",
 ]
@@ -50,6 +51,9 @@ REOPTIMIZE_PARAM_GRIDS: dict[str, dict[str, list]] = {
     "macd_cross":      {"fast": [8, 12, 16], "slow": [21, 26, 32], "signal_period": [5, 9, 12]},
     # 迭代 #2：布林带 3×3=9 个组合，覆盖常用 std_dev 范围 [1.5, 2.0, 2.5]。
     "bollinger_band":  {"period": [15, 20, 25], "std_dev": [1.5, 2.0, 2.5]},
+    # 迭代 #8：RSI 趋势过滤 3×3×3×1=27 个组合，trend_period 固定 200（经典长周期趋势线）。
+    "rsi_trend_filter": {"rsi_period": [7, 14, 21], "oversold": [25, 30, 35],
+                         "overbought": [65, 70, 75], "trend_period": [200]},
 }
 
 
@@ -414,12 +418,17 @@ def _run_reoptimize(config: "Any", logger: "Any") -> None:
             config=pb_cfg,
         )
         pb_result = pb.run(start=pb_start, end=pb_end)
+        # 迭代 #7：日志增加 benchmark / alpha / IR（Constitution L1 收益可归因）
         logger.info(
             f"[Portfolio Backtest] "
             f"DD={pb_result.max_drawdown_pct:.2f}%, "
             f"Sortino={pb_result.sortino_ratio:.4f}, "
             f"Sharpe={pb_result.sharpe_ratio:.4f}, "
             f"Annual Return={pb_result.annualized_return_pct:.2f}%, "
+            f"Benchmark({pb_result.benchmark_symbol}) "
+            f"Return={pb_result.benchmark_annualized_return_pct:.2f}%, "
+            f"Alpha={pb_result.alpha_pct:.2f}%, "
+            f"IR={pb_result.information_ratio:.4f}, "
             f"DD Violation={'YES' if pb_result.dd_violation else 'NO'}"
         )
         if pb_result.dd_violation:

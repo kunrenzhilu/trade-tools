@@ -1,6 +1,6 @@
 # Trade-Tools 项目核心参考文档
 
-> 最后更新：2026-06-30 (新增 Orchestrator 监控循环)  
+> 最后更新：2026-07-05 (Iter #9: MatrixBacktest Alpha-Based Strategy Selection)  
 > 本文是项目规范 + 关键索引，供 AI 助手快速建立项目上下文。  
 > **各阶段开发详情见** → [`.codebuddy/notes/dev_records.md`](.codebuddy/notes/dev_records.md)
 
@@ -105,7 +105,7 @@ mytrader/
 │   └── phase5_e2e.py           # [Phase 5] 端到端干跑脚本
 ├── reports/                    # 回测输出（.gitignore）
 │   └── paper/daily/             # [迭代 #5] PaperDailyMetrics JSON 归档
-├── tests/                      # 562 个测试（不含 live 集成测试，迭代 #5 后）
+├── tests/                      # 574 个测试（live 测试默认隔离，迭代 #7 后）
 └── mytrader/
     ├── data/                   # Module 01 — Data Layer ✅
     │   ├── providers/
@@ -119,18 +119,20 @@ mytrader/
     │   ├── constituents.py             # 成分股抓取
     │   └── grouping.py                 # 波动率分层
     ├── strategy/               # Module 02 — Strategy Engine ✅
-    │   ├── strategies/         # dual_ma / rsi / macd / bollinger
+    │   ├── strategies/         # dual_ma / rsi / rsi_trend_filter / macd / bollinger
     │   ├── ensemble.py
     │   └── matrix_runner.py    # [Phase 5] StrategyMatrixRunner
     │                           # [迭代 #5] build_matrix_signal_indicators 共享 helper
     ├── backtest/               # Module 07 — Backtest ✅
     │   ├── runner.py           # BacktestRunner（含 daily_returns）
-    │   ├── matrix_backtest.py  # [Phase 5] MatrixBacktest（含 backtest_dd_status 风险 metadata）
+    │   ├── matrix_backtest.py  # [Phase 5] MatrixBacktest（含 backtest_dd_status 风险 metadata + [Iter #9] backtest_alpha / alpha-based selection）
     │   └── portfolio_backtest.py  # [迭代 #4] PortfolioBacktester（组合层级回测）
     │                               # [迭代 #5] 复用 build_matrix_signal_indicators
+    │                               # [迭代 #7] SPY benchmark 对比（alpha/IR/benchmark Sortino/DD）
     ├── signal/                 # Module 03 — Signal Filter ✅
     │   ├── filters/
     │   └── ranker.py           # [Phase 5] SignalRanker
+                                # [迭代 #7] 评分切换 sharpe→sortino + dd_penalty（Constitution L1）
     ├── risk/                   # Module 04 — Risk Manager ✅
     │   ├── position_sizer.py
     │   ├── constraints.py
@@ -190,9 +192,13 @@ mytrader/
 | **Phase 4** | ✅ 完成 | 38 | AlpacaDataProvider + ScanOrchestrator + Streamlit Dashboard |
 | **Phase 5** | ✅ 完成 | 85 | MarketDataStore + UniverseManager + 矩阵扫描 + 矩阵回测 + Walk-Forward |
 | **Iter #5** | ✅ 完成 | 37 | Paper Trading Integrity & Parity（signal metadata parity + AlpacaBroker 只读 + reconciliation 修复 + paper metrics） |
+| **Iter #6** | ✅ 完成 | 38 | Harness Reliability & Live Test Isolation（live 隔离 + 假 passed 修复 + count_tests 修复 + untracked 快照 + gate_status.json） |
+| **Iter #7** | ✅ 完成 | 12 | SignalRanker Sortino Priority + Benchmark Comparison（sharpe→sortino 评分切换 + PortfolioBacktest SPY benchmark alpha/IR） |
+| **Iter #8** | ✅ 完成 | 11 | RSI Trend-Filtered Mean Reversion 策略（RSI 超卖/超买 + 200日SMA趋势过滤，5新测试） |
+| **Iter #9** | ✅ 完成 | 17 | MatrixBacktest Alpha-Based Strategy Selection（SPY benchmark + alpha 计算 + top-K/per-strategy/ensemble 从 Sortino/Sharpe 改为 Alpha + Sortino > 0.5 门槛 + 三级 fallback） |
 | **Phase 6** | 🔲 待开发 | — | AlpacaBroker auto 端到端验证 + 对账真实集成 + 港股支持 |
 
-**当前总测试数：562 passed，0 failed**（不含 5 个 IBKR live 集成测试 pre-existing failures，迭代 #5 后）
+**当前总测试数：602 passed，0 failed**（live 测试默认隔离，迭代 #9 后；harness 测试 38 个在 `alignment/tests/`）
 
 > 各阶段详细实现见 **[dev_records.md](.codebuddy/notes/dev_records.md)**
 

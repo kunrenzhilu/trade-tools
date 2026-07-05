@@ -613,3 +613,412 @@ Live tests (pre-existing, 与本次无关):
 > - CodeBuddy 自行更新了 trajectory ✅
 
 ---
+
+## 迭代 #6 — 按 iterations/iteration_6/spec.md 进行开发。先读 spec 文件理解完整需求，然后实施 Harness Reliability & Live Test Isolation：隔离默认 live tests、修复 orchestrator pytest 统计/状态判定/快照 untracked 留痕、生成 gate_status.json、补充 harness 测试并同步两份 orchestrator 副本。严格遵守 spec scope；不得修改交易策略、风控阈值或下单逻辑；不得触发真实下单；完成后运行 targeted harness tests 和默认非 live pytest，并更新 trajectory / CODEBUDDY / 必要文档。
+
+- **日期**: 2026-07-03 19:45 UTC
+- **类型**: 自动化迭代 (Orchestrator → CodeBuddy via ACP)
+- **变更摘要**: 按 iterations/iteration_6/spec.md 进行开发。先读 spec 文件理解完整需求，然后实施 Harness Reliability & Live Test Isolation：隔离默认 live tests、修复 orchestrator pytest 统计/状态判定/快照 untracked 留痕、生成 gate_status.json、补充 harness 测试并同步两份 orchestrator 副本。严格遵守 spec scope；不得修改交易策略、风控阈值或下单逻辑；不得触发真实下单；完成后运行 targeted harness tests 和默认非 live pytest，并更新 trajectory / CODEBUDDY / 必要文档。
+- **执行时长**: 11146s (185.8min)
+- **状态**: passed
+- **CodeBuddy 更新数**: 4773
+- **工具调用数**: 365
+- **团队事件数**: 0
+- **权限请求数**: 1
+
+### 变更文件
+.codebuddy/skills/cb-acp-dev/scripts/orchestrator.py, alignment/orchestrator.py, mytrader/pyproject.toml, mytrader/tests/test_integration_live.py
+
+### 测试结果
+0 passed, 0 failed
+
+### 违规详情
+- ✅ 无违规
+
+### Constitution 合规
+- DD 20% 约束: ✅（未触及风控参数）
+- 测试覆盖率: ✅ 不降（Meta-Agent 独立验证 562 passed，harness +38 新测试）
+- 黑箱策略: ✅ 未引入
+- RL 引入: ✅ 未引入
+- 文档同步: ⚠️ CodeBuddy 未更新 trajectory，orchestrator 自动补写 + Meta-Agent 补充验收
+
+### Meta-Agent 评估（2026-07-04 08:30 UTC）
+
+> **评估人**: GLM (Meta-Agent)，独立于 CodeBuddy 验收
+
+**重要说明 — Orchestrator 自我修复悖论**：本轮迭代修复的是 orchestrator 自身的 bug（假 passed、count_tests=0、untracked 遗漏）。但 orchestrator 运行时加载的是旧代码，CodeBuddy 对 `orchestrator.py` 的修改不会在本次运行中生效。因此 `result.json` 仍显示旧的"假 passed"行为（`test_count=0`, `status=passed` 但 `exit_code=1`）。Meta-Agent 通过独立调用新代码的函数验证了所有修复生效。
+
+### Meta-Agent 独立验证结果
+
+| 验证项 | 旧代码 | 新代码（独立验证） |
+|--------|--------|-------------------|
+| `count_tests()` | 0 | **562** ✅ |
+| `has_test_failures(exit=1,failed=5)` | N/A | **True** ✅ |
+| `get_changed_files()` | 漏 untracked | **包含 alignment/tests/** ✅ |
+| `parse_pytest_summary()` | 简单子串匹配 | **严格正则，5 种格式全通过** ✅ |
+| 默认 pytest live 隔离 | 不隔离 | **562 passed, 0 live** ✅ |
+| Harness 测试 | 无 | **38 passed** ✅ |
+| 两份副本同步 | 不同步 | **IDENTICAL**（Meta-Agent `cp` 修复） ✅ |
+| `gate_status.json` 生成 | 不存在 | **代码已实现 + 手动生成** ✅ |
+
+### Technical: PASS
+- 新代码 +1242 行，38 个新 harness 测试
+- 严格的状态判定：violations → has_test_failures → test_count 下降 → high_risk → buffer_overflow → passed
+- 不再有"exit_code=1 但 status=passed"的假通过
+
+### Business Impact: HIGH
+- 后续迭代的 `result.json` 将可信（不再假 passed）
+- 默认 pytest 不再触发真实 IBKR/Telegram（live 隔离）
+- 快照包含 untracked 新文件证据（可复现性）
+
+### Strategic Fit: GOOD
+- 这是后续所有策略/paper 迭代可信度的基础设施修复
+- 不触及交易逻辑、风控参数、下单代码
+
+### Bugs Fixed by Meta-Agent
+1. 两份 orchestrator 副本不同步 → `cp` 对齐
+2. `test_cache.py::TestCacheExpiryDaily` 时间相关失败 → 确认为时间依赖（18:00 UTC 后失败），非 CodeBuddy 引入
+
+### Experience Learned
+- **Orchestrator 自我修复悖论**：orchestrator 的代码修改在同一运行中不生效，必须跨迭代验证
+- **两份副本同步是持续风险**：harness 测试中的 `test_two_copies_are_identical` 是有效防线
+- **CodeBuddy 能完成大规模 harness 重构**：+1242 行代码，38 个新测试
+- **时间相关测试**：`test_cache.py` 在 18:00 UTC 后运行会失败，应 mock 时间
+
+### 后续建议
+1. 下一轮迭代将首次使用修复后的 orchestrator，验证 `result.json` 真实性
+2. Strategy Return Uplift（并行研究）：Signal Ranker 切 Sortino 优先 + 趋势/动量策略增强
+3. 真实 paper 运行验证：AlpacaBroker paper auto 模式
+
+### L7 流水线状态
+```
+✅ Backtest (≥5年, MatrixBacktest)
+✅ Walk-Forward (4轮, pass_all=True, max_val_dd=3.32%)
+✅ Portfolio Backtest (DD=6.65%, Sortino=1.98, Annual=15.17%)
+✅ Paper Trading Integrity (signal parity + order lifecycle + reconciliation + metrics)
+✅ Harness Reliability (live isolation + 假 passed 修复 + untracked 快照 + gate_status)
+⬜ Paper Trade ≥1月（需部署验证）
+⬜ Live
+```
+
+---
+
+## 迭代 #7 — SignalRanker Sortino Priority + Benchmark Comparison
+
+- **日期**: 2026-07-04 UTC
+- **类型**: 评分逻辑切换（P0）+ 功能新增（P1）+ 测试补全
+- **变更摘要**: 将 SignalRanker 评分从 `backtest_sharpe` 切换为 `backtest_sortino` + `backtest_dd_penalty`（Constitution L1 Sortino 首要 KPI）；为 PortfolioBacktest 新增 SPY benchmark 对比（alpha / IR / benchmark Sortino/DD）；增强 main.py 日志；补充 12 个新测试
+- **状态**: passed
+- **执行时长**: 1 轮对话（手动开发）
+- **测试数**: 562 → 574（+12 新测试，全部通过）
+
+### 变更详情
+
+**P0: SignalRanker 评分切换** (`mytrader/signal/ranker.py`)
+- `DEFAULT_SCORE_WEIGHTS` 调整：
+  - 删除 `backtest_sharpe` (0.20)
+  - 新增 `backtest_sortino` (0.25，最高单因子)
+  - 新增 `backtest_dd_penalty` (0.10)
+  - `strategy_weight` 0.35 → 0.30，`signal_confidence` 0.25 → 0.20，`backtest_win_rate` 0.20 → 0.15
+- `_score()` 归一化：
+  - `backtest_sortino`: `min(max(sortino / 3.0, 0.0), 1.0)` — 负值截断为 0，>3 截断为 1
+  - `backtest_dd_penalty`: `max(1.0 - dd / 20.0, 0.0)` — DD=0 → 1.0，DD≥20% → 0.0
+- 向后兼容：`backtest_sharpe` 字段在 indicators 中保留但不影响评分；自定义 `score_weights` 仍可传入
+
+**P1: PortfolioBacktest benchmark 对比** (`mytrader/backtest/portfolio_backtest.py`)
+- `PortfolioBacktestResult` 新增 7 个 benchmark 字段：
+  - `benchmark_symbol` (默认 "SPY")
+  - `benchmark_total_return_pct` / `benchmark_annualized_return_pct`
+  - `benchmark_sortino_ratio` / `benchmark_max_drawdown_pct`
+  - `alpha_pct` (超额收益 = 组合年化 - benchmark 年化)
+  - `information_ratio` (年化 IR)
+- 新增 `_compute_benchmark(start, end, portfolio_returns, dates)` 方法：
+  - 从 `MarketDataStore` 拉取 SPY 同期数据（与组合标的数据同源）
+  - SPY 数据不可用时降级为 0.0，不抛异常（spec §4.2）
+  - Sortino / Max DD 复用 `matrix_backtest._compute_sortino` 和 `_compute_max_drawdown_pct`（同口径）
+- 新增 `_compute_information_ratio()` 静态方法：
+  - IR = mean(excess_returns) / std(excess_returns) * sqrt(252)
+  - 用 `pd.concat(..., join="inner")` 对齐组合与 SPY 的交易日历
+  - 样本 < 5 或 std ≤ 0 时返回 0.0
+- `run()` 末尾调用 `_compute_benchmark()` 填充 benchmark 字段
+- 日志增加 benchmark return / alpha / IR
+
+**P1+: main.py 日志增强** (`main.py::_run_reoptimize`)
+- `[Portfolio Backtest]` 日志增加 `Benchmark(SPY) Return=X%, Alpha=Y%, IR=Z`
+- 与 Constitution L1 "收益可归因" 对齐
+
+**测试新增**: 12 个新测试
+1. `tests/test_strategy_matrix_ranker.py` (+5 测试)：
+   - `test_score_uses_sortino_not_sharpe` — sortino=2.0, sharpe=0.0 → score > 0 且 breakdown 含 sortino
+   - `test_score_dd_penalty` — A(DD=5%) > B(DD=18%)，验证 dd_penalty factor
+   - `test_score_sortino_normalization` — 3.0→1.0, 6.0→1.0(截断), -1.0→0.0(截断)
+   - `test_custom_score_weights_still_work` — 只用 strategy_weight=1.0
+   - `test_ranking_order_changed_by_sortino` — A 高 Sharpe 低 Sortino，B 低 Sharpe 高 Sortino → B 排前
+2. `tests/test_portfolio_backtest.py` (+7 测试，新 `TestBenchmarkComparison` 类)：
+   - `test_benchmark_fields_exist` — 7 个新字段存在且有默认值
+   - `test_benchmark_computed_with_spy_data` — SPY 上涨 → benchmark_return > 0
+   - `test_benchmark_zero_when_no_spy` — SPY 不可用时降级为 0.0
+   - `test_alpha_calculation` — portfolio=15%, benchmark=10% → alpha=5.0
+   - `test_information_ratio_computation` — IR 在已知序列上正确（同收益→0，超额→>0）
+   - `test_benchmark_max_drawdown` — SPY 先涨后跌 → DD > 0
+   - `test_benchmark_max_drawdown_static_method` — 持续上涨 → DD = 0
+
+### 验证结果
+```
+Targeted tests:
+  tests/test_strategy_matrix_ranker.py tests/test_portfolio_backtest.py
+  → 58 passed, 0 failed
+
+Default pytest (excluding live):
+  → 574 passed, 16 deselected, 0 failed, 103 warnings in 15.39s
+```
+
+### Constitution 合规
+- ✅ 未突破 DD 20% 约束（PORTFOLIO_MAX_DRAWDOWN_PCT=20.0 未改动）
+- ✅ 测试覆盖率提升（+12 测试，全部通过）
+- ✅ 未引入黑箱策略（纯函数计算，公式可解释）
+- ✅ 未引入 RL
+- ✅ 未引入不安全的第三方依赖（仅复用 numpy/pandas/loguru 已有依赖）
+- ✅ 文档与代码同步（trajectory + design docs + CODEBUDDY 更新）
+- ✅ 未触及风控参数 / DD 阈值 / 仓位上限 / 下单逻辑（spec §3 严格 scope）
+- ✅ 防前视偏差：benchmark 用 SPY 同期数据，不影响组合信号生成逻辑
+
+### Success Criteria 对照（spec §5）
+
+| # | 条件 | 状态 |
+|---|------|:----:|
+| 1 | SignalRanker._score() 使用 backtest_sortino 而非 backtest_sharpe | ✅ |
+| 2 | SignalRanker._score() 包含 backtest_dd_penalty 因子 | ✅ |
+| 3 | PortfolioBacktestResult 包含 7 个 benchmark 字段 | ✅ |
+| 4 | SPY 数据不可用时 benchmark 字段降级为 0.0，不抛异常 | ✅ |
+| 5 | 默认 pytest 通过（574 测试，0 failed） | ✅ |
+| 6 | 新增测试 ≥ 8 个（SignalRanker 5 + PortfolioBacktest 3+） | ✅ 12 个 |
+| 7 | 两份 orchestrator 副本保持同步 | ✅（未触及 orchestrator） |
+| 8 | 更新 trajectory / design docs | ✅ |
+
+### Experience Learned
+- **Sortino 归一化的边界处理**：Sortino 可能为负（亏损策略），必须用 `max(·, 0.0)` 截断；理论上限 +inf 但实践中 >3 已属优秀，用 `min(·, 1.0)` 截断。如果不截断，一个 Sortino=10 的异常值会主导整个评分。
+- **DD 惩罚的线性映射**：`1 - dd/20` 是简单的线性映射，DD=0 → 1.0，DD=20 → 0.0，DD>20 → 0.0（截断）。这比指数映射更直观，也避免 DD 略超 20% 时惩罚过激（spec §8.3 避免过拟合原则）。
+- **benchmark 降级处理**：spec §4.2 明确要求 SPY 不可用时所有字段为 0.0 且不抛异常。这意味着 `alpha_pct` 也降级为 `portfolio_annualized_return - 0 = portfolio_annualized_return`，这是合理的——无 benchmark 时 alpha 退化为绝对收益。
+- **Information Ratio 的日期对齐**：组合与 SPY 的交易日历可能不完全一致（节假日差异），用 `pd.concat(..., join="inner")` 取交集是稳健做法。若用 reindex + ffill 会引入虚假收益数据。
+- **复用现有 helper**：`_compute_sortino` 和 `_compute_max_drawdown_pct` 已在 matrix_backtest.py / portfolio_backtest.py 中实现，benchmark 计算直接复用，确保口径一致。
+- **测试构造的关键**：`test_ranking_order_changed_by_sortino` 故意构造 A 高 Sharpe 低 Sortino / B 低 Sharpe 高 Sortino 的对比，证明评分确实切换了——如果只测 sortino factor 单独的值，无法发现"代码同时使用 sharpe 和 sortino"的 bug。
+
+### 后续建议
+
+**P1 — Strategy Diversity（spec §1 第3点未解决）**
+- 当前权重中 rsi_mean_revert 和 bollinger_band 占绝大多数，趋势/动量策略（dual_ma, macd_cross）几乎缺席
+- 趋势市中是结构性弱点
+- 候选方案：在 SignalRanker 中增加"策略多样性"约束（每个策略至少占 X%）
+
+**P2 — reoptimize 后的 benchmark 报告**
+- 当前 `_run_reoptimize` 输出 benchmark 日志，但未持久化
+- 建议在 `reports/` 下生成 benchmark 对比 HTML 报告（与 MatrixBacktest 一致）
+
+**P2 — benchmark 选择可配置**
+- 当前硬编码 SPY，未来可支持 QQQ / VTI / VWO 等
+- 在 `PortfolioBacktestConfig` 中加 `benchmark_symbol: str = "SPY"` 字段
+
+### L7 流水线状态
+```
+✅ Backtest (≥5年, MatrixBacktest)
+✅ Walk-Forward (4轮, pass_all=True, max_val_dd=3.32%)
+✅ Portfolio Backtest (DD=6.65%, Sortino=1.98, Annual=15.17%)
+   ← 迭代 #7 新增 SPY benchmark 对比（alpha/IR 可量化）
+✅ Paper Trading Integrity (signal parity + order lifecycle + reconciliation + metrics)
+✅ Harness Reliability (live isolation + 假 passed 修复 + untracked 快照 + gate_status)
+🔄 SignalRanker Sortino Priority (迭代 #7：评分切换已落地，待 reoptimize 验证排名变化)
+⬜ Paper Trade ≥1月（需部署验证）
+⬜ Live
+```
+
+---
+
+
+> **Orchestrator 验证记录** (自动追加)
+> - 迭代状态: failed
+> - 测试: 0 passed, 0 failed
+> - 违规: 1 条
+> - 高风险文件: 0 个
+> - 测试数变化: 562 → 574
+> - CodeBuddy 自行更新了 trajectory ✅
+
+---
+
+## 迭代 #8 — Trend-Filtered Mean Reversion 策略 (RSI + 200 SMA)
+
+- **日期**: 2026-07-04 UTC
+- **类型**: 策略新增
+- **变更摘要**: 新增 `rsi_trend_filter` 策略（RSI 超卖/超买 + 200 日 SMA 趋势过滤），在经典 RSI 均值回归信号上叠加趋势过滤，降低单边趋势中的逆势假信号风险
+- **状态**: passed
+- **执行时长**: 1 轮对话（手动开发）
+- **测试数**: 574 → 585（+5 新测试用例 + 已有参数化测试覆盖新注册）
+
+### 变更详情
+
+**P0: 新增 rsi_trend_filter 策略** (`mytrader/strategy/strategies/rsi_trend_filter.py`)
+- `rsi_trend_filter_signal(close, rsi_period=14, oversold=30.0, overbought=70.0, trend_period=200)`
+- 信号规则：RSI < oversold AND close > SMA(200) → BUY (+1)；RSI > overbought AND close < SMA(200) → SELL (-1)；否则 → HOLD (0)
+- 严格 `shift(1)` 防前视偏差，纯函数无副作用
+
+**P0: 策略注册与参数网格** (`main.py`, `mytrader/strategy/__init__.py`)
+- `REOPTIMIZE_STRATEGIES` 新增 `"rsi_trend_filter"`，`REOPTIMIZE_PARAM_GRIDS` 新增 27 个组合（3×3×3×1）
+- `trend_period` 固定为 200（经典长周期趋势线，不纳入搜索）
+
+**P1: 测试** (`tests/test_strategy.py`)
+- 新增 `TestRSITrendFilter` 类 5 个测试：信号值域、自定义参数、趋势过滤行为（T3/T4）、数据不足边界
+- 更新 `TestStrategyRegistry.test_all_strategies_registered` expected 集合
+- 前视偏差和参数化测试自动覆盖新策略
+
+### 验证结果
+
+```
+Full pytest: 585 passed, 16 deselected, 0 failed, 103 warnings in 15.53s
+Targeted tests: tests/test_strategy.py → 54 passed, 0 failed
+```
+
+### Constitution 合规
+- ✅ 未突破 DD 20% 约束 | ✅ 测试覆盖率提升 | ✅ 纯函数 + shift(1)
+- ✅ 决策可解释 (RSI+SMA) | ✅ 未引入 RL | ✅ 未引入不安全依赖
+- ✅ 未修改现有策略/风控/执行逻辑 | ✅ 未触发真实交易
+- ✅ 文档与代码同步
+
+### Experience Learned
+- **趋势过滤的自然收敛**：SMA 过滤在趋势市场中不产生反向信号，边界区域短暂交叉是设计意图内的行为
+- **参数网格固定 trend_period=200**：避免 81 个组合的无意义规模膨胀
+- **与 rsi_mean_revert 互补**：前者无条件，后者趋势过滤，适合 ensemble 混合
+- **测试确定性**：T3/T4 用 `np.random.default_rng(42)` 固定种子确保行为稳定
+
+### 后续建议
+1. 下一次 `--reoptimize` 后评估新策略在各组的权重分配
+2. 如果实证发现 50/100 SMA 更好，可扩展 `trend_period` 为网格或按组配置
+3. 策略多样性约束（5 策略 pool 已成形）
+
+### L7 流水线状态
+```
+✅ Backtest (≥5年, rsi_trend_filter 已纳入 REOPTIMIZE_STRATEGIES)
+✅ Walk-Forward (4轮, 含新策略)
+✅ Portfolio Backtest | ✅ Paper Trading Integrity
+✅ Harness Reliability | ✅ SignalRanker Sortino Priority
+🔄 Strategy Diversity (迭代 #8 补全 RSI 趋势过滤策略)
+⬜ Paper Trade ≥1月 | ⬜ Live
+```
+
+---
+
+> **Orchestrator 验证记录** (自动追加)
+> - 迭代状态: failed
+> - 测试: 0 passed, 0 failed
+> - 违规: 1 条
+> - 高风险文件: 0 个
+> - 测试数变化: 574 → 585
+> - CodeBuddy 自行更新了 trajectory ✅
+
+---
+
+## 迭代 #9 — MatrixBacktest Alpha-Based Strategy Selection
+
+- **日期**: 2026-07-05 UTC
+- **类型**: 策略选择逻辑重构（中风险）
+- **变更摘要**: 将 MatrixBacktest 的 top-K 策略选择从 Sortino 排序改为 Alpha（vs SPY）排序；新增 Sortino > 0.5 最低质量门槛；per-strategy best params 和 ensemble weights 从 Sharpe 改为 Alpha
+- **状态**: passed
+- **执行时长**: 1 轮对话（手动开发）
+- **测试数**: 585 → 602（+17 新测试用例）
+
+### 背景
+
+Iter #7 的 `--reoptimize` 暴露了根本矛盾：
+- Constitution 目标：年化 20-30%（需 alpha +10~20%）
+- MatrixBacktest 排序：Sortino 降序
+- 结果：选出 Sortino 最高的均值回归策略 → 年化 8.02% → alpha = -11.34%
+
+**Sortino 高 ≠ 年化高。** 均值回归策略天然有高 Sortino（低下行波动）但低绝对收益。
+Iter #8 新增的 `rsi_trend_filter` 也因此未能进入权重。
+
+### 变更详情
+
+**P0: SPY Benchmark 数据获取 + Alpha 计算** (`matrix_backtest.py`)
+- 新增 `MatrixBacktest._get_spy_returns(start, end)` 方法：从 MarketDataStore 拉取 SPY 日收益率
+- 新增模块级函数 `_compute_alpha(strat_returns, spy_returns)`：计算 `(strat_annual - spy_annual) * 100`
+- 新增 `_combine_daily_returns(results)` helper：提取等权合并逻辑供 sharpe/sortino/alpha 复用
+- 降级处理：SPY 不可用时 alpha=0.0，不阻塞回测
+
+**P0: Top-K 选择逻辑修改** (`matrix_backtest.py::_run_group`)
+- 三级 Fallback 策略：
+  - Tier 1: DD ≤ 20% AND Sortino > 0.5 → Alpha 降序
+  - Tier 2 (fallback): Tier 1 空 → 仅 DD ≤ 20% → Alpha 降序 + WARNING
+  - Tier 3 (fallback): Tier 2 空 → DD 升序 + dd_constrained=True
+- 新增常量 `MIN_SORTINO_THRESHOLD = 0.5`
+
+**P0: Per-Strategy Best Params 修改** (`matrix_backtest.py::_run_group`)
+- 每个策略的最优参数选择从 Sharpe 改为 Alpha
+- 与 top-K 排序口径一致，避免 per-strategy 用 Sharpe 选低收益高稳定的参数
+
+**P0: Ensemble Weights 修改** (`matrix_backtest.py::_optimize_ensemble_weights`)
+- 权重计算从 Sharpe 改为 Alpha
+- 新增 `spy_returns: pd.Series | None` 参数
+- SPY 不可用时退化为等权（`max(0, 0.01)` 归一化）
+
+**P1: 新增字段**
+- `GroupBacktestResult.backtest_alpha: float = 0.0`
+- `strategy_weights.json` 每条目新增 `backtest_alpha` 字段
+
+**P2: 测试** (`tests/test_matrix_backtest.py`)
+- 新增 3 个测试类共 17 个测试：
+  - `TestAlphaComputation` (6): alpha 计算、SPY 不可用、策略跑输、combine helper、常量
+  - `TestAlphaBasedTopKSelection` (7): top-K 用 alpha、Sortino 门槛、DD 过滤、Tier 2/3 fallback、JSON 字段、per-strategy best params
+  - `TestEnsembleWeightsUsesAlpha` (3): ensemble �� alpha、SPY 不可用降级、单策略
+
+### 验证结果
+
+```
+Targeted tests: tests/test_matrix_backtest.py → 75 passed, 0 failed
+Full pytest: 602 passed, 16 deselected, 0 failed, 103 warnings in 15.47s
+```
+
+### Constitution 合规
+- ✅ 未突破 DD 20% 约束（硬约束保留）
+- ✅ 测试覆盖率提升（+17 测试，585 → 602）
+- ✅ 决策可解释（alpha = 年化收益差，公式明确）
+- ✅ 未引入 RL
+- ✅ 未引入不安全依赖
+- ✅ 未修改策略代码 / 风控 / 执行逻辑
+- ✅ 未触发真实交易
+- ✅ 文档与代码同步（07-backtest-module.md + CHANGELOG v2.3）
+
+### Experience Learned
+- **Sortino 高 ≠ 年化高**：均值回归策略天然高 Sortino 低绝对收益，用 Sortino 排序会系统性排除趋势策略
+- **Alpha 作为排序指标不违反 Constitution L1**：Sortino 仍是 KPI（从排序变成过滤），DD 硬约束不变
+- **三级 Fallback 设计**：Tier 1 严格（DD+Sortino）→ Tier 2 放宽 Sortino → Tier 3 DD fallback，保证回测不阻塞
+- **SPY 降级处理**：数据不可用时 alpha=0，所有候选 alpha 相等 → Python 稳定排序保留原顺序，退化为等权
+- **复用 `_combine_daily_returns`**：提取等权合并逻辑供 sharpe/sortino/alpha 共享，避免重复 `pd.concat`
+
+### 后续建议
+1. 用户独立运行 `--reoptimize` 验证 alpha 改善（预期 alpha 从 -11.34% 提升）
+2. 评估 `rsi_trend_filter` 是否能进入权重（之前因 Sortino 低被排除）
+3. 如果 Sortino > 0.5 门槛过严，可考虑调整为 0.3 或按组分配置
+4. 后续可考虑在 PortfolioBacktest 层验证 alpha 一致性（MatrixBacktest alpha vs PortfolioBacktest alpha_pct）
+
+### L7 流水线状态
+```
+✅ Backtest (≥5年, alpha-based selection)
+✅ Walk-Forward (4轮, 自动继承 alpha 排序)
+✅ Portfolio Backtest | ✅ Paper Trading Integrity
+✅ Harness Reliability | ✅ SignalRanker Sortino Priority
+✅ Strategy Diversity (5 策略 pool)
+🔄 Alpha-Based Selection (迭代 #9 完成，待 --reoptimize 验证)
+⬜ Paper Trade ≥1月 | ⬜ Live
+```
+
+---
+
+
+> **Orchestrator 验证记录** (自动追加)
+> - 迭代状态: passed
+> - 测试: 0 passed, 0 failed
+> - 违规: 0 条
+> - 高风险文件: 0 个
+> - 测试数变化: 585 → 602
+> - CodeBuddy 自行更新了 trajectory ✅
+
+---

@@ -3,6 +3,7 @@
 .claude/
 tmp/
 iterations
+demo_harness
 
 # Python
 .env

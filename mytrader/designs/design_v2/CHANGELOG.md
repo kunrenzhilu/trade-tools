@@ -4,6 +4,60 @@
 
 ---
 
+## v2.3 — 2026-07-05（迭代 #9：MatrixBacktest Alpha-Based Strategy Selection）
+
+### 背景
+
+Iter #7 的 `--reoptimize` 暴露了根本矛盾：
+- Constitution 目标：年化 20-30%（需 alpha +10~20%）
+- MatrixBacktest 排序：Sortino 降序
+- 结果：选出 Sortino 最高的均值回归策略 → 年化 8.02% → alpha = -11.34%
+
+**Sortino 高 ≠ 年化高。** 均值回归策略天然有高 Sortino（低下行波动）
+但低绝对收益。用 Sortino 排序会系统性地排除能跑赢 SPY 的趋势策略。
+Iter #8 新增的 `rsi_trend_filter` 也因此未能进入权重。
+
+### 修改清单
+
+| 优先级 | 问题 | 涉及文件 | 变更内容 |
+|--------|------|----------|---------|
+| P0 | top-K 排序用 Sortino → 永远选均值回归 → alpha 为负 | `matrix_backtest.py::_run_group` | top-K 排序从 Sortino 改为 Alpha（vs SPY） |
+| P0 | per-strategy best params 用 Sharpe → 偏好低波动 | `matrix_backtest.py::_run_group` | per-strategy best params 选择从 Sharpe 改为 Alpha |
+| P0 | ensemble weights 用 Sharpe → 与排序口径不一致 | `matrix_backtest.py::_optimize_ensemble_weights` | 权重计算从 Sharpe 改为 Alpha；新增 `spy_returns` 参数 |
+| P0 | 缺 SPY benchmark 数据获取 | `matrix_backtest.py::MatrixBacktest._get_spy_returns` | 新增方法从 MarketDataStore 拉取 SPY 日收益率 |
+| P0 | 缺 alpha 计算函数 | `matrix_backtest.py::_compute_alpha` | 新增模块级函数：`(strat_annual - spy_annual) * 100` |
+| P0 | 缺日收益率合并复用 | `matrix_backtest.py::_combine_daily_returns` | 新增 helper 提取等权合并逻辑，sharpe/sortino/alpha 共享 |
+| P1 | 缺 Sortino 最低质量门槛 | `matrix_backtest.py::MIN_SORTINO_THRESHOLD` | 新增常量 0.5，作为 top-K Tier 1 过滤；可放宽（Tier 2 fallback） |
+| P1 | GroupBacktestResult 缺 alpha 字段 | `matrix_backtest.py::GroupBacktestResult` | 新增 `backtest_alpha: float = 0.0` |
+| P1 | strategy_weights.json 缺 alpha 字段 | `matrix_backtest.py::_run_group` | 每条目新增 `backtest_alpha` 字段 |
+| P2 | 缺 alpha 相关测试 | `tests/test_matrix_backtest.py` | 新增 17 个测试：alpha 计算、top-K 用 alpha、Sortino 门槛、三级 fallback、ensemble weights |
+| P2 | 设计文档与代码不同步 | `07-backtest-module.md` | §10.4 加"Alpha 排序 + Sortino 门槛"等设计点；新增 §10.4.1 三级 Fallback 说明；§10.6 加 JSON 字段说明 |
+
+### 不变项
+
+- DD ≤ 20% 硬约束保留（Constitution L1）
+- 策略代码 / 风控 / 执行逻辑未修改
+- Walk-Forward 4 轮验证流程不变（内部复用 `_run_group`，自动继承 alpha 排序）
+- `backtest_sharpe` / `backtest_sortino` / `backtest_max_drawdown` 字段保留
+- 5 个策略文件未修改
+
+### 降级处理
+
+SPY 数据不可用时：
+- `_get_spy_returns` 返回 None
+- `_compute_alpha` 返回 0.0
+- 所有候选 alpha=0 → Python 稳定排序保留原顺序（按策略列表）
+- ensemble weights 退化为等权（`max(0, 0.01)` 归一化）
+- 不抛异常，不阻塞回测
+
+### 影响范围
+
+- ✅ 向后兼容：`backtest_alpha` 带 default 值；`_optimize_ensemble_weights` 的 `spy_returns` 参数带 default None
+- ⚠️ 行为变更：`--reoptimize` 重新产出后，top-K 策略选择会变化（趋势策略可能进入权重）
+- 🔲 下一轮迭代候选：用户独立运行 `--reoptimize` 验证 alpha 改善
+
+---
+
 ## v2.2 — 2026-06-30（迭代 #1：策略名 bug 修复 + Sortino 指标）
 
 ### 背景

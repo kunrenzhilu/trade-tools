@@ -40,6 +40,12 @@ MAX_PORTFOLIO_DRAWDOWN_PCT: float = 20.0
 # （低于 L1 的 20% 线，给样本外留缓冲）
 WALK_FORWARD_VAL_DD_THRESHOLD: float = 15.0
 
+# 迭代 #9 新增：Sortino 最低质量门槛，用于 top-K 选择时的二级过滤
+# 排除 Sortino ≤ 0.5 的"垃圾"策略（即使 alpha 高也不选）
+# 设计动机：alpha 排序选出高绝对收益策略，但需 Sortino 门槛保证基本下行质量
+# fallback：若无候选通过此门槛，放宽过滤（仅保留 DD 硬约束）
+MIN_SORTINO_THRESHOLD: float = 0.5
+
 
 # ---------------------------------------------------------------------------
 # 数据结构
@@ -76,6 +82,7 @@ class GroupBacktestResult:
     portfolio_sortino: float = 0.0          # 等权组合 Sortino（迭代 #1 新增）
     portfolio_max_drawdown: float = 0.0     # 等权组合最大回撤（迭代 #2 新增，Constitution L1 KPI）
     dd_constrained: bool = False            # 迭代 #3：该组是否用了 DD fallback（无合规候选）
+    backtest_alpha: float = 0.0              # 迭代 #9：alpha vs SPY（百分数），用于排序策略选择
 
 
 @dataclass
@@ -233,6 +240,83 @@ def _compute_sortino(
     return float(returns.mean() / dd * np.sqrt(periods_per_year))
 
 
+def _combine_daily_returns(results: list[SingleBacktestResult]) -> pd.Series:
+    """等权合并组内日收益率序列，返回组合日收益率（迭代 #9 新增）。
+
+    与 _portfolio_sharpe_from_results / _portfolio_sortino_from_results 同语义：
+    将所有标的日收益率等权合并为组合序列。提取为独立函数以便 alpha 计算
+    和 per-strategy best params 选择复用，避免重复 pd.concat。
+
+    Args:
+        results: 单策略多标的的回测结果列表
+
+    Returns:
+        组合日收益率 pd.Series；无有效数据时返回空 Series
+    """
+    valid = [r.daily_returns for r in results if not r.daily_returns.empty]
+    if not valid:
+        return pd.Series(dtype=float)
+    return pd.concat(valid, axis=1).mean(axis=1)
+
+
+def _compute_alpha(
+    strategy_daily_returns: pd.Series,
+    spy_daily_returns: pd.Series | None,
+    periods_per_year: int = 252,
+) -> float:
+    """计算 alpha = 策略年化收益 - SPY 年化收益（迭代 #9 新增）。
+
+    Alpha 衡量策略相对 SPY buy-and-hold 的超额收益。正值表示跑赢 SPY，
+    负值表示跑输 SPY。用于 top-K 策略选择和 per-strategy best params 选择，
+    替代之前基于 Sortino/Sharpe 的选择逻辑（参考 iteration #9 spec）。
+
+    年化公式：(1 + mean_daily) ** periods_per_year - 1
+    使用算术平均日收益的几何年化，与 PortfolioBacktester 同口径。
+
+    降级处理：SPY 数据不可用（None 或空）→ 返回 0.0（不抛异常）。
+    这样在 SPY 数据缺失时，alpha 排序退化为"原顺序"，不会阻塞回测。
+
+    Args:
+        strategy_daily_returns: 策略组合日收益率序列
+        spy_daily_returns:      SPY 日收益率序列；None 表示数据不可用
+        periods_per_year:       年化因子（日线 = 252）
+
+    Returns:
+        Alpha 百分数（如 5.23 表示策略年化收益跑赢 SPY 5.23 个百分点）；
+        SPY 不可用时返回 0.0
+    """
+    if spy_daily_returns is None or spy_daily_returns.empty:
+        return 0.0
+    if strategy_daily_returns is None or strategy_daily_returns.empty:
+        return 0.0
+
+    # 对齐时间索引（inner join 取交集）
+    aligned = pd.concat(
+        [strategy_daily_returns.rename("strat"), spy_daily_returns.rename("spy")],
+        axis=1,
+        join="inner",
+    ).dropna()
+    if aligned.empty or len(aligned) < 2:
+        return 0.0
+
+    strat_returns = aligned["strat"]
+    spy_returns = aligned["spy"]
+
+    # 年化收益 = (1 + mean_daily)^252 - 1
+    strat_mean = strat_returns.mean()
+    spy_mean = spy_returns.mean()
+    if not np.isfinite(strat_mean) or not np.isfinite(spy_mean):
+        return 0.0
+
+    strat_annual = (1.0 + strat_mean) ** periods_per_year - 1.0
+    spy_annual = (1.0 + spy_mean) ** periods_per_year - 1.0
+
+    alpha = (strat_annual - spy_annual) * 100.0  # 转为百分数
+    if not np.isfinite(alpha):
+        return 0.0
+    return float(alpha)
+
+
 def _backtest_one(
     df: pd.DataFrame,
     strategy_name: str,
@@ -369,6 +453,7 @@ def _portfolio_max_drawdown_from_results(
 
 def _optimize_ensemble_weights(
     group_results: list[tuple[str, dict, list[SingleBacktestResult]]],
+    spy_returns: pd.Series | None = None,
     conflict_threshold: float = 0.3,
 ) -> list[tuple[str, dict, float]]:
     """在"单点离散值加权投票"语义下优化 ensemble 权重。
@@ -376,8 +461,13 @@ def _optimize_ensemble_weights(
     实盘每根 bar 各策略产出离散值（1/-1/0），加权投票决定方向。
     回测的权重优化必须使用相同语义，而非对整段时间序列做加权。
 
+    迭代 #9：权重计算从 Sharpe 改为 Alpha（vs SPY）。
+    动机：与 _run_group 的 top-K 排序口径一致，使 ensemble 权重直接
+    反映"跑赢 SPY 的程度"。SPY 不可用时 alpha=0，退化为等权。
+
     Args:
         group_results: [(strategy, params, [SingleBacktestResult]), ...]
+        spy_returns:   SPY 日收益率序列（用于 alpha 计算）；None 时退化为等权
         conflict_threshold: 加权投票分数绝对值低于此时视为 HOLD
 
     Returns:
@@ -387,15 +477,16 @@ def _optimize_ensemble_weights(
         strategy, params, _ = group_results[0]
         return [(strategy, params, 1.0)]
 
-    # 简化的 ensemble 权重搜索：用各策略的组合 Sharpe 归一化为权重
-    # 更严格的做法是网格搜索 weight 组合，在离散投票序列上跑回测
-    sharpes = []
+    # 迭代 #9：用各策略的组合 alpha 归一化为权重（替代 Sharpe）
+    # alpha 可能 < 0（跑输 SPY），用 max(alpha, 0.01) 避免负权重
+    alphas = []
     for strategy, params, results in group_results:
-        ps = _portfolio_sharpe_from_results(results)
-        sharpes.append(max(ps, 0.01))  # 避免负权重
+        combined = _combine_daily_returns(results)
+        alpha = _compute_alpha(combined, spy_returns)
+        alphas.append(max(alpha, 0.01))  # 避免负/零权重
 
-    total = sum(sharpes)
-    weights = [s / total for s in sharpes]
+    total = sum(alphas)
+    weights = [a / total for a in alphas]
 
     return [
         (strategy, params, weight)
@@ -716,6 +807,44 @@ class MatrixBacktest:
         )
         return report
 
+    def _get_spy_returns(self, start: date, end: date) -> pd.Series | None:
+        """获取 SPY 同期日收益率序列，用于计算 alpha（迭代 #9 新增）。
+
+        从 MarketDataStore 拉取 SPY 日线数据，计算日收益率。
+        SPY 不在标的池中，但作为 benchmark 用于 alpha 计算。
+
+        降级处理：SPY 数据不可用时返回 None（_compute_alpha 会返回 0.0），
+        不抛异常，保证回测不因 benchmark 缺失而阻塞。
+
+        Args:
+            start: 回测起始日期
+            end:   回测结束日期
+
+        Returns:
+            SPY 日收益率 pd.Series；数据不可用时返回 None
+        """
+        try:
+            spy_bars = self._store.get_bars_multi(["SPY"], start, end)
+            spy_df = spy_bars.get("SPY") if spy_bars else None
+            if spy_df is None or spy_df.empty:
+                logger.warning(
+                    "[MatrixBacktest] SPY data unavailable, alpha will degrade to 0.0"
+                )
+                return None
+            spy_close = spy_df["close"].astype(float)
+            if len(spy_close) < 2:
+                logger.warning(
+                    "[MatrixBacktest] SPY data too short, alpha will degrade to 0.0"
+                )
+                return None
+            return spy_close.pct_change().dropna()
+        except Exception as e:
+            logger.warning(
+                f"[MatrixBacktest] SPY benchmark fetch failed: {e} — "
+                f"alpha will degrade to 0.0"
+            )
+            return None
+
     def _run_group(
         self,
         group_id: str,
@@ -726,7 +855,14 @@ class MatrixBacktest:
         param_grids: dict[str, dict[str, list]],
         report: MatrixBacktestReport,
     ) -> list[dict[str, Any]]:
-        """对单个分组执行策略 × 参数网格回测，返回该组的权重配置列表。"""
+        """对单个分组执行策略 × 参数网格回测，返回该组的权重配置列表。
+
+        迭代 #9 变更：
+            - per-strategy best params：从 Sharpe 改为 Alpha（vs SPY）
+            - top-K 排序：从 Sortino 改为 Alpha
+            - 新增 Sortino > 0.5 最低质量门槛（二级过滤，可放宽）
+            - ensemble weights：从 Sharpe 改为 Alpha
+        """
 
         # 1. 读取组内所有标的数据
         data = self._store.get_bars_multi(symbols, start, end)
@@ -734,7 +870,10 @@ class MatrixBacktest:
             logger.warning(f"[MatrixBacktest] {group_id}: no data, skip")
             return []
 
-        # 2. 对每个策略 × 每组参数，计算组合 Sharpe
+        # 迭代 #9：获取 SPY 同期日收益率用于 alpha 计算（一次获取，组内复用）
+        spy_returns = self._get_spy_returns(start, end)
+
+        # 2. 对每个策略 × 每组参数，按 alpha 选最优参数
         group_results: list[tuple[str, dict, list[SingleBacktestResult]]] = []
 
         for strategy in strategies:
@@ -756,8 +895,9 @@ class MatrixBacktest:
             ) if grid else [{}]
 
             best_params = None
-            best_sharpe = float("-inf")
-            best_sortino = 0.0
+            best_alpha = float("-inf")
+            best_sharpe = 0.0       # 仅用于 GroupBacktestResult 存档
+            best_sortino = 0.0      # 仅用于 GroupBacktestResult 存档
             best_results: list[SingleBacktestResult] = []
 
             for params in param_combos:
@@ -778,11 +918,16 @@ class MatrixBacktest:
                 if not results:
                     continue
 
-                # ⚠️ 等权合并日收益率序列计算组合 Sharpe（不能取算术平均）
-                ps = _portfolio_sharpe_from_results(results)
-                pso = _portfolio_sortino_from_results(results)
+                # ⚠️ 等权合并日收益率序列，一次性计算所有指标
+                # 迭代 #9：复用 combined 计算 sharpe / sortino / alpha
+                combined = _combine_daily_returns(results)
+                ps = _compute_sharpe(combined)
+                pso = _compute_sortino(combined)
+                alpha = _compute_alpha(combined, spy_returns)
 
-                if ps > best_sharpe:
+                # 迭代 #9：per-strategy best params 用 alpha 选（替代 Sharpe）
+                if alpha > best_alpha:
+                    best_alpha = alpha
                     best_sharpe = ps
                     best_sortino = pso
                     best_params = params
@@ -809,50 +954,77 @@ class MatrixBacktest:
                     portfolio_max_drawdown=_portfolio_max_drawdown_from_results(
                         best_results
                     ),
+                    backtest_alpha=best_alpha,
                 ))
 
         if not group_results:
             logger.warning(f"[MatrixBacktest] {group_id}: no valid results")
             return []
 
-        # 3. 迭代 #3：DD 约束 + Sortino 排序选 Top-K
-        #    Constitution L1: portfolio DD ≤ 20% 是硬约束
-        #    步骤：(a) 计算每候选 portfolio_max_drawdown
-        #          (b) 过滤 DD <= MAX_PORTFOLIO_DRAWDOWN_PCT 的合规集
-        #          (c) 合规集非空 → 按 Sortino 降序取 top-K
-        #          (d) 合规集为空 → fallback：按 DD 升序取 top-K，标记 dd_constrained=True
-        candidates: list[tuple[str, dict, list[SingleBacktestResult], float, float]] = []
+        # 3. 迭代 #9：DD 硬约束 + Sortino 门槛 + Alpha 排序选 Top-K
+        #    Constitution L1: portfolio DD ≤ 20% 是硬约束（保留）
+        #    新增：Sortino > 0.5 最低质量门槛（可放宽）
+        #    变更：排序指标从 Sortino 改为 Alpha
+        #
+        #    三级过滤策略：
+        #      Tier 1: DD ≤ 20% AND Sortino > 0.5 → Alpha 降序
+        #      Tier 2 (fallback): Tier 1 为空 → 仅 DD ≤ 20% → Alpha 降序
+        #      Tier 3 (fallback): Tier 2 为空 → 按 DD 升序，标记 dd_constrained=True
+        candidates: list[
+            tuple[str, dict, list[SingleBacktestResult], float, float, float]
+        ] = []
         for (strategy, params, results) in group_results:
             pso = _portfolio_sortino_from_results(results)
             pdd = _portfolio_max_drawdown_from_results(results)
-            candidates.append((strategy, params, results, pso, pdd))
+            # 复用 _combine_daily_returns 计算 alpha（与 per-strategy 选择一致）
+            alpha = _compute_alpha(_combine_daily_returns(results), spy_returns)
+            candidates.append((strategy, params, results, pso, pdd, alpha))
 
-        compliant = [c for c in candidates if c[4] <= MAX_PORTFOLIO_DRAWDOWN_PCT]
+        # Tier 1: DD ≤ 20% AND Sortino > 0.5
+        compliant = [
+            c for c in candidates
+            if c[4] <= MAX_PORTFOLIO_DRAWDOWN_PCT and c[3] > MIN_SORTINO_THRESHOLD
+        ]
         if compliant:
-            # 合规集非空：按 Sortino 降序取 top-K
-            ranked = sorted(compliant, key=lambda x: x[3], reverse=True)
+            # Tier 1 命中：按 Alpha 降序取 top-K
+            ranked = sorted(compliant, key=lambda x: x[5], reverse=True)
             dd_constrained = False
             logger.info(
-                f"[MatrixBacktest] {group_id}: DD filter passed — "
+                f"[MatrixBacktest] {group_id}: DD + Sortino filter passed — "
                 f"{len(compliant)}/{len(candidates)} candidates compliant "
-                f"(DD <= {MAX_PORTFOLIO_DRAWDOWN_PCT}%)"
+                f"(DD <= {MAX_PORTFOLIO_DRAWDOWN_PCT}% AND Sortino > {MIN_SORTINO_THRESHOLD})"
             )
         else:
-            # Fallback：无合规候选（结构性问题，如 NDX_high_vol 全部 > 20%）
-            # 按 DD 升序（最低 DD 优先）取 top-K，标记 dd_constrained
-            ranked = sorted(candidates, key=lambda x: x[4])
-            dd_constrained = True
-            logger.warning(
-                f"[MatrixBacktest] {group_id}: NO compliant candidates "
-                f"(all {len(candidates)} exceed DD={MAX_PORTFOLIO_DRAWDOWN_PCT}%). "
-                f"Fallback: selected top-{self._top_k} by lowest DD. "
-                f"This group is marked dd_constrained=True — "
-                f"review whether to drop the group or accept the risk."
-            )
-            report.warnings.append(
-                f"{group_id}: dd_constrained=True "
-                f"(min DD={ranked[0][4]:.2f}% > {MAX_PORTFOLIO_DRAWDOWN_PCT}%)"
-            )
+            # Tier 2: 放宽 Sortino 门槛，仅保留 DD 约束
+            dd_compliant = [
+                c for c in candidates if c[4] <= MAX_PORTFOLIO_DRAWDOWN_PCT
+            ]
+            if dd_compliant:
+                # Tier 2 命中：按 Alpha 降序取 top-K（dd_constrained 仍为 False）
+                ranked = sorted(dd_compliant, key=lambda x: x[5], reverse=True)
+                dd_constrained = False
+                logger.warning(
+                    f"[MatrixBacktest] {group_id}: Sortino filter relaxed — "
+                    f"no candidate passed Sortino > {MIN_SORTINO_THRESHOLD}. "
+                    f"Fallback to DD-only filter: "
+                    f"{len(dd_compliant)}/{len(candidates)} candidates DD-compliant."
+                )
+            else:
+                # Tier 3: 无 DD 合规候选 → 按 DD 升序，标记 dd_constrained
+                # （结构性问题，如 NDX_high_vol 全部 > 20%）
+                ranked = sorted(candidates, key=lambda x: x[4])
+                dd_constrained = True
+                logger.warning(
+                    f"[MatrixBacktest] {group_id}: NO compliant candidates "
+                    f"(all {len(candidates)} exceed DD={MAX_PORTFOLIO_DRAWDOWN_PCT}%). "
+                    f"Fallback: selected top-{self._top_k} by lowest DD. "
+                    f"This group is marked dd_constrained=True — "
+                    f"review whether to drop the group or accept the risk."
+                )
+                report.warnings.append(
+                    f"{group_id}: dd_constrained=True "
+                    f"(min DD={ranked[0][4]:.2f}% > {MAX_PORTFOLIO_DRAWDOWN_PCT}%)"
+                )
 
         top_results = ranked[: self._top_k]
 
@@ -861,9 +1033,10 @@ class MatrixBacktest:
             if gr.group_id == group_id:
                 gr.dd_constrained = dd_constrained
 
-        # 4. 优化 ensemble 权重（单点离散值加权投票语义）
+        # 4. 优化 ensemble 权重（单点离散值加权投票语义，迭代 #9 改用 alpha）
         weighted = _optimize_ensemble_weights(
-            [(s, p, r) for (s, p, r, _, _) in top_results]
+            [(s, p, r) for (s, p, r, _, _, _) in top_results],
+            spy_returns=spy_returns,
         )
 
         # 5. 构建权重配置列表
@@ -886,6 +1059,9 @@ class MatrixBacktest:
                 "backtest_sortino": round(gr.portfolio_sortino if gr else 0.0, 4),
                 "backtest_max_drawdown": round(gr.portfolio_max_drawdown if gr else 0.0, 4),
                 "backtest_win_rate": round(gr.avg_win_rate_pct / 100 if gr else 0.5, 4),
+                # 迭代 #9：新增 backtest_alpha 字段（vs SPY 的超额收益百分数）
+                # 下游 PortfolioBacktester 可读此字段验证 alpha 一致性
+                "backtest_alpha": round(gr.backtest_alpha if gr else 0.0, 4),
                 # 迭代 #3：标记该组是否用了 DD fallback（无合规候选）
                 # 同组所有策略条目共享同一 dd_constrained 值
                 "dd_constrained": dd_constrained,

@@ -1,13 +1,26 @@
 """Phase 3 真实集成测试：Alpaca Paper 账户 + Telegram Bot。
 
-运行方式：
+⚠️ Live 测试隔离
+----------------
+本文件所有测试均标记为 `@pytest.mark.live`，默认 `pytest` 不会收集或运行它们
+（见 `pyproject.toml` 的 `addopts = "-q -m 'not live'"`）。
+
+为什么隔离：
+- Alpaca 测试需要真实 `.env`（ALPACA__API_KEY / SECRET_KEY）
+- Telegram 测试会真实发送消息到手机
+- IBKR 测试需要本地 TWS Paper 运行并开启 API 端口
+- 默认运行这些测试会污染 orchestrator 验证结果（exit_code=1 但非业务 bug）
+
+显式运行 live 测试（应仅在手动验证时使用）：
+
     cd mytrader
-    python -m pytest tests/test_integration_live.py -v -s
+    python -m pytest tests/test_integration_live.py -m live -v -s
 
 前提：
     - .env 已配置 ALPACA__API_KEY / ALPACA__SECRET_KEY
     - .env 已配置 NOTIFICATION__TELEGRAM_ENABLED=true / BOT_TOKEN / CHAT_ID
     - alpaca-py 已安装
+    - IBKR 测试额外需要本地 TWS/Gateway 运行（IBKR__HOST 配置）
 """
 from __future__ import annotations
 
@@ -18,6 +31,9 @@ import pytest
 from alpaca.trading.client import TradingClient
 
 from mytrader.infra.config import load_config
+
+# 整个模块标记为 live：默认 pytest 不收集，仅 `-m live` 时运行
+pytestmark = pytest.mark.live
 
 
 # ---------------------------------------------------------------------------

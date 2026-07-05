@@ -85,4 +85,9 @@ ignore = ["E501"]               # line-length 由 formatter 控制
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = "test_*.py"
-addopts = "-q"
+markers = [
+    "live: tests that call real broker/notification/network services; skipped by default",
+]
+# 默认排除 live 测试：避免本地未启动 TWS / 未配置 .env 时误触真实下单 / Telegram。
+# 显式运行 live 测试：`python -m pytest tests/test_integration_live.py -m live -v -s`
+addopts = "-q -m 'not live'"

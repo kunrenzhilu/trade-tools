@@ -67,13 +67,18 @@ class SignalRanker:
         candidates_multiplier: 候选倍数，默认 2
         conflict_threshold: 加权投票分数绝对值低于此阈值时丢弃（策略分歧）
         score_weights:      综合得分各因子权重 dict
+
+    迭代 #7：默认评分因子从 backtest_sharpe 切换为 backtest_sortino +
+    backtest_dd_penalty（Constitution L1 Sortino 首要 KPI）。
     """
 
     DEFAULT_SCORE_WEIGHTS = {
-        "strategy_weight":    0.35,
-        "signal_confidence":  0.25,
-        "backtest_win_rate":  0.20,
-        "backtest_sharpe":    0.20,
+        # 迭代 #7：Constitution L1 Sortino 首要 KPI，替换 backtest_sharpe
+        "strategy_weight":     0.30,
+        "signal_confidence":   0.20,
+        "backtest_win_rate":   0.15,
+        "backtest_sortino":    0.25,   # ← 替换 backtest_sharpe，权重最高单因子
+        "backtest_dd_penalty": 0.10,   # ← 新增：DD 越低分越高（0%→1.0, 20%→0.0）
     }
 
     def __init__(
@@ -193,13 +198,24 @@ class SignalRanker:
         return aggregated, dropped
 
     def _score(self, signal: Signal) -> tuple[float, dict[str, float]]:
-        """计算综合得分 + 各因子明细。"""
+        """计算综合得分 + 各因子明细。
+
+        迭代 #7：评分因子从 backtest_sharpe 切换为 backtest_sortino + backtest_dd_penalty
+        （Constitution L1 Sortino 首要 KPI）。
+
+        归一化：
+            - backtest_sortino:    Sortino 通常 0~3，除以 3.0 截断到 [0, 1]；
+                                  负值被 max(·, 0.0) 截断为 0
+            - backtest_dd_penalty: DD 0~20%+，1 - dd/20 截断到 [0, 1]；
+                                  DD=0 → 1.0（满分），DD≥20 → 0.0
+        """
         ind = signal.indicators
         factors = {
-            "strategy_weight":   float(ind.get("weight", 0.5)),
-            "signal_confidence": float(signal.confidence),
-            "backtest_win_rate": float(ind.get("backtest_win_rate", 0.5)),
-            "backtest_sharpe":   min(float(ind.get("backtest_sharpe", 0.0)) / 3.0, 1.0),
+            "strategy_weight":     float(ind.get("weight", 0.5)),
+            "signal_confidence":   float(signal.confidence),
+            "backtest_win_rate":   float(ind.get("backtest_win_rate", 0.5)),
+            "backtest_sortino":    min(max(float(ind.get("backtest_sortino", 0.0)) / 3.0, 0.0), 1.0),
+            "backtest_dd_penalty": max(1.0 - float(ind.get("backtest_max_drawdown", 0.0)) / 20.0, 0.0),
         }
 
         w = self._score_weights

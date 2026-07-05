@@ -33,20 +33,34 @@ def _make_signal(
     sharpe: float = 1.2,
     win_rate: float = 0.55,
     sector: str = "Technology",
+    sortino: float | None = None,
+    max_drawdown: float | None = None,
 ) -> Signal:
+    """构造测试用 Signal。
+
+    迭代 #7：新增 sortino / max_drawdown 可选参数。
+    默认 None 时**不写入** indicators，模拟旧数据（缺少新字段）；
+    传入值时写入，便于 Sortino/DD penalty 测试。
+    backtest_sharpe 字段保留（向后兼容，但不再参与评分）。
+    """
+    indicators = {
+        "weight": weight,
+        "backtest_sharpe": sharpe,
+        "backtest_win_rate": win_rate,
+        "group_id": "NDX_high_vol",
+        "sector": sector,
+    }
+    if sortino is not None:
+        indicators["backtest_sortino"] = sortino
+    if max_drawdown is not None:
+        indicators["backtest_max_drawdown"] = max_drawdown
     return Signal(
         symbol=symbol,
         direction=direction,
         timestamp=datetime.now(tz=timezone.utc),
         confidence=confidence,
         strategy_name=strategy,
-        indicators={
-            "weight": weight,
-            "backtest_sharpe": sharpe,
-            "backtest_win_rate": win_rate,
-            "group_id": "NDX_high_vol",
-            "sector": sector,
-        },
+        indicators=indicators,
     )
 
 
@@ -274,6 +288,106 @@ class TestSignalRanker:
         report = ranker.rank(sigs)
         ranks = [c.rank for c in report.buy_candidates]
         assert ranks == [1, 2, 3]
+
+    # ------------------------------------------------------------------
+    # 迭代 #7：Sortino + DD penalty 评分因子测试
+    # ------------------------------------------------------------------
+
+    def test_score_uses_sortino_not_sharpe(self):
+        """评分应使用 backtest_sortino 而非 backtest_sharpe。
+
+        构造 signal：sortino=2.0（高），sharpe=0.0（低，旧字段）。
+        断言：score > 0，且 score_breakdown 包含 backtest_sortino 而非 backtest_sharpe。
+        """
+        ranker = SignalRanker(top_k=5)
+        sig = _make_signal("A", SignalDirection.BUY, sortino=2.0, sharpe=0.0)
+        report = ranker.rank([sig])
+        ranked = report.buy_candidates[0]
+        assert ranked.score > 0
+        assert "backtest_sortino" in ranked.score_breakdown
+        assert "backtest_sharpe" not in ranked.score_breakdown
+        # sortino=2.0 → factor = min(2.0/3.0, 1.0) = 0.6667
+        assert abs(ranked.score_breakdown["backtest_sortino"] - (2.0 / 3.0)) < 1e-6
+
+    def test_score_dd_penalty(self):
+        """DD 越低，得分越高。
+
+        A: max_drawdown=5% → dd_penalty = 1 - 5/20 = 0.75
+        B: max_drawdown=18% → dd_penalty = 1 - 18/20 = 0.10
+        其余因子相同 → A.score > B.score
+        """
+        ranker = SignalRanker(top_k=5)
+        sig_a = _make_signal("A", SignalDirection.BUY, sortino=1.5, max_drawdown=5.0)
+        sig_b = _make_signal("B", SignalDirection.BUY, sortino=1.5, max_drawdown=18.0)
+        report = ranker.rank([sig_a, sig_b])
+        scores = {r.symbol: r.score for r in report.buy_candidates}
+        assert scores["A"] > scores["B"], (
+            f"A(DD=5%) score {scores['A']:.4f} 应大于 B(DD=18%) score {scores['B']:.4f}"
+        )
+        # 验证 dd_penalty factor
+        bd_a = {r.symbol: r.score_breakdown for r in report.buy_candidates}["A"]
+        bd_b = {r.symbol: r.score_breakdown for r in report.buy_candidates}["B"]
+        assert abs(bd_a["backtest_dd_penalty"] - 0.75) < 1e-6
+        assert abs(bd_b["backtest_dd_penalty"] - 0.10) < 1e-6
+
+    def test_score_sortino_normalization(self):
+        """Sortino 归一化：3.0→1.0, 6.0→1.0(截断), -1.0→0.0(截断)。"""
+        ranker = SignalRanker(top_k=5)
+        # 3.0 → 1.0
+        sig1 = _make_signal("S3", SignalDirection.BUY, sortino=3.0, max_drawdown=0.0)
+        # 6.0 → 1.0 (truncated)
+        sig2 = _make_signal("S6", SignalDirection.BUY, sortino=6.0, max_drawdown=0.0)
+        # -1.0 → 0.0 (clamped)
+        sig_neg = _make_signal("SN", SignalDirection.BUY, sortino=-1.0, max_drawdown=0.0)
+        report = ranker.rank([sig1, sig2, sig_neg])
+        bd = {r.symbol: r.score_breakdown for r in report.buy_candidates}
+        assert abs(bd["S3"]["backtest_sortino"] - 1.0) < 1e-6
+        assert abs(bd["S6"]["backtest_sortino"] - 1.0) < 1e-6
+        assert abs(bd["SN"]["backtest_sortino"] - 0.0) < 1e-6
+
+    def test_custom_score_weights_still_work(self):
+        """传入自定义 score_weights 只用指定因子。"""
+        ranker = SignalRanker(
+            top_k=5,
+            score_weights={"strategy_weight": 1.0},
+        )
+        sig = _make_signal("X", SignalDirection.BUY, weight=0.8, sortino=2.0)
+        report = ranker.rank([sig])
+        ranked = report.buy_candidates[0]
+        # 只用 strategy_weight=0.8 → score=0.8
+        assert abs(ranked.score - 0.8) < 1e-6
+
+    def test_ranking_order_changed_by_sortino(self):
+        """Sortino 评分切换：A 的 Sharpe 高但 Sortino 低，B 的 Sharpe 低但 Sortino 高。
+
+        旧评分（sharpe）：A 排前
+        新评分（sortino）：B 排前
+        """
+        ranker = SignalRanker(top_k=5)
+        sig_a = _make_signal(
+            "A_HIGH_SHARPE_LOW_SORTINO",
+            SignalDirection.BUY,
+            sharpe=2.5,      # 旧因子：高
+            sortino=0.5,     # 新因子：低
+            max_drawdown=10.0,
+            confidence=0.5,
+            weight=0.5,
+            win_rate=0.5,
+        )
+        sig_b = _make_signal(
+            "B_LOW_SHARPE_HIGH_SORTINO",
+            SignalDirection.BUY,
+            sharpe=0.2,      # 旧因子：低
+            sortino=2.5,     # 新因子：高
+            max_drawdown=10.0,
+            confidence=0.5,
+            weight=0.5,
+            win_rate=0.5,
+        )
+        report = ranker.rank([sig_a, sig_b])
+        # B 应排第一（Sortino 高）
+        assert report.buy_candidates[0].symbol == "B_LOW_SHARPE_HIGH_SORTINO"
+        assert report.buy_candidates[1].symbol == "A_HIGH_SHARPE_LOW_SORTINO"
 
 
 # ---------------------------------------------------------------------------

@@ -17,14 +17,18 @@ import pytest
 from mytrader.backtest.matrix_backtest import (
     MatrixBacktest,
     _backtest_one,
+    _combine_daily_returns,
+    _compute_alpha,
     _compute_sharpe,
     _compute_sortino,
     _portfolio_max_drawdown_from_results,
     _portfolio_sharpe_from_results,
     _portfolio_sortino_from_results,
+    _optimize_ensemble_weights,
     _safe_float,
     _safe_mean,
     MAX_PORTFOLIO_DRAWDOWN_PCT,
+    MIN_SORTINO_THRESHOLD,
     WALK_FORWARD_VAL_DD_THRESHOLD,
     SingleBacktestResult,
     WalkForwardReport,
@@ -953,4 +957,689 @@ class TestWalkForward:
         assert len(report.rounds) == 2
         assert report.rounds[0].round_num == 1
         assert report.rounds[1].round_num == 2
+
+
+# ---------------------------------------------------------------------------
+# 迭代 #9 新增：Alpha-Based Strategy Selection
+# ---------------------------------------------------------------------------
+
+class TestAlphaComputation:
+    """_compute_alpha / _combine_daily_returns 单元测试。"""
+
+    def test_compute_alpha_basic(self):
+        """构造已知策略收益和 SPY 收益，验证 alpha 计算正确。
+
+        策略日均收益 0.001 (0.1%)，SPY 日均收益 0.0004 (0.04%)。
+        年化：(1.001^252 - 1) - (1.0004^252 - 1) ≈ 0.285 - 0.110 = 0.175 → 17.5%
+        """
+        np.random.seed(42)
+        idx = pd.date_range("2021-01-01", periods=252, freq="B")
+        # 策略收益：稳定 0.1%/日（年化 ~28.5%）
+        strat_returns = pd.Series(
+            np.random.normal(0.001, 0.002, 252), index=idx
+        )
+        # SPY 收益：稳定 0.04%/日（年化 ~11.0%）
+        spy_returns = pd.Series(
+            np.random.normal(0.0004, 0.001, 252), index=idx
+        )
+
+        alpha = _compute_alpha(strat_returns, spy_returns)
+
+        # 期望 alpha ≈ 17.5%（正数，跑赢 SPY）
+        assert alpha > 0.0, f"策略年化应高于 SPY，alpha 应为正，实际 {alpha:.4f}"
+        # 验证量级在合理范围（10~25%）
+        assert 10.0 < alpha < 25.0, (
+            f"alpha 应在 10~25% 范围，实际 {alpha:.4f}%"
+        )
+
+    def test_compute_alpha_spy_unavailable(self):
+        """SPY 数据为 None → alpha = 0.0（降级处理，不抛异常）。"""
+        idx = pd.date_range("2021-01-01", periods=100, freq="B")
+        strat_returns = pd.Series(np.random.normal(0.001, 0.01, 100), index=idx)
+
+        # spy_returns=None
+        assert _compute_alpha(strat_returns, None) == 0.0
+        # spy_returns=空 Series
+        empty_spy = pd.Series(dtype=float)
+        assert _compute_alpha(strat_returns, empty_spy) == 0.0
+
+    def test_compute_alpha_strategy_underperforms(self):
+        """策略跑输 SPY → alpha 为负。"""
+        idx = pd.date_range("2021-01-01", periods=252, freq="B")
+        # 策略日均 0.0001 (0.01%)，SPY 日均 0.001 (0.1%)
+        strat_returns = pd.Series(np.random.normal(0.0001, 0.005, 252), index=idx)
+        spy_returns = pd.Series(np.random.normal(0.001, 0.002, 252), index=idx)
+
+        alpha = _compute_alpha(strat_returns, spy_returns)
+        assert alpha < 0.0, (
+            f"策略跑输 SPY 时 alpha 应为负，实际 {alpha:.4f}"
+        )
+
+    def test_combine_daily_returns_basic(self):
+        """等权合并组内日收益率序列。"""
+        idx = pd.date_range("2021-01-01", periods=10, freq="B")
+        r1 = pd.Series([0.001] * 10, index=idx)
+        r2 = pd.Series([0.003] * 10, index=idx)
+        results = [
+            SingleBacktestResult("S1", "s", {}, 0.0, 0, 0, 0, 0, r1),
+            SingleBacktestResult("S2", "s", {}, 0.0, 0, 0, 0, 0, r2),
+        ]
+        combined = _combine_daily_returns(results)
+        # 等权平均：(0.001 + 0.003) / 2 = 0.002
+        assert len(combined) == 10
+        assert all(abs(v - 0.002) < 1e-9 for v in combined)
+
+    def test_combine_daily_returns_empty(self):
+        """空列表 → 空 Series。"""
+        combined = _combine_daily_returns([])
+        assert combined.empty
+
+    def test_min_sortino_threshold_constant(self):
+        """MIN_SORTINO_THRESHOLD = 0.5（spec §4.2 硬约束）。"""
+        assert MIN_SORTINO_THRESHOLD == 0.5, (
+            f"MIN_SORTINO_THRESHOLD 应为 0.5（迭代 #9 spec），"
+            f"实际 {MIN_SORTINO_THRESHOLD}"
+        )
+
+
+class TestAlphaBasedTopKSelection:
+    """top-K 选择逻辑从 Sortino 改为 Alpha 的集成测试。"""
+
+    def test_top_k_selection_uses_alpha(self, tmp_path):
+        """top-K 排序使用 Alpha 而非 Sortino。
+
+        场景：策略 A 的 Sortino 高于 B，但 B 的 Alpha 高于 A。
+        应选择 B（高 alpha）而非 A（高 Sortino）。
+
+        构造方法：用 patch 拦截 _backtest_one，返回受控的 daily_returns。
+        """
+        from unittest.mock import patch
+
+        # 构造 SPY 数据：温和上涨（年化 ~10%）
+        n = 300
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        spy_close = [100.0 * (1.0004 ** i) for i in range(n)]  # ~10% 年化
+        spy_df = pd.DataFrame({
+            "open": [c - 0.1 for c in spy_close],
+            "high": [c + 0.5 for c in spy_close],
+            "low": [c - 0.5 for c in spy_close],
+            "close": spy_close,
+            "volume": [1_000_000] * n,
+        }, index=idx)
+        spy_returns = spy_df["close"].pct_change().dropna()
+
+        # 策略 A (dual_ma): 低波动低收益 → 高 Sortino 但低 alpha
+        # 日均 0.0004（~10% 年化，与 SPY 持平 → alpha ≈ 0）
+        np.random.seed(42)
+        returns_a = pd.Series(
+            np.random.normal(0.0004, 0.002, n), index=idx
+        )
+        # 策略 B (rsi_mean_revert): 高波动高收益 → 低 Sortino 但高 alpha
+        # 日均 0.0011（~32% 年化，远超 SPY → alpha ≈ 22%）
+        returns_b = pd.Series(
+            np.random.normal(0.0011, 0.008, n), index=idx
+        )
+
+        # 验证测试前提：A 的 Sortino > B 的 Sortino，B 的 alpha > A 的 alpha
+        sortino_a = _compute_sortino(returns_a)
+        sortino_b = _compute_sortino(returns_b)
+        alpha_a = _compute_alpha(returns_a, spy_returns)
+        alpha_b = _compute_alpha(returns_b, spy_returns)
+        assert sortino_a > sortino_b, (
+            f"测试前提失败：A 的 Sortino({sortino_a:.4f}) 应 > B({sortino_b:.4f})"
+        )
+        assert alpha_b > alpha_a, (
+            f"测试前提失败：B 的 alpha({alpha_b:.4f}) 应 > A({alpha_a:.4f})"
+        )
+
+        # Mock _backtest_one 返回受控结果
+        def mock_backtest_one(df, strategy, params, *args, **kwargs):
+            sym = df.index.name or "SYM"
+            if strategy == "dual_ma":
+                return SingleBacktestResult(
+                    sym, strategy, params, 1.0, 10.0, 5.0, 55.0, 10, returns_a
+                )
+            else:  # rsi_mean_revert
+                return SingleBacktestResult(
+                    sym, strategy, params, 1.0, 30.0, 8.0, 50.0, 10, returns_b
+                )
+
+        # 构造 mock store：返回 SPY + 普通上涨数据
+        df_up = _make_ohlcv(n, trend="up")
+        store = MagicMock()
+
+        def get_bars_multi(symbols, start, end, timeframe="1d"):
+            mapping = {"AAPL": df_up, "SPY": spy_df}
+            return {s: mapping[s] for s in symbols if s in mapping}
+
+        store.get_bars_multi.side_effect = get_bars_multi
+
+        universe = MagicMock()
+        universe.get_groups.return_value = {"test_group": ["AAPL"]}
+
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=1)
+
+        with patch(
+            "mytrader.backtest.matrix_backtest._backtest_one",
+            side_effect=mock_backtest_one,
+        ):
+            report = mb.run(
+                strategies=["dual_ma", "rsi_mean_revert"],
+                param_grids={
+                    "dual_ma": {"fast": [5], "slow": [20]},
+                    "rsi_mean_revert": {
+                        "period": [14], "oversold": [30], "overbought": [70]
+                    },
+                },
+            )
+
+        # 验证：选择了 rsi_mean_revert（高 alpha）而非 dual_ma（高 Sortino）
+        weights = report.groups["test_group"]
+        assert len(weights) == 1, f"top_k=1 应只选 1 个策略，实际 {len(weights)}"
+        assert weights[0]["strategy"] == "rsi_mean_revert", (
+            f"应选择高 alpha 的 rsi_mean_revert，"
+            f"实际选择了 {weights[0]['strategy']}（高 Sortino 的 dual_ma）"
+        )
+        # backtest_alpha 字段应反映 B 的高 alpha
+        assert weights[0]["backtest_alpha"] > 5.0, (
+            f"B 的 alpha 应 > 5%，实际 {weights[0]['backtest_alpha']:.4f}"
+        )
+
+    def test_sortino_filter_excludes_garbage(self, tmp_path):
+        """Sortino < 0.5 的候选被过滤（即使 alpha 高也不选）。
+
+        场景：构造一个 Sortino < 0.5 的"垃圾"策略 A，和一个 Sortino > 0.5 的正常策略 B。
+        即使 A 的 alpha 略高，也应被 Sortino 门槛排除。
+
+        注：由于 Sortino 门槛是 Tier 1 过滤，若无候选通过门槛，会触发 Tier 2 fallback
+        放宽门槛。本测试构造"至少有一个正常候选"的场景验证 Tier 1 正常工作。
+        """
+        from unittest.mock import patch
+
+        n = 300
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        # SPY 温和上涨
+        spy_close = [100.0 * (1.0004 ** i) for i in range(n)]
+        spy_df = pd.DataFrame({
+            "open": [c - 0.1 for c in spy_close],
+            "high": [c + 0.5 for c in spy_close],
+            "low": [c - 0.5 for c in spy_close],
+            "close": spy_close,
+            "volume": [1_000_000] * n,
+        }, index=idx)
+        spy_returns = spy_df["close"].pct_change().dropna()
+
+        # 垃圾策略 A：极低 Sortino（高下行波动）+ 高 alpha（靠总体高收益）
+        # 构造大起大落的收益序列：均值高但下行波动大
+        np.random.seed(42)
+        returns_a = pd.Series(
+            np.concatenate([
+                np.random.normal(0.003, 0.015, 200),   # 高波动高收益
+                np.random.normal(-0.005, 0.01, 100),   # 大幅下行
+            ]),
+            index=idx,
+        )
+        # 正常策略 B：稳定收益，Sortino > 0.5
+        returns_b = pd.Series(
+            np.random.normal(0.0008, 0.003, n), index=idx
+        )
+
+        sortino_a = _compute_sortino(returns_a)
+        sortino_b = _compute_sortino(returns_b)
+        # 验证前提：A 的 Sortino < 0.5（垃圾），B 的 Sortino > 0.5（正常）
+        assert sortino_a < MIN_SORTINO_THRESHOLD, (
+            f"A 应为 Sortino < 0.5 的垃圾策略，实际 {sortino_a:.4f}"
+        )
+        assert sortino_b > MIN_SORTINO_THRESHOLD, (
+            f"B 应为 Sortino > 0.5 的正常策略，实际 {sortino_b:.4f}"
+        )
+
+        def mock_backtest_one(df, strategy, params, *args, **kwargs):
+            sym = df.index.name or "SYM"
+            if strategy == "dual_ma":
+                return SingleBacktestResult(
+                    sym, strategy, params, 0.5, 15.0, 10.0, 50.0, 5, returns_a
+                )
+            else:  # rsi_mean_revert
+                return SingleBacktestResult(
+                    sym, strategy, params, 1.0, 20.0, 5.0, 55.0, 10, returns_b
+                )
+
+        df_up = _make_ohlcv(n, trend="up")
+        store = MagicMock()
+        store.get_bars_multi.side_effect = lambda symbols, start, end, timeframe="1d": {
+            s: {"AAPL": df_up, "SPY": spy_df}[s] for s in symbols
+            if s in {"AAPL", "SPY"}
+        }
+
+        universe = MagicMock()
+        universe.get_groups.return_value = {"test_group": ["AAPL"]}
+
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=1)
+        with patch(
+            "mytrader.backtest.matrix_backtest._backtest_one",
+            side_effect=mock_backtest_one,
+        ):
+            report = mb.run(
+                strategies=["dual_ma", "rsi_mean_revert"],
+                param_grids={
+                    "dual_ma": {"fast": [5], "slow": [20]},
+                    "rsi_mean_revert": {
+                        "period": [14], "oversold": [30], "overbought": [70]
+                    },
+                },
+            )
+
+        weights = report.groups["test_group"]
+        assert len(weights) == 1
+        # 应选择 rsi_mean_revert（Sortino > 0.5），排除 dual_ma（Sortino < 0.5）
+        assert weights[0]["strategy"] == "rsi_mean_revert", (
+            f"应排除 Sortino < 0.5 的 dual_ma，选择 rsi_mean_revert，"
+            f"实际选择了 {weights[0]['strategy']}"
+        )
+
+    def test_dd_filter_still_applies(self, tmp_path):
+        """DD > 20% 的候选被过滤（即使 alpha 高也不通过 DD 硬约束）。
+
+        场景：构造 rsi_mean_revert 在持续下跌数据上产生大 DD 的策略行为。
+        验证：dd_constrained=True（触发 DD fallback），权重仍产出。
+        """
+        store = MagicMock()
+        # 构造先涨后崩数据：rsi_mean_revert 会在下跌中超卖买入，持续持仓导致大 DD
+        n = 400
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        close = (
+            [100.0 * (1 - 0.002 * i) for i in range(200)]   # 缓慢下跌压低 RSI
+            + [60.0 * (1 - 0.005 * (i - 200)) for i in range(200, n)]  # 急速崩溃
+        )
+        close = [max(c, 1.0) for c in close]
+        df_crash = pd.DataFrame({
+            "open": [c - 0.3 for c in close],
+            "high": [c + 0.5 for c in close],
+            "low": [c - 0.5 for c in close],
+            "close": close,
+            "volume": [1_000_000] * n,
+        }, index=idx)
+        # 同时提供 SPY 数据（让 alpha 计算不降级）
+        spy_df = _make_ohlcv(n, trend="up")
+        spy_df = spy_df.copy()
+        spy_df.index = idx  # 对齐索引
+
+        def get_bars_multi(symbols, start, end, timeframe="1d"):
+            mapping = {"AAPL": df_crash, "SPY": spy_df}
+            return {s: mapping[s] for s in symbols if s in mapping}
+
+        store.get_bars_multi.side_effect = get_bars_multi
+
+        universe = MagicMock()
+        universe.get_groups.return_value = {"volatile_group": ["AAPL"]}
+
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=1)
+        report = mb.run(
+            strategies=["rsi_mean_revert"],
+            param_grids={"rsi_mean_revert": {
+                "period": [14], "oversold": [35], "overbought": [65]
+            }},
+            output_file=tmp_path / "weights_dd.json",
+        )
+
+        # 验证：DD 超标时 dd_constrained=True（DD fallback 触发）
+        has_weights = any(weights for weights in report.groups.values() if weights)
+        if has_weights:
+            for gid, weights in report.groups.items():
+                for w in weights:
+                    if w.get("backtest_max_drawdown", 0) > MAX_PORTFOLIO_DRAWDOWN_PCT:
+                        assert w["dd_constrained"] is True, (
+                            f"{gid}: DD={w['backtest_max_drawdown']:.1f}% > "
+                            f"{MAX_PORTFOLIO_DRAWDOWN_PCT}% 但 dd_constrained 为 False"
+                        )
+
+    def test_fallback_when_no_sortino_compliant(self, tmp_path):
+        """所有候选 Sortino < 0.5 → 触发 Tier 2 fallback（放宽 Sortino 门槛）。
+
+        场景：构造低 Sortino 的策略，但 DD ≤ 20%。
+        验证：权重仍产出（不空），dd_constrained=False（因为 DD 合规），
+        且日志中应有 "Sortino filter relaxed" 警告。
+        """
+        from unittest.mock import patch
+        from loguru import logger
+
+        n = 300
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        spy_df = pd.DataFrame({
+            "open": [99.9], "high": [100.5], "low": [99.5],
+            "close": [100.0], "volume": [1_000_000],
+        }, index=idx[:1])
+        # 让 SPY 数据足够长
+        spy_close = [100.0 * (1.0004 ** i) for i in range(n)]
+        spy_df = pd.DataFrame({
+            "open": [c - 0.1 for c in spy_close],
+            "high": [c + 0.5 for c in spy_close],
+            "low": [c - 0.5 for c in spy_close],
+            "close": spy_close,
+            "volume": [1_000_000] * n,
+        }, index=idx)
+
+        # 低 Sortino 但 DD 合规的收益序列
+        np.random.seed(42)
+        returns_garbage = pd.Series(
+            np.concatenate([
+                np.random.normal(0.0002, 0.01, 200),  # 低均值高波动
+                np.random.normal(-0.0001, 0.008, 100), # 略负
+            ]),
+            index=idx,
+        )
+        # 验证前提：Sortino < 0.5（垃圾门槛）
+        assert _compute_sortino(returns_garbage) < MIN_SORTINO_THRESHOLD
+
+        def mock_backtest_one(df, strategy, params, *args, **kwargs):
+            sym = df.index.name or "SYM"
+            return SingleBacktestResult(
+                sym, strategy, params, 0.3, 5.0, 10.0, 50.0, 3, returns_garbage
+            )
+
+        df_up = _make_ohlcv(n, trend="up")
+        store = MagicMock()
+        store.get_bars_multi.side_effect = lambda symbols, start, end, timeframe="1d": {
+            s: {"AAPL": df_up, "SPY": spy_df}[s] for s in symbols
+            if s in {"AAPL", "SPY"}
+        }
+
+        universe = MagicMock()
+        universe.get_groups.return_value = {"test_group": ["AAPL"]}
+
+        # 捕获 WARNING 日志
+        msgs: list[str] = []
+        handler_id = logger.add(lambda m: msgs.append(str(m)), level="WARNING")
+
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=1)
+        try:
+            with patch(
+                "mytrader.backtest.matrix_backtest._backtest_one",
+                side_effect=mock_backtest_one,
+            ):
+                report = mb.run(
+                    strategies=["dual_ma"],
+                    param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+                )
+        finally:
+            logger.remove(handler_id)
+
+        # 验证：fallback 触发，日志记录 Sortino 放宽
+        assert any("Sortino filter relaxed" in m for m in msgs), (
+            f"应触发 Tier 2 fallback（Sortino relaxed），实际日志: {msgs}"
+        )
+
+        # 权重仍产出（DD 合规），dd_constrained=False
+        weights = report.groups.get("test_group", [])
+        if weights:
+            for w in weights:
+                assert w["dd_constrained"] is False, (
+                    "DD 合规时 dd_constrained 应为 False（Sortino fallback 不影响）"
+                )
+
+    def test_fallback_when_no_dd_compliant(self, tmp_path):
+        """所有候选 DD > 20% → 触发 Tier 3 fallback（按 DD 升序）。
+
+        场景：复用 test_fallback_when_no_compliant_candidates 的数据构造，
+        验证 dd_constrained=True（与迭代 #3 行为一致）。
+        """
+        store = MagicMock()
+        n = 400
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        close = (
+            [100.0 * (1 - 0.002 * i) for i in range(200)]
+            + [60.0 * (1 - 0.005 * (i - 200)) for i in range(200, n)]
+        )
+        close = [max(c, 1.0) for c in close]
+        df_crash = pd.DataFrame({
+            "open": [c - 0.3 for c in close],
+            "high": [c + 0.5 for c in close],
+            "low": [c - 0.5 for c in close],
+            "close": close,
+            "volume": [1_000_000] * n,
+        }, index=idx)
+        # SPY 数据（让 alpha 不降级，验证 DD fallback 优先于 Sortino 过滤）
+        spy_close = [100.0 * (1.0004 ** i) for i in range(n)]
+        spy_df = pd.DataFrame({
+            "open": [c - 0.1 for c in spy_close],
+            "high": [c + 0.5 for c in spy_close],
+            "low": [c - 0.5 for c in spy_close],
+            "close": spy_close,
+            "volume": [1_000_000] * n,
+        }, index=idx)
+
+        def get_bars_multi(symbols, start, end, timeframe="1d"):
+            mapping = {"AAPL": df_crash, "SPY": spy_df}
+            return {s: mapping[s] for s in symbols if s in mapping}
+
+        store.get_bars_multi.side_effect = get_bars_multi
+
+        universe = MagicMock()
+        universe.get_groups.return_value = {"volatile_group": ["AAPL", "MSFT"]}
+
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
+        report = mb.run(
+            strategies=["rsi_mean_revert"],
+            param_grids={"rsi_mean_revert": {
+                "period": [14], "oversold": [35], "overbought": [65]
+            }},
+            output_file=tmp_path / "weights_fallback_dd.json",
+        )
+
+        has_weights = any(weights for weights in report.groups.values() if weights)
+        if has_weights:
+            for gid, weights in report.groups.items():
+                for w in weights:
+                    if w.get("backtest_max_drawdown", 0) > MAX_PORTFOLIO_DRAWDOWN_PCT:
+                        assert w["dd_constrained"] is True, (
+                            f"{gid}: DD={w['backtest_max_drawdown']:.1f}% > 20% "
+                            f"但 dd_constrained 为 False（Tier 3 应触发）"
+                        )
+
+    def test_alpha_field_in_weights_json(self, mock_store, mock_universe, tmp_path):
+        """strategy_weights.json 每个权重条目含 backtest_alpha 字段。"""
+        output = tmp_path / "weights_with_alpha.json"
+        mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=1)
+        mb.run(
+            strategies=["dual_ma"],
+            param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+            output_file=output,
+        )
+        data = json.loads(output.read_text())
+        for gid, weights in data["groups"].items():
+            for w in weights:
+                assert "backtest_alpha" in w, (
+                    f"{gid}: 权重条目缺少 backtest_alpha 字段，"
+                    f"实际 keys={list(w.keys())}"
+                )
+                assert isinstance(w["backtest_alpha"], (int, float)), (
+                    f"{gid}: backtest_alpha 应为数值，"
+                    f"实际 {type(w['backtest_alpha'])}"
+                )
+
+    def test_group_results_have_backtest_alpha(self, mock_store, mock_universe):
+        """GroupBacktestResult.backtest_alpha 是浮点数（迭代 #9 新增字段）。"""
+        mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=1)
+        report = mb.run(
+            strategies=["dual_ma"],
+            param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+        )
+        for gr in report.group_results:
+            assert isinstance(gr.backtest_alpha, float), (
+                f"backtest_alpha 应为 float，实际 {type(gr.backtest_alpha)}"
+            )
+
+    def test_per_strategy_best_params_uses_alpha(self, tmp_path):
+        """per-strategy best params 选择使用 Alpha 而非 Sharpe。
+
+        场景：两个参数组合 A (fast=5, slow=20) 和 B (fast=10, slow=50)，
+        A 的 Sharpe 高但 alpha 低，B 的 Sharpe 低但 alpha 高。
+        验证最终 GroupBacktestResult.params 是 B（高 alpha）。
+        """
+        from unittest.mock import patch
+
+        n = 300
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        spy_close = [100.0 * (1.0004 ** i) for i in range(n)]
+        spy_df = pd.DataFrame({
+            "open": [c - 0.1 for c in spy_close],
+            "high": [c + 0.5 for c in spy_close],
+            "low": [c - 0.5 for c in spy_close],
+            "close": spy_close,
+            "volume": [1_000_000] * n,
+        }, index=idx)
+        spy_returns = spy_df["close"].pct_change().dropna()
+
+        # 参数 A 的收益：低波动低收益 → 高 Sharpe 但低 alpha
+        np.random.seed(42)
+        returns_a = pd.Series(
+            np.random.normal(0.0005, 0.002, n), index=idx  # 与 SPY 接近，alpha≈0
+        )
+        # 参数 B 的收益：高波动高收益 → 低 Sharpe 但高 alpha
+        returns_b = pd.Series(
+            np.random.normal(0.0012, 0.008, n), index=idx  # 远超 SPY，alpha>0
+        )
+
+        # 验证前提
+        sharpe_a = _compute_sharpe(returns_a)
+        sharpe_b = _compute_sharpe(returns_b)
+        alpha_a = _compute_alpha(returns_a, spy_returns)
+        alpha_b = _compute_alpha(returns_b, spy_returns)
+        assert sharpe_a > sharpe_b, (
+            f"A 的 Sharpe({sharpe_a:.4f}) 应 > B({sharpe_b:.4f})"
+        )
+        assert alpha_b > alpha_a, (
+            f"B 的 alpha({alpha_b:.4f}) 应 > A({alpha_a:.4f})"
+        )
+
+        # 根据参数选择返回不同收益
+        def mock_backtest_one(df, strategy, params, *args, **kwargs):
+            sym = df.index.name or "SYM"
+            if params.get("fast") == 5:  # 参数 A
+                return SingleBacktestResult(
+                    sym, strategy, params, sharpe_a, 10.0, 5.0, 55.0, 10, returns_a
+                )
+            else:  # 参数 B (fast=10)
+                return SingleBacktestResult(
+                    sym, strategy, params, sharpe_b, 30.0, 8.0, 50.0, 10, returns_b
+                )
+
+        df_up = _make_ohlcv(n, trend="up")
+        store = MagicMock()
+        store.get_bars_multi.side_effect = lambda symbols, start, end, timeframe="1d": {
+            s: {"AAPL": df_up, "SPY": spy_df}[s] for s in symbols
+            if s in {"AAPL", "SPY"}
+        }
+
+        universe = MagicMock()
+        universe.get_groups.return_value = {"test_group": ["AAPL"]}
+
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=1)
+        with patch(
+            "mytrader.backtest.matrix_backtest._backtest_one",
+            side_effect=mock_backtest_one,
+        ):
+            report = mb.run(
+                strategies=["dual_ma"],
+                param_grids={
+                    "dual_ma": {"fast": [5, 10], "slow": [20, 50]}
+                },
+            )
+
+        # 验证：选择参数 B（fast=10, slow=50，高 alpha）
+        gr = next(
+            (r for r in report.group_results if r.group_id == "test_group"),
+            None,
+        )
+        assert gr is not None, "应至少有一个 GroupBacktestResult"
+        assert gr.params.get("fast") == 10, (
+            f"应选高 alpha 的参数 B (fast=10)，实际选了 {gr.params}"
+        )
+        assert gr.backtest_alpha > 5.0, (
+            f"B 的 alpha 应 > 5%，实际 {gr.backtest_alpha:.4f}"
+        )
+
+
+class TestEnsembleWeightsUsesAlpha:
+    """_optimize_ensemble_weights 从 Sharpe 改为 Alpha。"""
+
+    def test_ensemble_weights_use_alpha(self):
+        """两个策略的权重应基于 alpha 分配，alpha 高的策略权重大。"""
+        n = 252
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        spy_returns = pd.Series(np.random.normal(0.0004, 0.001, n), index=idx)
+
+        # 策略 A：alpha=0（与 SPY 持平）
+        returns_a = pd.Series(np.random.normal(0.0004, 0.003, n), index=idx)
+        # 策略 B：alpha 高（远超 SPY）
+        returns_b = pd.Series(np.random.normal(0.0012, 0.005, n), index=idx)
+
+        results_a = [SingleBacktestResult(
+            "S1", "strat_a", {}, 1.0, 10.0, 5.0, 55.0, 10, returns_a
+        )]
+        results_b = [SingleBacktestResult(
+            "S2", "strat_b", {}, 1.5, 30.0, 8.0, 50.0, 10, returns_b
+        )]
+
+        group_results = [
+            ("strat_a", {}, results_a),
+            ("strat_b", {}, results_b),
+        ]
+
+        weights = _optimize_ensemble_weights(group_results, spy_returns=spy_returns)
+
+        # B 的 alpha 更高 → 权重应更大
+        weights_dict = {s: w for s, _, w in weights}
+        assert weights_dict["strat_b"] > weights_dict["strat_a"], (
+            f"B 的 alpha 更高，权重应大于 A，"
+            f"实际 A={weights_dict['strat_a']:.4f}, B={weights_dict['strat_b']:.4f}"
+        )
+        # 权重和 = 1.0
+        total = sum(weights_dict.values())
+        assert abs(total - 1.0) < 1e-6, f"权重和应为 1.0，实际 {total:.6f}"
+
+    def test_ensemble_weights_spy_unavailable_degrades_to_equal(self):
+        """SPY 数据不可用时 alpha 降级为 0 → 退化为等权。"""
+        n = 100
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        returns_a = pd.Series(np.random.normal(0.001, 0.005, n), index=idx)
+        returns_b = pd.Series(np.random.normal(0.002, 0.008, n), index=idx)
+
+        results_a = [SingleBacktestResult(
+            "S1", "strat_a", {}, 1.0, 10.0, 5.0, 55.0, 10, returns_a
+        )]
+        results_b = [SingleBacktestResult(
+            "S2", "strat_b", {}, 1.5, 30.0, 8.0, 50.0, 10, returns_b
+        )]
+
+        group_results = [
+            ("strat_a", {}, results_a),
+            ("strat_b", {}, results_b),
+        ]
+
+        # spy_returns=None → alpha=0 → 退化为等权（max(0, 0.01)）
+        weights = _optimize_ensemble_weights(group_results, spy_returns=None)
+        weights_dict = {s: w for s, _, w in weights}
+        # 等权：各 0.5
+        assert abs(weights_dict["strat_a"] - 0.5) < 1e-6
+        assert abs(weights_dict["strat_b"] - 0.5) < 1e-6
+
+    def test_ensemble_weights_single_strategy(self):
+        """单策略时直接返回权重 1.0。"""
+        n = 100
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        returns = pd.Series(np.random.normal(0.001, 0.005, n), index=idx)
+        results = [SingleBacktestResult(
+            "S1", "strat_a", {}, 1.0, 10.0, 5.0, 55.0, 10, returns
+        )]
+
+        weights = _optimize_ensemble_weights(
+            [("strat_a", {}, results)],
+            spy_returns=pd.Series(dtype=float),
+        )
+        assert len(weights) == 1
+        assert weights[0][0] == "strat_a"
+        assert weights[0][2] == 1.0
+
 

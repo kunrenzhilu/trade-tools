@@ -80,7 +80,7 @@ class TestIndicators:
 
 class TestStrategyRegistry:
     def test_all_strategies_registered(self):
-        expected = {"dual_ma", "rsi_mean_revert", "bollinger_band", "macd_cross"}
+        expected = {"dual_ma", "rsi_mean_revert", "rsi_trend_filter", "bollinger_band", "macd_cross"}
         assert expected.issubset(set(STRATEGY_REGISTRY.keys()))
 
     def test_strategy_callable(self):
@@ -283,6 +283,65 @@ class TestAllStrategiesQuality:
         close = make_trending_close(100)
         signal = macd_signal(close, fast=5, slow=35, signal_period=5)
         assert set(signal.unique()).issubset({-1, 0, 1})
+
+
+# ---------------------------------------------------------------------------
+# RSI Trend Filter 策略测试（迭代 #8）
+# ---------------------------------------------------------------------------
+
+class TestRSITrendFilter:
+    """T1-T5: RSI 趋势过滤策略测试。"""
+
+    def test_signal_values(self):
+        """T1: 信号值仅在 {-1, 0, 1} 范围内。"""
+        from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
+        close = make_oscillating_close(300)
+        signal = rsi_trend_filter_signal(close)
+        assert set(signal.unique()).issubset({-1, 0, 1})
+
+    def test_custom_params(self):
+        """T2: 非默认参数正常工作。"""
+        from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
+        close = make_oscillating_close(300)
+        signal = rsi_trend_filter_signal(
+            close, rsi_period=7, oversold=25.0, overbought=75.0, trend_period=100,
+        )
+        assert set(signal.unique()).issubset({-1, 0, 1})
+
+    def test_uptrend_only_buy(self):
+        """T3: 强上升趋势中不产生 SELL 信号。"""
+        from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
+        n = 300
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        # 强上升趋势：价格持续上涨，始终在 SMA(200) 上方
+        rng = np.random.default_rng(42)
+        prices = 100.0 * np.exp(np.cumsum(0.005 + 0.005 * rng.standard_normal(n)))
+        close = pd.Series(prices, index=idx, name="close")
+        signal = rsi_trend_filter_signal(close, oversold=35.0, overbought=65.0)
+        # 上升趋势中 SELL 被 SMA 过滤，不应出现 -1
+        unique_vals = set(signal.values)
+        assert -1 not in unique_vals, f"Found SELL signal in uptrend: {unique_vals}"
+
+    def test_downtrend_only_sell(self):
+        """T4: 强下降趋势中不产生 BUY 信号。"""
+        from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
+        n = 300
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        # 强下降趋势：价格持续下跌，始终在 SMA(200) 下方
+        rng = np.random.default_rng(42)
+        prices = 100.0 * np.exp(np.cumsum(-0.005 + 0.005 * rng.standard_normal(n)))
+        close = pd.Series(prices, index=idx, name="close")
+        signal = rsi_trend_filter_signal(close, oversold=35.0, overbought=65.0)
+        # 下降趋势中 BUY 被 SMA 过滤，不应出现 +1
+        unique_vals = set(signal.values)
+        assert 1 not in unique_vals, f"Found BUY signal in downtrend: {unique_vals}"
+
+    def test_insufficient_data(self):
+        """T5: 数据不足 trend_period 时返回全零（不崩溃）。"""
+        from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
+        close = make_oscillating_close(50)
+        signal = rsi_trend_filter_signal(close)
+        assert (signal == 0).all()
 
 
 # ---------------------------------------------------------------------------

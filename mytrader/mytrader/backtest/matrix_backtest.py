@@ -390,6 +390,163 @@ def _backtest_one(
         return None
 
 
+def _backtest_batch(
+    data: dict[str, pd.DataFrame],
+    strategy_name: str,
+    params: dict,
+    init_cash: float = 100_000.0,
+    fees: float = 0.001,
+    slippage: float = 0.001,
+) -> list[SingleBacktestResult]:
+    """对组内所有标的批量执行回测（迭代 #10 新增）。
+
+    核心优化：用一次 vbt.Portfolio.from_signals 处理组内所有标的，
+    替代 `_backtest_one` 的 for-symbol 循环。调用次数从 O(N 标的)
+    降为 O(1)，预计 10-20x 提速（spec §1）。
+
+    实现要点：
+        1. 逐标的调用策略函数（保持与 `_backtest_one` 一致的调用语义：
+           先尝试 `strategy_fn(close, df=df, **params)`，TypeError 时
+           回退到 `strategy_fn(close, **params)`）。策略函数本身不改。
+        2. 构建列式矩阵（每列一个标的），用一次 vbt 调用回测所有标的。
+           vbt 1.0+ 的列分组语义保证每列独立结算 P&L。
+        3. 通过 `pf[sym]` 提取每列的 stats/daily_returns，输出格式与
+           `_backtest_one` 完全一致，下游聚合代码无需修改。
+
+    对齐策略：
+        - 用 `pd.DataFrame(dict)` 构造时自动 outer-join 时间索引，
+          缺失值填 NaN。
+        - vbt 对 NaN close 的处理：内部 fillna 为 0 收益率，等价于
+          "该标的此日期不交易"。当标的在样本外日期缺失时（如退市、
+          新上市），其 stats 仍按其有效日期区间计算。
+        - 在美股实际场景中所有标的共享交易日历，日期对齐天然成立，
+          不会有大量 NaN。
+
+    Args:
+        data:          {symbol: OHLCV DataFrame} 字典
+        strategy_name: 策略名
+        params:        策略参数
+        init_cash:     初始资金（vbt 给每列分配独立的 init_cash）
+        fees:          手续费率
+        slippage:      滑点率
+
+    Returns:
+        SingleBacktestResult 列表（与 `_backtest_one` 输出格式一致）。
+        数据不足 / 策略异常的标的会被跳过（不返回 None，不抛异常）。
+        空数据时返回空列表。
+    """
+    strategy_fn = STRATEGY_REGISTRY.get(strategy_name)
+    if strategy_fn is None:
+        return []
+
+    # 1. 逐标的调用策略函数，构建 signal / close / open 列
+    signal_columns: dict[str, pd.Series] = {}
+    close_columns: dict[str, pd.Series] = {}
+    open_columns: dict[str, pd.Series] = {}
+
+    for sym, df in data.items():
+        if df is None or df.empty or len(df) < 30:
+            continue
+        close = df["close"]
+        if "open" in df.columns:
+            open_ = df["open"]
+            open_columns[sym] = open_
+        else:
+            open_ = None
+
+        # 调用策略（与 _backtest_one 一致的 try/except 语义）
+        try:
+            sig = strategy_fn(close, df=df, **params)
+        except TypeError:
+            sig = strategy_fn(close, **params)
+        except Exception as e:
+            logger.debug(
+                f"[backtest_batch] {strategy_name}({params}) {sym} failed: {e}"
+            )
+            continue
+
+        signal_columns[sym] = sig
+        close_columns[sym] = close
+
+    if not signal_columns:
+        return []
+
+    # 2. 构建矩阵（自动 outer-join 索引，缺失值填 NaN）
+    close_matrix = pd.DataFrame(close_columns)
+    signal_matrix = pd.DataFrame(signal_columns)
+    has_open = bool(open_columns)
+    open_matrix = pd.DataFrame(open_columns) if has_open else None
+
+    # 3. 一次 vbt 调用处理所有标的
+    entries = signal_matrix == 1
+    exits = signal_matrix == -1
+
+    pf_kwargs: dict[str, Any] = dict(
+        entries=entries,
+        exits=exits,
+        init_cash=init_cash,
+        fees=fees,
+        slippage=slippage,
+        size=0.95,
+        size_type="Percent",
+        freq="D",
+    )
+
+    try:
+        if has_open:
+            pf = vbt.Portfolio.from_signals(
+                close=close_matrix, open=open_matrix, **pf_kwargs
+            )
+        else:
+            pf = vbt.Portfolio.from_signals(close_matrix, **pf_kwargs)
+    except Exception as e:
+        logger.warning(
+            f"[backtest_batch] {strategy_name}({params}) vbt call failed: {e} "
+            f"— falling back to per-symbol _backtest_one"
+        )
+        # 回滚方案：批量失败时退化为逐标的回测，保证回测不中断
+        results: list[SingleBacktestResult] = []
+        for sym, df in data.items():
+            if df is None or df.empty or len(df) < 30:
+                continue
+            df = df.copy()
+            df.index.name = sym
+            r = _backtest_one(
+                df, strategy_name, params, init_cash, fees, slippage
+            )
+            if r is not None:
+                results.append(r)
+        return results
+
+    # 4. 提取 per-symbol 结果（与 _backtest_one 输出格式一致）
+    results = []
+    for sym in signal_matrix.columns:
+        try:
+            pf_sym = pf[sym]
+            stats = pf_sym.stats()
+            daily_returns = pf_sym.returns()
+            results.append(SingleBacktestResult(
+                symbol=sym,
+                strategy=strategy_name,
+                params=params,
+                sharpe=_safe_float(stats.get("Sharpe Ratio")),
+                total_return_pct=_safe_float(stats.get("Total Return [%]")),
+                max_drawdown_pct=_safe_float(stats.get("Max Drawdown [%]")),
+                win_rate_pct=_safe_float(stats.get("Win Rate [%]")),
+                total_trades=int(_safe_float(stats.get("Total Trades"), default=0.0)),
+                daily_returns=daily_returns,
+                sortino=_compute_sortino(daily_returns),
+            ))
+        except Exception as e:
+            logger.debug(
+                f"[backtest_batch] {strategy_name}({params}) {sym} "
+                f"stats extraction failed: {e}"
+            )
+            continue
+
+    return results
+
+
 def _portfolio_sharpe_from_results(results: list[SingleBacktestResult]) -> float:
     """等权合并组内日收益率序列，计算组合 Sharpe。
 
@@ -518,6 +675,9 @@ def _backtest_with_params_on_period(
     用于 Walk-Forward 验证期：用训练期产出的 best params 在验证期回测，
     不再做参数搜索。返回原始日收益率列表，由调用方聚合为整体 portfolio。
 
+    迭代 #10 变更：用 `_backtest_batch` 替代 for-symbol 循环，
+    每个策略×参数组合一次 vbt 调用，加速 Walk-Forward 验证期回测。
+
     Args:
         mb:       MatrixBacktest 实例（复用其 store/init_cash/fees/slippage）
         symbols:  该组的标的列表
@@ -541,17 +701,13 @@ def _backtest_with_params_on_period(
         params = w.get("params", {})
         if not strategy or strategy not in STRATEGY_REGISTRY:
             continue
-        for sym in symbols:
-            df = data.get(sym, pd.DataFrame())
-            if df.empty:
-                continue
-            df = df.copy()
-            df.index.name = sym
-            r = _backtest_one(
-                df, strategy, params,
-                mb._init_cash, mb._fees, mb._slippage,
-            )
-            if r is not None and not r.daily_returns.empty:
+        # 迭代 #10：一次 batch 调用处理组内所有标的
+        results = _backtest_batch(
+            data, strategy, params,
+            mb._init_cash, mb._fees, mb._slippage,
+        )
+        for r in results:
+            if not r.daily_returns.empty:
                 all_returns.append(r.daily_returns)
     return all_returns
 
@@ -862,7 +1018,13 @@ class MatrixBacktest:
             - top-K 排序：从 Sortino 改为 Alpha
             - 新增 Sortino > 0.5 最低质量门槛（二级过滤，可放宽）
             - ensemble weights：从 Sharpe 改为 Alpha
+        迭代 #10 变更：
+            - 用 `_backtest_batch` 替代 for-symbol 循环（10-20x 提速）
+            - 每组 / 每策略增加进度耗时日志
         """
+        import time
+
+        group_start = time.time()
 
         # 1. 读取组内所有标的数据
         data = self._store.get_bars_multi(symbols, start, end)
@@ -873,10 +1035,20 @@ class MatrixBacktest:
         # 迭代 #9：获取 SPY 同期日收益率用于 alpha 计算（一次获取，组内复用）
         spy_returns = self._get_spy_returns(start, end)
 
+        valid_symbol_count = sum(
+            1 for df in data.values() if df is not None and not df.empty and len(df) >= 30
+        )
+        logger.info(
+            f"[MatrixBacktest] {group_id}: start — "
+            f"{len(strategies)} strategies × {valid_symbol_count} valid symbols"
+        )
+
         # 2. 对每个策略 × 每组参数，按 alpha 选最优参数
         group_results: list[tuple[str, dict, list[SingleBacktestResult]]] = []
 
         for strategy in strategies:
+            strat_start = time.time()
+
             # ⚠️ 早期检测未注册策略名（迭代 #1 修复"策略名拼写错误被静默跳过"的 bug）
             # 之前 _backtest_one 内部静默 return None，导致 main.py 误用 "rsi"/"macd"/"bollinger"
             # 简称 6 天未被发现。改为 WARNING 级日志 + continue。
@@ -901,19 +1073,12 @@ class MatrixBacktest:
             best_results: list[SingleBacktestResult] = []
 
             for params in param_combos:
-                # 对组内每只标的回测
-                results = []
-                for sym in symbols:
-                    df = data.get(sym, pd.DataFrame())
-                    if df.empty:
-                        continue
-                    df.index.name = sym  # 方便 _backtest_one 使用
-                    r = _backtest_one(
-                        df, strategy, params,
-                        self._init_cash, self._fees, self._slippage
-                    )
-                    if r is not None:
-                        results.append(r)
+                # 迭代 #10：用 _backtest_batch 一次处理组内所有标的
+                # 替代原 for sym in symbols: _backtest_one(...) 的逐标的循环
+                results = _backtest_batch(
+                    data, strategy, params,
+                    self._init_cash, self._fees, self._slippage,
+                )
 
                 if not results:
                     continue
@@ -957,8 +1122,17 @@ class MatrixBacktest:
                     backtest_alpha=best_alpha,
                 ))
 
+            logger.info(
+                f"[MatrixBacktest] {group_id}: {strategy} done in "
+                f"{time.time() - strat_start:.1f}s "
+                f"({len(param_combos)} param combos × {valid_symbol_count} symbols)"
+            )
+
         if not group_results:
-            logger.warning(f"[MatrixBacktest] {group_id}: no valid results")
+            logger.warning(
+                f"[MatrixBacktest] {group_id}: no valid results "
+                f"(elapsed {time.time() - group_start:.1f}s)"
+            )
             return []
 
         # 3. 迭代 #9：DD 硬约束 + Sortino 门槛 + Alpha 排序选 Top-K
@@ -1072,6 +1246,12 @@ class MatrixBacktest:
                 # 该组权重的可靠性，作为风险信号标记
                 "backtest_dd_status": backtest_dd_status,
             })
+
+        logger.info(
+            f"[MatrixBacktest] {group_id}: all strategies done in "
+            f"{time.time() - group_start:.1f}s "
+            f"(top-{self._top_k} selected, dd_constrained={dd_constrained})"
+        )
 
         return weights_list
 

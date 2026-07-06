@@ -1092,17 +1092,21 @@ class TestAlphaBasedTopKSelection:
             f"测试前提失败：B 的 alpha({alpha_b:.4f}) 应 > A({alpha_a:.4f})"
         )
 
-        # Mock _backtest_one 返回受控结果
-        def mock_backtest_one(df, strategy, params, *args, **kwargs):
-            sym = df.index.name or "SYM"
-            if strategy == "dual_ma":
-                return SingleBacktestResult(
-                    sym, strategy, params, 1.0, 10.0, 5.0, 55.0, 10, returns_a
-                )
-            else:  # rsi_mean_revert
-                return SingleBacktestResult(
-                    sym, strategy, params, 1.0, 30.0, 8.0, 50.0, 10, returns_b
-                )
+        # Mock _backtest_batch 返回受控结果（迭代 #10：_run_group 改用 batch）
+        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
+            results = []
+            for sym, df in data.items():
+                if df is None or df.empty or len(df) < 30:
+                    continue
+                if strategy_name == "dual_ma":
+                    results.append(SingleBacktestResult(
+                        sym, strategy_name, params, 1.0, 10.0, 5.0, 55.0, 10, returns_a
+                    ))
+                else:  # rsi_mean_revert
+                    results.append(SingleBacktestResult(
+                        sym, strategy_name, params, 1.0, 30.0, 8.0, 50.0, 10, returns_b
+                    ))
+            return results
 
         # 构造 mock store：返回 SPY + 普通上涨数据
         df_up = _make_ohlcv(n, trend="up")
@@ -1120,8 +1124,8 @@ class TestAlphaBasedTopKSelection:
         mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=1)
 
         with patch(
-            "mytrader.backtest.matrix_backtest._backtest_one",
-            side_effect=mock_backtest_one,
+            "mytrader.backtest.matrix_backtest._backtest_batch",
+            side_effect=mock_backtest_batch,
         ):
             report = mb.run(
                 strategies=["dual_ma", "rsi_mean_revert"],
@@ -1194,16 +1198,20 @@ class TestAlphaBasedTopKSelection:
             f"B 应为 Sortino > 0.5 的正常策略，实际 {sortino_b:.4f}"
         )
 
-        def mock_backtest_one(df, strategy, params, *args, **kwargs):
-            sym = df.index.name or "SYM"
-            if strategy == "dual_ma":
-                return SingleBacktestResult(
-                    sym, strategy, params, 0.5, 15.0, 10.0, 50.0, 5, returns_a
-                )
-            else:  # rsi_mean_revert
-                return SingleBacktestResult(
-                    sym, strategy, params, 1.0, 20.0, 5.0, 55.0, 10, returns_b
-                )
+        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
+            results = []
+            for sym, df in data.items():
+                if df is None or df.empty or len(df) < 30:
+                    continue
+                if strategy_name == "dual_ma":
+                    results.append(SingleBacktestResult(
+                        sym, strategy_name, params, 0.5, 15.0, 10.0, 50.0, 5, returns_a
+                    ))
+                else:  # rsi_mean_revert
+                    results.append(SingleBacktestResult(
+                        sym, strategy_name, params, 1.0, 20.0, 5.0, 55.0, 10, returns_b
+                    ))
+            return results
 
         df_up = _make_ohlcv(n, trend="up")
         store = MagicMock()
@@ -1217,8 +1225,8 @@ class TestAlphaBasedTopKSelection:
 
         mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=1)
         with patch(
-            "mytrader.backtest.matrix_backtest._backtest_one",
-            side_effect=mock_backtest_one,
+            "mytrader.backtest.matrix_backtest._backtest_batch",
+            side_effect=mock_backtest_batch,
         ):
             report = mb.run(
                 strategies=["dual_ma", "rsi_mean_revert"],
@@ -1332,11 +1340,15 @@ class TestAlphaBasedTopKSelection:
         # 验证前提：Sortino < 0.5（垃圾门槛）
         assert _compute_sortino(returns_garbage) < MIN_SORTINO_THRESHOLD
 
-        def mock_backtest_one(df, strategy, params, *args, **kwargs):
-            sym = df.index.name or "SYM"
-            return SingleBacktestResult(
-                sym, strategy, params, 0.3, 5.0, 10.0, 50.0, 3, returns_garbage
-            )
+        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
+            results = []
+            for sym, df in data.items():
+                if df is None or df.empty or len(df) < 30:
+                    continue
+                results.append(SingleBacktestResult(
+                    sym, strategy_name, params, 0.3, 5.0, 10.0, 50.0, 3, returns_garbage
+                ))
+            return results
 
         df_up = _make_ohlcv(n, trend="up")
         store = MagicMock()
@@ -1355,8 +1367,8 @@ class TestAlphaBasedTopKSelection:
         mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=1)
         try:
             with patch(
-                "mytrader.backtest.matrix_backtest._backtest_one",
-                side_effect=mock_backtest_one,
+                "mytrader.backtest.matrix_backtest._backtest_batch",
+                side_effect=mock_backtest_batch,
             ):
                 report = mb.run(
                     strategies=["dual_ma"],
@@ -1513,17 +1525,21 @@ class TestAlphaBasedTopKSelection:
             f"B 的 alpha({alpha_b:.4f}) 应 > A({alpha_a:.4f})"
         )
 
-        # 根据参数选择返回不同收益
-        def mock_backtest_one(df, strategy, params, *args, **kwargs):
-            sym = df.index.name or "SYM"
-            if params.get("fast") == 5:  # 参数 A
-                return SingleBacktestResult(
-                    sym, strategy, params, sharpe_a, 10.0, 5.0, 55.0, 10, returns_a
-                )
-            else:  # 参数 B (fast=10)
-                return SingleBacktestResult(
-                    sym, strategy, params, sharpe_b, 30.0, 8.0, 50.0, 10, returns_b
-                )
+        # 根据参数选择返回不同收益（迭代 #10：mock _backtest_batch）
+        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
+            results = []
+            for sym, df in data.items():
+                if df is None or df.empty or len(df) < 30:
+                    continue
+                if params.get("fast") == 5:  # 参数 A
+                    results.append(SingleBacktestResult(
+                        sym, strategy_name, params, sharpe_a, 10.0, 5.0, 55.0, 10, returns_a
+                    ))
+                else:  # 参数 B (fast=10)
+                    results.append(SingleBacktestResult(
+                        sym, strategy_name, params, sharpe_b, 30.0, 8.0, 50.0, 10, returns_b
+                    ))
+            return results
 
         df_up = _make_ohlcv(n, trend="up")
         store = MagicMock()
@@ -1537,8 +1553,8 @@ class TestAlphaBasedTopKSelection:
 
         mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=1)
         with patch(
-            "mytrader.backtest.matrix_backtest._backtest_one",
-            side_effect=mock_backtest_one,
+            "mytrader.backtest.matrix_backtest._backtest_batch",
+            side_effect=mock_backtest_batch,
         ):
             report = mb.run(
                 strategies=["dual_ma"],

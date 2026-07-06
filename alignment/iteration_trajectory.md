@@ -1022,3 +1022,119 @@ Full pytest: 602 passed, 16 deselected, 0 failed, 103 warnings in 15.47s
 > - CodeBuddy 自行更新了 trajectory ✅
 
 ---
+
+## 迭代 #10 — vectorbt Batch Backtest Optimization
+
+- **日期**: 2026-07-05 UTC
+- **类型**: 回测核心路径性能优化（中高风险）
+- **变更摘要**: 将 MatrixBacktest 和 Walk-Forward 的 for-symbol 逐标的循环改为 vectorbt 矩阵化调用（`_backtest_batch`），单次 `vbt.Portfolio.from_signals` 处理组内所有标的，预计 10-20x 提速；新增进度日志；补充 24 个数值一致性测试
+- **状态**: passed
+- **执行时长**: 1 轮对话（手动开发）
+- **测试数**: 602 → 626（+24 新测试用例）
+
+### 背景
+
+Iter #7 实测 `--reoptimize` 耗时 ~4 小时。瓶颈分析显示 vbt 调用次数 ~200,000 次（40,000 次/组 × 4 轮 WF），每次 30-50ms。当前代码把 vectorbt 当成"单标的回测器在 for 循环里调"，完全没用到 vectorbt 的矩阵化特性。
+
+### 变更详情
+
+**P0: 新增 `_backtest_batch()` 函数** (`matrix_backtest.py`)
+- 一次 `vbt.Portfolio.from_signals` 处理组内所有标的，替代 for-symbol 循环
+- vbt 调用次数从 ~40,000/组降到 ~660/组（110 参数 × 6 组），**60x 减少**
+- 实现要点：
+  - 逐标的调用策略函数（保持 `_backtest_one` 的 try/except TypeError 语义）
+  - 构建 close/open 矩阵（`pd.DataFrame` 自动 outer-join 时间索引）
+  - 一次 vbt 调用，通过 `pf[sym]` 提取 per-symbol stats/daily_returns
+  - 输出格式与 `_backtest_one` 完全一致，下游聚合代码无需修改
+- 安全 fallback：vbt 异常时退化为 `_backtest_one` 逐标的回测，保证不阻塞
+
+**P0: 修改 `_run_group()` 使用 batch** (`matrix_backtest.py::_run_group`)
+- 替换 `for sym in symbols: _backtest_one(...)` 为 `_backtest_batch(data, strategy, params, ...)`
+- top-K 选择 / DD 过滤 / Alpha 排序 / ensemble 权重逻辑全部保持不变
+- 迭代 #9 的所有逻辑（三级 fallback、Sortino 门槛、Alpha 排序）完全不动
+
+**P0: 修改 Walk-Forward 使用 batch** (`matrix_backtest.py::_backtest_with_params_on_period`)
+- 替换 for-symbol 循环为 `_backtest_batch`
+- Walk-Forward 4 轮验证期回测同样提速
+
+**P1: 进度日志** (`matrix_backtest.py::_run_group`)
+- 每组开始时输出 `start — N strategies × M valid symbols`
+- 每策略完成时输出 `done in X.Xs (N param combos × M symbols)`
+- 每组完成时输出 `all strategies done in X.Xs (top-K selected, dd_constrained=...)`
+- 使用 `time.time()` 计时，不影响性能
+
+**P2: 测试** (`tests/test_batch_backtest.py` 新文件)
+- 新增 4 个测试类共 24 个测试：
+  - `TestBatchConsistencyAllStrategies` (10): 5 策略 × 2 参数 batch vs single 数值一致性（np.allclose, rtol=1e-6）
+  - `TestBatchEdgeCases` (9): 数据不足跳过、空 DataFrame 跳过、单标的、单标的一致性、日期不对齐、空数据、未知策略、无 open 列、symbol 顺序保持
+  - `TestBatchOutputFormat` (2): 字段完整、各标的 daily_returns 独立
+  - `TestRunGroupBatchIntegration` (2): _run_group 产出权重、进度日志
+  - `TestWalkForwardBatchIntegration` (1): Walk-Forward 2 轮产出有效报告
+- 同时更新 `test_matrix_backtest.py` 中 4 个 mock-based 测试（从 patch `_backtest_one` 改为 patch `_backtest_batch`）
+
+### 验证结果
+
+```
+Targeted tests:
+  tests/test_batch_backtest.py → 24 passed
+  tests/test_matrix_backtest.py → 75 passed (4 mock-based tests updated)
+
+Full pytest (excluding live tests):
+  626 passed, 0 failed, 103 warnings in 21.41s
+```
+
+### 数值一致性验证
+
+- 所有 5 策略（dual_ma, rsi_mean_revert, rsi_trend_filter, macd_cross, bollinger_band）× 2 参数组合
+- `daily_returns` 严格一致：`np.testing.assert_allclose(rtol=1e-6, atol=1e-8)`
+- `sharpe` / `total_return_pct` / `max_drawdown_pct` / `win_rate_pct` 允许 1e-4 浮点误差（vbt 内部计算路径差异）
+- `sortino` 严格一致（从 daily_returns 派生）
+- `total_trades` 严格一致
+
+### Constitution 合规
+- ✅ 未突破 DD 20% 约束（DD 过滤逻辑完全不变）
+- ✅ 测试覆盖率提升（+24 测试，602 → 626）
+- ✅ 未修改策略代码 / 指标代码 / Alpha 排序逻辑（迭代 #9 改动不动）
+- ✅ 未缩短回测窗口（仍 5 年）
+- ✅ 决策可解释（batch 与 single 数值一致，top-K 选择结果不变）
+- ✅ 未引入 RL / 未引入不安全依赖
+- ✅ 未触发真实交易
+- ✅ 文档与代码同步（07-backtest-module.md + CODEBUDDY.md + trajectory）
+
+### Experience Learned
+- **vectorbt 矩阵化是核心优化**：一次 `from_signals` 处理 N 个标的比 N 次单标的调用快得多，且 vbt 内部并行计算
+- **`pf[sym]` 提取 per-symbol 结果**：vbt 1.0+ 的列分组语义保证每列独立结算 P&L，stats 提取与单标的一致
+- **NaN 对齐处理**：`pd.DataFrame(dict)` 自动 outer-join 索引，vbt 对 NaN close 内部处理为"不交易"。美股实际场景中所有标的共享交易日历，日期对齐天然成立
+- **mock 测试需要更新**：当被测函数的内部实现改变（从 `_backtest_one` 改为 `_backtest_batch`），mock patch 路径也需要同步更新。这提醒 mock 是实现耦合的，应谨慎使用
+- **loguru 日志捕获**：pytest 的 `caplog` fixture 不捕获 loguru 日志，需用 `logger.add(lambda m: msgs.append(str(m)), level=...)` 模式
+- **安全 fallback 设计**：batch 路径有异常时退化为 `_backtest_one` 逐标的回测，保证回测不中断（虽然性能下降，但功能正确）
+
+### 后续建议
+1. **性能验证**（Meta-Agent 验收阶段）：运行小规模 reoptimize（1 个组），对比新旧耗时。预期单组从 ~6 分钟降到 < 1 分钟
+2. **完整 reoptimize 测试**：验证 4 小时 → 预期 15-30 分钟
+3. **joblib 并行**（spec §3 明确不做）：batch 验证稳定后，可考虑组间并行（6 组并行）
+4. **进一步优化**：vbt 支持 `param_grid` 内置参数网格搜索，未来可考虑用 vbt 原生网格替代 for-params 循环
+
+### L7 流水线状态
+```
+✅ Backtest (≥5年, alpha-based selection, batch-optimized)
+✅ Walk-Forward (4轮, 自动继承 alpha 排序, batch-optimized)
+✅ Portfolio Backtest | ✅ Paper Trading Integrity
+✅ Harness Reliability | ✅ SignalRanker Sortino Priority
+✅ Strategy Diversity (5 策略 pool)
+✅ Alpha-Based Selection (迭代 #9 完成)
+🔄 Batch Backtest Optimization (迭代 #10 完成，待 --reoptimize 性能验证)
+⬜ Paper Trade ≥1月 | ⬜ Live
+```
+
+---
+
+> **Orchestrator 验证记录** (自动追加)
+> - 迭代状态: passed
+> - 测试: 0 passed, 0 failed
+> - 违规: 0 条
+> - 高风险文件: 0 个
+> - 测试数变化: 602 → 626
+> - CodeBuddy 自行更新了 trajectory ✅
+
+---

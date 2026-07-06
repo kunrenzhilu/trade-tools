@@ -337,3 +337,51 @@
 - **决策结果**: SPY 不可用时 alpha=0.0，所有候选 alpha 相等 → 稳定排序保留原顺序 → ensemble 退化为等权。与迭代 #7 降级策略一致。
 
 ---
+
+### [2026-07-05 UTC] 迭代 #10 — _backtest_batch vbt 异常时的安全 fallback
+
+- **困境描述**: `_backtest_batch` 用一次 `vbt.Portfolio.from_signals` 处理组内所有标的。如果 vbt 调用因数据问题（如全 NaN、shape 不一致）抛异常，整个组的回测会失败，阻塞 `--reoptimize`。spec §8 要求"回滚方案：如果 batch 版本数值不一致且无法修复，保留 `_backtest_one` 作为 fallback"。
+
+- **涉及 AI Constitution 条款**:
+  - L7: 验证流水线 — 回测不能因实现问题阻塞
+  - L1: KPI 必须可解释 — 异常时不应静默失败
+  - L8: 重大决策须通知 — 但 fallback 触发是降级而非"重大决策"，用 WARNING 日志即可
+
+- **决策逻辑**:
+  1. **保留 `_backtest_one` 函数**：不删除旧实现，作为 batch 失败时的 fallback
+  2. **try/except 包裹 vbt 调用**：异常时退化为逐标的 `_backtest_one`，保证回测不中断
+  3. **WARNING 日志**：`_backtest_batch vbt call failed: {e} — falling back to per-symbol _backtest_one`
+  4. **不抛异常**：fallback 后返回与 batch 相同格式的 `list[SingleBacktestResult]`，调用方无感知
+  5. **测试验证**：`test_batch_unknown_strategy` / `test_batch_empty_data` 等边界场景测试覆盖
+
+- **决策结果**: 
+  - 保留 `_backtest_one` 作为 fallback
+  - `_backtest_batch` 在 vbt 异常时 WARNING + 退化为逐标的回测
+  - 不阻塞 `--reoptimize`，不抛异常给上层
+  - 数值一致性测试验证 batch 正常路径与 single 一致，fallback 路径天然一致（就是 single）
+
+---
+
+### [2026-07-05 UTC] 迭代 #10 — mock-based 测试的 patch 路径更新
+
+- **困境描述**: `test_matrix_backtest.py` 中 4 个测试（`test_top_k_selection_uses_alpha` 等）用 `patch("mytrader.backtest.matrix_backtest._backtest_one")` 拦截回测函数返回受控结果。迭代 #10 将 `_run_group` 从调用 `_backtest_one` 改为调用 `_backtest_batch`，这些测试的 mock 失效。
+
+- **涉及 AI Constitution 条款**:
+  - L7: 测试纪律 — 测试不能因实现重构而失效
+  - L1: KPI 可解释 — mock 应验证行为，不应与实现强耦合
+
+- **决策逻辑**:
+  1. **同步更新 mock**：将 `mock_backtest_one(df, strategy, params, ...)` 改为 `mock_backtest_batch(data, strategy_name, params, ...)`，返回 `list[SingleBacktestResult]`
+  2. **保留测试意图**：测试验证的是 top-K 选择 / Alpha 排序 / Sortino 过滤等行为，不是回测实现细节
+  3. **mock 签名匹配新函数**：`mock_backtest_batch(data, strategy_name, params, *args, **kwargs)` 返回列表，与 `_backtest_batch` 签名一致
+  4. **不删除 `_backtest_one` 测试**：`test_backtest_one_with_open` 等直接测试 `_backtest_one` 的保留，验证单标的回测逻辑
+
+- **决策结果**: 
+  - 4 个 mock-based 测试从 patch `_backtest_one` 改为 patch `_backtest_batch`
+  - mock 函数签名匹配 `_backtest_batch(data, strategy_name, params, ...)`
+  - 测试意图保持不变（验证 Alpha 排序、Sortino 过滤等行���）
+  - `_backtest_one` 的直接测试全部保留
+
+- **经验教训**: mock 是实现耦合的，当被测函数的内部依赖改变时，mock 需要同步更新。未来应优先用真实数据测试（如 `test_batch_backtest.py` 的数值一致性测试），减少 mock 依赖。
+
+---

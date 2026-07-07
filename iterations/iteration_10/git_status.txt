@@ -1,0 +1,5 @@
+ M alignment/decision_log.md
+ M alignment/iteration_trajectory.md
+ M mytrader/mytrader/backtest/matrix_backtest.py
+ M mytrader/tests/test_matrix_backtest.py
+?? mytrader/tests/test_batch_backtest.py

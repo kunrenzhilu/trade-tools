@@ -1,0 +1,541 @@
+diff --git a/.codebuddy/CODEBUDDY.md b/.codebuddy/CODEBUDDY.md
+index 500b59f..59c5425 100644
+--- a/.codebuddy/CODEBUDDY.md
++++ b/.codebuddy/CODEBUDDY.md
+@@ -104,7 +104,7 @@ mytrader/
+ │   ├── phase1_backtest.py
+ │   └── phase5_e2e.py           # [Phase 5] 端到端干跑脚本
+ ├── reports/                    # 回测输出（.gitignore）
+-├── tests/                      # 467 个测试
++├── tests/                      # 525 个测试（不含 live 集成测试，迭代 #4 后）
+ └── mytrader/
+     ├── data/                   # Module 01 — Data Layer ✅
+     │   ├── providers/
+@@ -123,7 +123,8 @@ mytrader/
+     │   └── matrix_runner.py    # [Phase 5] StrategyMatrixRunner
+     ├── backtest/               # Module 07 — Backtest ✅
+     │   ├── runner.py           # BacktestRunner（含 daily_returns）
+-    │   └── matrix_backtest.py  # [Phase 5] MatrixBacktest
++    │   ├── matrix_backtest.py  # [Phase 5] MatrixBacktest（含 backtest_dd_status 风险 metadata）
++    │   └── portfolio_backtest.py  # [迭代 #4] PortfolioBacktester（组合层级回测）
+     ├── signal/                 # Module 03 — Signal Filter ✅
+     │   ├── filters/
+     │   └── ranker.py           # [Phase 5] SignalRanker
+@@ -185,7 +186,7 @@ mytrader/
+ | **Phase 5** | ✅ 完成 | 85 | MarketDataStore + UniverseManager + 矩阵扫描 + 矩阵回测 + Walk-Forward |
+ | **Phase 6** | 🔲 待开发 | — | AlpacaBroker auto 端到端验证 + 对账真实集成 + 港股支持 |
+ 
+-**当前总测试数：467 passed，0 failed**
++**当前总测试数：525 passed，0 failed**（不含 5 个 IBKR live 集成测试，迭代 #4 后）
+ 
+ > 各阶段详细实现见 **[dev_records.md](.codebuddy/notes/dev_records.md)**
+ 
+diff --git a/alignment/decision_log.md b/alignment/decision_log.md
+index a3dbd2a..ee42804 100644
+--- a/alignment/decision_log.md
++++ b/alignment/decision_log.md
+@@ -101,3 +101,57 @@
+ - **决策结果 (P1.2)**: 验证期将所有组的回测日收益率按等权合并为一个 portfolio 序列，计算 Sortino 和 max DD。
+ 
+ ---
++
++### [2026-07-02 UTC] 迭代 #4 — PortfolioBacktest 复用 vs 重写 + backtest_dd_status 字段位置
++
++- **困境描述 (P0)**: spec 要求"复用现有组件，不重写 StrategyMatrixRunner/SignalRanker/CandidateSelector"。但 PortfolioBacktester 需要在每日切片数据上生成信号（防前视偏差），而 StrategyMatrixRunner.run_symbol 内部直接读 store.get_latest_n_bars——这会拿到 store 中的全量历史数据，无法限定到"截至当日"。
++
++  两种实现方式：
++  - 解读 A: 直接调用 `self._matrix_runner.run_symbol(sym)` — 简单但破坏防前视偏差（runner 读全量数据）
++  - 解读 B: 复用 runner 的策略调用逻辑（直接调 STRATEGY_REGISTRY），但用传入的切片数据 — 维持防前视偏差但代码有重复
++
++- **涉及 AI Constitution 条款**:
++  - L7: 验证流水线 — 必须保证回测防前视偏差
++  - L1: 决策可解释 — 回测结果必须可信（前视偏差会让回测过于乐观）
++  - Constitution 决策权重矩阵：正确性 > 代码 DRY
++
++- **决策逻辑 (P0)**: 采用解读 B。理由：
++  1. 防前视偏差是 Constitution L7 的硬要求，不能为了代码 DRY 而牺牲正确性
++  2. 重复的部分仅是"策略调用 + 信号有效期检查"约 20 行，不是核心逻辑
++  3. SignalRanker 和 CandidateSelector 完全复用（无重复），只有 StrategyMatrixRunner 的信号生成部分因前视偏差要求需要绕过
++  4. 未来可重构 StrategyMatrixRunner.run_symbol 支持传入数据切片参数，但这是更大的变更，本次迭代不引入
++
++- **决策结果 (P0)**: PortfolioBacktester._generate_signals 复用 STRATEGY_REGISTRY 直接调用策略函数，绕过 runner.run_symbol 的 store 读取。SignalRanker 和 CandidateSelector 完全复用。
++
++- **困境描述 (P1b)**: spec 说"在 _write_weights 中新增 backtest_dd_status 字段"。但 _write_weights 函数体只是 `json.dump(report.groups)`，真正的字段构建在 _run_group。应该在哪里添加？
++
++- **决策逻辑 (P1b)**: 在 `_run_group` 构建 weights_list 时添加 `backtest_dd_status` 字段。理由：
++  1. _write_weights 是序列化函数，不应包含业务逻辑
++  2. 在 _run_group 添加字段使 in-memory report 和 JSON 输出都包含该字段，下游消费方更灵活
++  3. 与现有 `dd_constrained` bool 字段并列，一致性好
++  4. spec 的"在 _write_weights 中新增"是结果导向（JSON 中要有此字段），不是实现位置约束
++
++- **决策结果 (P1b)**: 在 _run_group 的 weights_list 构建中添加 `backtest_dd_status` 字段，值为 `'pass'` 或 `'dd_constrained'`，与现有 `dd_constrained` bool 一致。
++
++- **困境描述 (P0.2)**: PortfolioBacktester 的 max_drawdown_pct 符号约定——正值还是负值？vectorbt 返回负值，但迭代 #2 已确定正值约定。
++
++- **决策逻辑 (P0.2)**: 沿用迭代 #2 正值约定（0.0~100.0）。理由：
++  1. 与 `matrix_backtest._portfolio_max_drawdown_from_results` 一致
++  2. 与 `GroupBacktestResult.portfolio_max_drawdown` 一致
++  3. dd_violation 判定 `max_dd > 20.0` 直观
++  4. 避免引入新的符号约定差异
++
++- **决策结果 (P0.2)**: `PortfolioBacktestResult.max_drawdown_pct` 返回正值百分数，与迭代 #2 决策一致。
++
++- **困境描述 (P0.3)**: PortfolioBacktester.run() 的回测时间窗口——用近 1 年还是与 MatrixBacktest 一样 5 年？
++
++- **决策逻辑 (P0.3)**: 近 1 年。理由：
++  1. PortfolioBacktest 是验证组合层"近期"表现的工具，不是策略参数优化（MatrixBacktest 的职责）
++  2. 1 年数据足以计算 Sharpe/Sortino/DD 等指标（252 个交易日）
++  3. 与 Walk-Forward 最后一个验证期（6 个月）形成互补：WF 是样本外验证，PortfolioBacktest 是近期样本内验证
++  4. 5 年回测会让早期信号对当前组合权重不具代表性（权重是离线优化的，会月度更新）
++
++- **决策结果 (P0.3)**: main._run_reoptimize 中调用 PortfolioBacktester.run(start=today-365, end=today-1)，回测近 1 年数据。end 用 today-1 避免当日数据未结算。
++
++---
++
+diff --git a/alignment/iteration_trajectory.md b/alignment/iteration_trajectory.md
+index 8fe78de..25b5943 100644
+--- a/alignment/iteration_trajectory.md
++++ b/alignment/iteration_trajectory.md
+@@ -356,3 +356,117 @@ CodeBuddy 因 ACP buffer 溢出未完成 `--reoptimize`，由 Meta-Agent 独立
+ 
+ ---
+ 
++
++> **Orchestrator 验证记录** (自动追加)
++> - 迭代状态: passed
++> - 测试: 0 passed, 0 failed
++> - 违规: 0 条
++> - 高风险文件: 0 个
++> - 测试数变化: 0 → 0
++> - CodeBuddy 自行更新了 trajectory ✅
++
++---
++
++## 迭代 #4 — Portfolio Backtest 模块 + per-group DD 降级为风险 metadata
++
++- **日期**: 2026-07-02 UTC
++- **类型**: 功能新增（P0+P1+P1b）+ 测试补全
++- **变更摘要**: 新增 PortfolioBacktest 模块（组合层级回测），在 main._run_reoptimize 中集成 PortfolioBacktester 输出组合层 KPI，matrix_backtest._write_weights 新增 backtest_dd_status 字段作为风险 metadata
++- **状态**: passed
++- **执行时长**: 1 轮对话（手动开发）
++- **CodeBuddy 更新数**: 3 个文件（portfolio_backtest.py 新增、matrix_backtest.py 修改、main.py 修改）+ 1 个测试文件新增
++- **违规检测**: 0 条
++
++### 变更详情
++
++**P0: PortfolioBacktest 模块新增** (`mytrader/backtest/portfolio_backtest.py`)
++- `PortfolioBacktestConfig` dataclass：initial_capital=100000, top_k=5, candidates_multiplier=2, max_single_position_pct=0.20, max_total_exposure_pct=0.80, max_sector_exposure_pct=0.40, rebalance_freq='daily', signal_valid_bars=3
++- `PortfolioBacktestResult` dataclass：包含 spec 要求的 15 个字段（start_date, end_date, initial_capital, final_equity, total_return_pct, annualized_return_pct, sharpe_ratio, sortino_ratio, max_drawdown_pct, calmar_ratio, daily_returns, equity_curve, holdings_history, dd_violation, group_exposure_history）
++- `PortfolioBacktester` 类：`__init__(store, universe, weights_file, config)` + `run(start, end) -> PortfolioBacktestResult`
++- `run()` 核心逻辑：按交易日遍历，复用 StrategyMatrixRunner 的策略调用逻辑生成信号、SignalRanker 排名、CandidateSelector 选股，模拟换仓并计算净值
++- 防前视偏差：每个交易日只用截至当日的数据切片（`bars_up_to_date`），通过 `df.index <= pd.Timestamp(trading_date)` 过滤
++- 常量 `PORTFOLIO_MAX_DRAWDOWN_PCT = 20.0`（与 matrix_backtest.MAX_PORTFOLIO_DRAWDOWN_PCT 一致）
++
++**P1: main.py 集成** (`main.py::_run_reoptimize`)
++- 在 `run_walk_forward()` 之后自动运行 `PortfolioBacktester`
++- 回测近 1 年数据（pb_end = today - 1day, pb_start = pb_end - 365days）
++- 日志格式：`[Portfolio Backtest] DD=X%, Sortino=Y, Sharpe=Z, Annual Return=W%, DD Violation=YES/NO`
++- DD 违规时输出 WARNING（Constitution L1 硬约束）
++
++**P1b: per-group DD 降级** (`matrix_backtest.py::_run_group`)
++- 在 `weights_list` 构建中新增 `backtest_dd_status` 字段
++- 值为 `'pass'` 或 `'dd_constrained'`，与现有 `dd_constrained` bool 一致
++- 现有 `dd_constrained` bool 字段和 fallback 逻辑保留不变（向下兼容）
++- 该字段作为风险 metadata 标记，下游消费方（PortfolioBacktester / 风控观测）可读此字段判断该组权重可靠性
++
++**测试新增**: `tests/test_portfolio_backtest.py`（27 个测试，10 个测试类）
++1. `TestPortfolioBacktestResultDataclass` — dataclass 字段完整性 + 类型（2 测试）
++2. `TestPortfolioBacktesterBasic` — run() 返回类型 + 3 标的×10 天流程 + 空数据（3 测试）
++3. `TestMaxDrawdownCalculation` — _compute_max_drawdown_pct 在已知序列上的正确性（4 测试）
++4. `TestRebalanceLogic` — holdings_history 记录 + 换仓卖出 + 无重复标的（3 测试）
++5. `TestSignalValidBars` — signal_valid_bars=1 严格模式 + =3 默认（2 测试）
++6. `TestDDViolation` — DD≤20% 时 False + DD>20% 时 True + 阈值常量 + 逻辑（4 测试）
++7. `TestGroupExposureHistory` — 记录完整性 + 总暴露度上限（2 测试）
++8. `TestBacktestDDStatusField` — P1b pass/dd_constrained + 一致性 + 类型（3 测试）
++9. `TestPortfolioBacktestConfig` — 默认值 + 自定义（2 测试）
++10. `TestMainIntegration` — main._run_reoptimize 包含 PortfolioBacktester 调用 + 日志格式（2 测试）
++
++### 验证结果
++```
++tests/test_portfolio_backtest.py: 27 passed
++全量测试: 525 passed (excluding live tests) / 5 failed (pre-existing IBKR live)
++基线: 498 → 525 (新增 27 测试，全部通过)
++```
++
++### Constitution 合规
++- ✅ 未突破 DD 20% 约束（新增 dd_violation 标记用于监控）
++- ✅ 测试覆盖率提升（+27 测试，全部通过）
++- ✅ 未引入黑箱策略（复用现有 StrategyMatrixRunner / SignalRanker / CandidateSelector）
++- ✅ 未引入 RL
++- ✅ 未引入不安全的第三方依赖（仅用 numpy/pandas/loguru 已有依赖）
++- ✅ 文档与代码同步（trajectory + decision_log 更新）
++- ✅ 低风险变更：不触及 risk/execution 模块的核心风控参数（P2 Guardrail 不在本次范围）
++- ✅ 防前视偏差：每个交易日只用截至当日的数据切片
++
++### Experience Learned
++- **复用 vs 重写**：PortfolioBacktester 复用 StrategyMatrixRunner 的策略调用逻辑（直接调 `STRATEGY_REGISTRY`），而非直接调用 `run_symbol()`（后者会读 store 而无法用切片数据）。这是为了正确实现"防前视偏差"——直接读 store 会拿到全量历史数据。
++- **数据切片实现**：一次性 `get_bars_multi` 拉取全量数据，再在内存中按 `df.index <= pd.Timestamp(trading_date)` 过滤。这避免了 N 次 SQL 查询，性能更好。
++- **类属性污染陷阱**：初次实现时误把 `_holdings_history` 和 `_group_exposure_history` 定义为类属性（class attribute），导致多个 PortfolioBacktester 实例间共享历史。修正为 `__init__` 中初始化的实例属性。
++- **`backtest_dd_status` 字段位置选择**：spec 说"在 _write_weights 中新增"，但实际代码中 `_write_weights` 只是 `json.dump(report.groups)`，真正的字段构建在 `_run_group`。选择在 `_run_group` 添加字段，这样 in-memory report 和 JSON 输出都包含该字段，下游消费方更灵活。
++- **DD 符号约定**：PortfolioBacktestResult.max_drawdown_pct 沿用迭代 #2 的正值约定（0.0~100.0），与 matrix_backtest._portfolio_max_drawdown_from_results 一致。
++
++### 后续建议
++
++**P2 Guardrail（不在本次范围，需用户审批）**:
++- 在 Risk Manager / Portfolio Tracker 层增加 portfolio-level DD 监控的 hard guardrail
++- 当实时 portfolio DD > 20% 时触发强制减仓
++- 这是 L8 高风险变更，需用户明确授权
++
++**PortfolioBacktest 增强方向**:
++1. 支持 `rebalance_freq='weekly'`（当前仅实现 daily）
++2. 加入交易成本（fees/slippage）模拟
++3. 加入 ATR 仓位法（当前用固定 target_position_pct）
++4. 输出 HTML 报告（与 MatrixBacktest 一致）
++5. 加入 Benchmark 对比（SPY buy-and-hold）
++
++**L7 流水线状态**:
++```
++✅ Backtest (≥5年, MatrixBacktest)
++✅ Walk-Forward (4 轮, 迭代 #3)
++✅ Portfolio Backtest (组合层验证, 迭代 #4 新增)
++❌ Paper Trade (≥1月, Gate 1 DD 约束未完全满足)
++   ← NDX_high_vol 超标需用户决策（迭代 #3 残留）
++```
++
++---
++
++
++> **Orchestrator 验证记录** (自动追加)
++> - 迭代状态: passed
++> - 测试: 0 passed, 0 failed
++> - 违规: 0 条
++> - 高风险文件: 0 个
++> - 测试数变化: 0 → 0
++> - CodeBuddy 自行更新了 trajectory ✅
++
++---
+diff --git a/mytrader/config/strategy_weights.json b/mytrader/config/strategy_weights.json
+index 74ac192..7b5ab2f 100644
+--- a/mytrader/config/strategy_weights.json
++++ b/mytrader/config/strategy_weights.json
+@@ -1,7 +1,7 @@
+ {
+   "_meta": {
+-    "generated_at": "2026-07-01T06:04:02.240068+00:00",
+-    "backtest_window": "2021-07-02 ~ 2026-07-01",
++    "generated_at": "2026-07-01T18:03:31.673858+00:00",
++    "backtest_window": "2021-07-03 ~ 2026-07-02",
+     "reoptimize_freq": "monthly",
+     "survivorship_bias_warning": "使用当前成分股回测，S&P 500 5年成分变动约100只(~20%)，均值回归组(SPX_low_vol)结果可能系统性偏高"
+   },
+@@ -14,12 +14,13 @@
+           "oversold": 30,
+           "overbought": 65
+         },
+-        "weight": 0.5298,
+-        "backtest_sharpe": 0.9806,
+-        "backtest_sortino": 1.5657,
+-        "backtest_max_drawdown": 7.3709,
+-        "backtest_win_rate": 0.7672,
+-        "dd_constrained": false
++        "weight": 0.5262,
++        "backtest_sharpe": 0.9677,
++        "backtest_sortino": 1.5506,
++        "backtest_max_drawdown": 7.3712,
++        "backtest_win_rate": 0.7719,
++        "dd_constrained": false,
++        "backtest_dd_status": "pass"
+       },
+       {
+         "strategy": "bollinger_band",
+@@ -27,12 +28,13 @@
+           "period": 25,
+           "std_dev": 1.5
+         },
+-        "weight": 0.4702,
+-        "backtest_sharpe": 0.8704,
+-        "backtest_sortino": 1.3496,
++        "weight": 0.4738,
++        "backtest_sharpe": 0.8714,
++        "backtest_sortino": 1.3511,
+         "backtest_max_drawdown": 9.3546,
+-        "backtest_win_rate": 0.7089,
+-        "dd_constrained": false
++        "backtest_win_rate": 0.7093,
++        "dd_constrained": false,
++        "backtest_dd_status": "pass"
+       }
+     ],
+     "SPX_high_vol": [
+@@ -42,12 +44,13 @@
+           "period": 15,
+           "std_dev": 1.5
+         },
+-        "weight": 0.5115,
+-        "backtest_sharpe": 0.6712,
+-        "backtest_sortino": 1.0294,
++        "weight": 0.5017,
++        "backtest_sharpe": 0.6715,
++        "backtest_sortino": 1.0298,
+         "backtest_max_drawdown": 14.898,
+         "backtest_win_rate": 0.6632,
+-        "dd_constrained": false
++        "dd_constrained": false,
++        "backtest_dd_status": "pass"
+       },
+       {
+         "strategy": "rsi_mean_revert",
+@@ -56,56 +59,47 @@
+           "oversold": 35,
+           "overbought": 75
+         },
+-        "weight": 0.4885,
+-        "backtest_sharpe": 0.6411,
+-        "backtest_sortino": 0.9435,
+-        "backtest_max_drawdown": 19.4925,
+-        "backtest_win_rate": 0.6591,
+-        "dd_constrained": false
++        "weight": 0.4983,
++        "backtest_sharpe": 0.6668,
++        "backtest_sortino": 0.9855,
++        "backtest_max_drawdown": 18.0227,
++        "backtest_win_rate": 0.6714,
++        "dd_constrained": false,
++        "backtest_dd_status": "pass"
+       }
+     ],
+     "NDX_high_vol": [
+       {
+-        "strategy": "bollinger_band",
+-        "params": {
+-          "period": 25,
+-          "std_dev": 1.5
+-        },
+-        "weight": 0.4247,
+-        "backtest_sharpe": 0.7249,
+-        "backtest_sortino": 1.1013,
+-        "backtest_max_drawdown": 21.9606,
+-        "backtest_win_rate": 0.7131,
+-        "dd_constrained": true
+-      },
+-      {
+-        "strategy": "dual_ma",
++        "strategy": "rsi_mean_revert",
+         "params": {
+-          "fast": 20,
+-          "slow": 80
++          "period": 21,
++          "oversold": 30,
++          "overbought": 75
+         },
+-        "weight": 0.5753,
+-        "backtest_sharpe": 0.982,
+-        "backtest_sortino": 1.4021,
+-        "backtest_max_drawdown": 22.2166,
+-        "backtest_win_rate": 0.372,
+-        "dd_constrained": true
++        "weight": 1.0,
++        "backtest_sharpe": 0.8218,
++        "backtest_sortino": 1.2312,
++        "backtest_max_drawdown": 18.4532,
++        "backtest_win_rate": 0.7581,
++        "dd_constrained": false,
++        "backtest_dd_status": "pass"
+       }
+     ],
+     "SPX_low_vol": [
+       {
+         "strategy": "rsi_mean_revert",
+         "params": {
+-          "period": 14,
++          "period": 21,
+           "oversold": 25,
+           "overbought": 65
+         },
+-        "weight": 0.567,
+-        "backtest_sharpe": 1.1384,
+-        "backtest_sortino": 1.8197,
+-        "backtest_max_drawdown": 4.7776,
+-        "backtest_win_rate": 0.8876,
+-        "dd_constrained": false
++        "weight": 0.5833,
++        "backtest_sharpe": 1.2177,
++        "backtest_sortino": 1.9962,
++        "backtest_max_drawdown": 1.0705,
++        "backtest_win_rate": 0.3488,
++        "dd_constrained": false,
++        "backtest_dd_status": "pass"
+       },
+       {
+         "strategy": "bollinger_band",
+@@ -113,12 +107,13 @@
+           "period": 25,
+           "std_dev": 1.5
+         },
+-        "weight": 0.433,
+-        "backtest_sharpe": 0.8696,
+-        "backtest_sortino": 1.3018,
++        "weight": 0.4167,
++        "backtest_sharpe": 0.8699,
++        "backtest_sortino": 1.3024,
+         "backtest_max_drawdown": 9.7659,
+         "backtest_win_rate": 0.7421,
+-        "dd_constrained": false
++        "dd_constrained": false,
++        "backtest_dd_status": "pass"
+       }
+     ],
+     "NDX_mid_vol": [
+@@ -129,12 +124,13 @@
+           "oversold": 25,
+           "overbought": 65
+         },
+-        "weight": 0.5935,
+-        "backtest_sharpe": 1.0869,
+-        "backtest_sortino": 1.705,
++        "weight": 0.5939,
++        "backtest_sharpe": 1.0891,
++        "backtest_sortino": 1.7276,
+         "backtest_max_drawdown": 4.035,
+-        "backtest_win_rate": 0.7966,
+-        "dd_constrained": false
++        "backtest_win_rate": 0.8127,
++        "dd_constrained": false,
++        "backtest_dd_status": "pass"
+       },
+       {
+         "strategy": "bollinger_band",
+@@ -142,12 +138,13 @@
+           "period": 15,
+           "std_dev": 1.5
+         },
+-        "weight": 0.4065,
+-        "backtest_sharpe": 0.7443,
+-        "backtest_sortino": 1.109,
++        "weight": 0.4061,
++        "backtest_sharpe": 0.7446,
++        "backtest_sortino": 1.1094,
+         "backtest_max_drawdown": 10.792,
+         "backtest_win_rate": 0.6738,
+-        "dd_constrained": false
++        "dd_constrained": false,
++        "backtest_dd_status": "pass"
+       }
+     ],
+     "NDX_low_vol": [
+@@ -158,12 +155,13 @@
+           "oversold": 35,
+           "overbought": 65
+         },
+-        "weight": 0.5448,
+-        "backtest_sharpe": 1.1768,
+-        "backtest_sortino": 1.9528,
+-        "backtest_max_drawdown": 10.7112,
+-        "backtest_win_rate": 0.8196,
+-        "dd_constrained": false
++        "weight": 0.5454,
++        "backtest_sharpe": 1.1775,
++        "backtest_sortino": 1.9616,
++        "backtest_max_drawdown": 10.7092,
++        "backtest_win_rate": 0.8152,
++        "dd_constrained": false,
++        "backtest_dd_status": "pass"
+       },
+       {
+         "strategy": "bollinger_band",
+@@ -171,12 +169,13 @@
+           "period": 25,
+           "std_dev": 1.5
+         },
+-        "weight": 0.4552,
+-        "backtest_sharpe": 0.9834,
+-        "backtest_sortino": 1.5717,
++        "weight": 0.4546,
++        "backtest_sharpe": 0.9816,
++        "backtest_sortino": 1.5688,
+         "backtest_max_drawdown": 12.7388,
+         "backtest_win_rate": 0.7286,
+-        "dd_constrained": false
++        "dd_constrained": false,
++        "backtest_dd_status": "pass"
+       }
+     ]
+   }
+diff --git a/mytrader/main.py b/mytrader/main.py
+index 5caa25a..2fe88ef 100644
+--- a/mytrader/main.py
++++ b/mytrader/main.py
+@@ -391,6 +391,46 @@ def _run_reoptimize(config: "Any", logger: "Any") -> None:
+     except Exception as exc:
+         logger.error(f"[WalkForward] failed: {exc}", exc_info=True)
+ 
++    # 迭代 #4：PortfolioBacktest（组合层级回测）
++    # 在 MatrixBacktest + Walk-Forward 之后运行，验证组合层 KPI（Sortino/DD）
++    # 输出 Constitution L1 关键指标到日志，用于决策"是否进入 paper trading"
++    try:
++        from mytrader.backtest.portfolio_backtest import (
++            PortfolioBacktester,
++            PortfolioBacktestConfig,
++        )
++        from datetime import date as _date
++        from datetime import timedelta as _timedelta
++
++        logger.info("[Reoptimize] starting PortfolioBacktest...")
++        # 回测近 1 年（与 Walk-Forward 验证期最后一段对齐）
++        pb_end = _date.today() - _timedelta(days=1)
++        pb_start = pb_end - _timedelta(days=365)
++        pb_cfg = PortfolioBacktestConfig()
++        pb = PortfolioBacktester(
++            store=store,
++            universe=universe,
++            weights_file=output,
++            config=pb_cfg,
++        )
++        pb_result = pb.run(start=pb_start, end=pb_end)
++        logger.info(
++            f"[Portfolio Backtest] "
++            f"DD={pb_result.max_drawdown_pct:.2f}%, "
++            f"Sortino={pb_result.sortino_ratio:.4f}, "
++            f"Sharpe={pb_result.sharpe_ratio:.4f}, "
++            f"Annual Return={pb_result.annualized_return_pct:.2f}%, "
++            f"DD Violation={'YES' if pb_result.dd_violation else 'NO'}"
++        )
++        if pb_result.dd_violation:
++            logger.warning(
++                f"[Portfolio Backtest] DD Violation: max_dd={pb_result.max_drawdown_pct:.2f}% "
++                f"> 20% threshold (Constitution L1). "
++                f"Recommend: review group weights before paper trading."
++            )
++    except Exception as exc:
++        logger.error(f"[Portfolio Backtest] failed: {exc}", exc_info=True)
++
+     # 热加载（如果 StrategyMatrixRunner 已在运行）
+     try:
+         from mytrader.strategy.matrix_runner import StrategyMatrixRunner
+diff --git a/mytrader/mytrader/backtest/matrix_backtest.py b/mytrader/mytrader/backtest/matrix_backtest.py
+index 696ffc8..269160d 100644
+--- a/mytrader/mytrader/backtest/matrix_backtest.py
++++ b/mytrader/mytrader/backtest/matrix_backtest.py
+@@ -875,6 +875,9 @@ class MatrixBacktest:
+                  if r.group_id == group_id and r.strategy == strategy),
+                 None,
+             )
++            # 迭代 #4：新增 backtest_dd_status 字段（'pass' / 'dd_constrained'）
++            # 作为风险 metadata 标记，与 dd_constrained bool 同义但更可读
++            backtest_dd_status = "dd_constrained" if dd_constrained else "pass"
+             weights_list.append({
+                 "strategy": strategy,
+                 "params": params,
+@@ -886,6 +889,12 @@ class MatrixBacktest:
+                 # 迭代 #3：标记该组是否用了 DD fallback（无合规候选）
+                 # 同组所有策略条目共享同一 dd_constrained 值
+                 "dd_constrained": dd_constrained,
++                # 迭代 #4：backtest_dd_status — 风险 metadata 字段
++                # 'pass' = 该组有合规候选（DD ≤ 20%）
++                # 'dd_constrained' = fallback 触发（无合规候选，按最低 DD 取 top-K）
++                # 下游消费方（PortfolioBacktester / 风控观测）可读此字段判断
++                # 该组权重的可靠性，作为风险信号标记
++                "backtest_dd_status": backtest_dd_status,
+             })
+ 
+         return weights_list

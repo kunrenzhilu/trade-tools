@@ -1,0 +1,807 @@
+diff --git a/.codebuddy/CODEBUDDY.md b/.codebuddy/CODEBUDDY.md
+index 421c1ef..ca8edfa 100644
+--- a/.codebuddy/CODEBUDDY.md
++++ b/.codebuddy/CODEBUDDY.md
+@@ -1,6 +1,6 @@
+ # Trade-Tools 项目核心参考文档
+ 
+-> 最后更新：2026-07-05 (Iter #9: MatrixBacktest Alpha-Based Strategy Selection)  
++> 最后更新：2026-07-07 (Iter #11: Sanity Gate / Reject Degenerate Strategies)  
+ > 本文是项目规范 + 关键索引，供 AI 助手快速建立项目上下文。  
+ > **各阶段开发详情见** → [`.codebuddy/notes/dev_records.md`](.codebuddy/notes/dev_records.md)
+ 
+@@ -125,7 +125,7 @@ mytrader/
+     │                           # [迭代 #5] build_matrix_signal_indicators 共享 helper
+     ├── backtest/               # Module 07 — Backtest ✅
+     │   ├── runner.py           # BacktestRunner（含 daily_returns）
+-    │   ├── matrix_backtest.py  # [Phase 5] MatrixBacktest（含 backtest_dd_status 风险 metadata + [Iter #9] backtest_alpha / alpha-based selection）
++    │   ├── matrix_backtest.py  # [Phase 5] MatrixBacktest（含 backtest_dd_status 风险 metadata + [Iter #9] backtest_alpha / alpha-based selection + [Iter #11] closed_trades / sanity gate / no_valid_strategy）
+     │   └── portfolio_backtest.py  # [迭代 #4] PortfolioBacktester（组合层级回测）
+     │                               # [迭代 #5] 复用 build_matrix_signal_indicators
+     │                               # [迭代 #7] SPY benchmark 对比（alpha/IR/benchmark Sortino/DD）
+@@ -196,9 +196,11 @@ mytrader/
+ | **Iter #7** | ✅ 完成 | 12 | SignalRanker Sortino Priority + Benchmark Comparison（sharpe→sortino 评分切换 + PortfolioBacktest SPY benchmark alpha/IR） |
+ | **Iter #8** | ✅ 完成 | 11 | RSI Trend-Filtered Mean Reversion 策略（RSI 超卖/超买 + 200日SMA趋势过滤，5新测试） |
+ | **Iter #9** | ✅ 完成 | 17 | MatrixBacktest Alpha-Based Strategy Selection（SPY benchmark + alpha 计算 + top-K/per-strategy/ensemble 从 Sortino/Sharpe 改为 Alpha + Sortino > 0.5 门槛 + 三级 fallback） |
++| **Iter #10** | ✅ 完成 | 24 | vectorbt Batch Backtest Optimization（`_backtest_batch` 一次 vbt 调用处理组内所有标的 + batch vs single 数值一致性测试） |
++| **Iter #11** | ✅ 完成 | 20 | Sanity Gate / Reject Degenerate Strategies（`SingleBacktestResult.closed_trades` 字段 + `_is_degenerate_strategy` + `_run_group` 排序前剔除退化策略 + 全退化组空仓 `no_valid_strategy` 标记） |
+ | **Phase 6** | 🔲 待开发 | — | AlpacaBroker auto 端到端验证 + 对账真实集成 + 港股支持 |
+ 
+-**当前总测试数：602 passed，0 failed**（live 测试默认隔离，迭代 #9 后；harness 测试 38 个在 `alignment/tests/`）
++**当前总测试数：646 passed，0 failed**（live 测试默认隔离，迭代 #11 后；harness 测试 38 个在 `alignment/tests/`）
+ 
+ > 各阶段详细实现见 **[dev_records.md](.codebuddy/notes/dev_records.md)**
+ 
+diff --git a/.codebuddy/notes/experience.md b/.codebuddy/notes/experience.md
+index 028dda0..656bf5e 100644
+--- a/.codebuddy/notes/experience.md
++++ b/.codebuddy/notes/experience.md
+@@ -44,6 +44,34 @@
+ - 集成测试要用**真实数据路径**（非 mock），至少要用能代表真实状态的 fixture
+ - 具体到本项目：每个新 Sprint 完成后，跑 `--scan-now morning`（哪怕本地没数据），确认从入口到链路末端没有崩溃
+ 
++## 6. 单元测试测"信号正确"，但不测"策略能否完成交易闭环"
++
++**背景**：Iter #8 的 `rsi_trend_filter` 单元测试全绿（信号 ∈ {-1,0,1}、上升趋势不 SELL、下降趋势不 BUY），却在真实回测中对 5 只股票产生 **0 个出场信号**——入场条件（上升趋势）和出场条件（下降趋势）在趋势方向上互斥，仓位永远无法平仓，退化成滞后 buy-and-hold。最讽刺的是：`test_uptrend_only_buy` / `test_downtrend_only_sell` 这两个"通过"的测试，验证的恰恰是导致 Bug 的那个特性，把致命缺陷当成正确行为认证了。
++
++**原则**：
++- 策略测试必须包含**交易闭环测试**：给一段真实/半真实数据，跑一次回测，断言 `已平仓交易数 ≥ 阈值`、`win_rate 非 NaN`、`持仓暴露时间比例合理`
++- 入场和出场条件不能在同一维度上互斥（否则买了卖不掉）。设计策略时先问：**"我这笔仓位靠什么信号平掉？这个信号在目标行情里会不会几乎不触发？"**
++- `win_rate=NaN / 交易笔数≈0` 但 Sortino/收益却正常，是"仓位不平仓、靠盯市和末尾强平凑出收益"的强信号，必须当异常查
++
++## 7. "被选中" ≠ "有效"；指标是过滤器，不是优化目标
++
++**背景**：Iter #9 为了让 `rsi_trend_filter` 能入选，把选择器从 Sortino 排序改成样本内 Alpha 排序。结果坏策略确实进了 4/6 组权重（"被选中"），但样本外组合 alpha 从 -11% 崩到 -25%。换指标只是把样本内的 regime 运气暴露出来，放大了过拟合。
++
++**原则**：
++- 一个策略"能进权重"不代表"有效"。判断有效的标准是**样本外表现**，不是它在选择器里排第几
++- **在同一段数据上同时做参数搜索 + 策略选择，无论用什么单指标（Sortino/Sharpe/Alpha）都必然过拟合**。选择必须用样本外指标（Walk-Forward 验证期），或专用 holdout（前 N 年调参、后 1 年选策略）
++- 遇到"结果变差"时，先质疑**输入的策略/数据是否本身就坏**，再去调选择指标。别把"策略坏了"误诊成"指标选错了"（DeepSeek 就栽在这句上）
++
++## 8. 排序前必须先过硬门槛：健全性 + 风险 + 正超额
++
++**背景**：当前 `_run_group` 的选择逻辑允许：0 平仓交易的退化策略、alpha 全负时选"没那么差"的负 alpha、负 alpha 被 `max(alpha,0.01)` 归一化成等权。WF 4/4 pass 但组合 alpha=-25%，因为 WF gate 只校验 DD/Sortino 不校验 alpha。
++
++**原则**：
++- 排序（选 top-K）之前，先过**硬门槛过滤**，顺序：① 健全性（交易笔数/win_rate 非退化）→ ② 风险（DD≤20%）→ ③ 正超额（alpha>0 或 >benchmark_margin）→ 最后才在合规候选里排序
++- **没有候选满足门槛时，正确动作是"空仓/降现金/回退 benchmark"，不是"矬子里拔将军"强行 top-K**
++- 验收 gate（无论 WF 还是 paper 准入）必须校验**跑赢 benchmark（正 alpha）**，DD/Sortino 达标 ≠ 有正 alpha
++- 归一化权重时，负分不能用 `max(x, ε)` 掩盖——那会把"都不好"变成"等权都要"
++
+ ---
+ 
+ *持续更新。每犯一次新类型的错误，提炼一条原则。*
+diff --git a/.codebuddy/skills/meta-agent/SKILL.md b/.codebuddy/skills/meta-agent/SKILL.md
+index 2cdc7c1..1d0fae3 100644
+--- a/.codebuddy/skills/meta-agent/SKILL.md
++++ b/.codebuddy/skills/meta-agent/SKILL.md
+@@ -136,6 +136,8 @@ Monitor via heartbeat log. If ACP buffer overflow occurs, the orchestrator will
+    - Did the actual trading metrics improve? (Run `--reoptimize` if strategy-related)
+    - Did the system get closer to the Sortino/DD/return targets?
+    - Is the system more deployable now than before?
++   - **Is the strategy actually trading?** Check `backtest_win_rate` in `strategy_weights.json`: NaN or ≈0 means degenerate (no closed trades) — the metrics are fake. A "selected" strategy is NOT a "valid" strategy.
++   - **Did alpha actually improve out-of-sample?** In-sample alpha/Sortino means nothing if the portfolio backtest (recent period) shows negative alpha. Always compare in-sample selection metric vs OOS portfolio result — a large gap = overfitting.
+ 
+    **C. Strategic Fit (Was this the right thing to do?)**
+    - Could the time have been better spent on a different task?
+@@ -266,6 +268,23 @@ Tests passing is necessary but not sufficient. After strategy changes:
+ 3. Look at actual Sortino/Sharpe/DD numbers — are they reasonable?
+ 4. Compare to previous iteration — did things get better or worse?
+ 
++### 7. "Selected" ≠ "Valid" — and In-Sample Ranking Always Overfits
++
++**The Iter #8/9/10 disaster in one principle.** When an iteration's goal is "make strategy X get selected," and it succeeds, that is NOT success. A strategy entering the weights table only proves the selector picked it — not that it works.
++
++- **A metric is a filter, not the target.** Don't change the ranking metric (Sortino→Alpha) just to make a favored strategy rank higher. That treats the symptom and amplifies overfitting. Ask first: *is the underlying strategy even valid?*
++- **Selecting on in-sample data always overfits, regardless of metric.** If parameter search AND strategy selection both happen on the same 5-year window, the "best" strategy is curve-fit. Selection must use out-of-sample signal (Walk-Forward validation-period metrics, or a dedicated holdout period).
++- **When results get worse, first suspect the input (strategy/data), then the metric.** DeepSeek's audit was wrong precisely because it insisted "the strategy isn't broken, only the method is" — while the strategy was structurally broken (0 exit signals). Don't mis-locate the root cause one abstraction layer too high.
++- **Hard gates before ranking.** Order: ① sanity (closed trades / win_rate not degenerate) → ② risk (DD ≤ 20%) → ③ positive excess return (alpha > 0) → then rank survivors. If no candidate passes, the correct action is cash/benchmark fallback, NOT "pick the least-bad negative-alpha one."
++
++### 8. Distinguish "Why it's broken" from "Why it wasn't caught"
++
++When diagnosing a failed iteration, separate two questions:
++- **Why is the output bad?** → usually a code/logic/strategy defect (proximate cause).
++- **Why did the harness/gates let it through?** → a governance/gate gap.
++
++Both need fixing, but they live in different layers. A single cheap gate (e.g. "min closed trades ≥ N") often catches the problem earlier and cheaper than an elaborate methodology fix. Prefer the earliest, cheapest gate that would have caught it.
++
+ ## Interaction with cb-acp-dev
+ 
+ `cb-acp-dev` is the **execution layer** — it handles ACP protocol, monitoring, compliance checks.
+@@ -313,12 +332,16 @@ The strategy doesn't need to be optimal — it just needs to not be garbage:
+ 
+ | Condition | Threshold | Rationale |
+ |-----------|-----------|-----------|
++| **Trade health (no degenerate)** | Each symbol has closed trades ≥ 3, `win_rate` is NOT NaN/≈0 | A strategy that never closes positions is a fake buy-and-hold, not a strategy (Iter #8 lesson) |
+ | Sortino | > 0.5 | Below 0.5 = no better than random, no testing value |
+ | Max DD | ≤ 20% | Constitution hard constraint |
++| **Positive alpha (OOS)** | Walk-Forward avg validation alpha > 0, no round with alpha < -5% | DD/Sortino passing ≠ beating benchmark. Iter #10 had WF 4/4 pass but portfolio alpha = -25% |
+ | Walk-Forward | 4 rounds, no round with >15% loss | Not required to profit every round, but no disasters |
+ | Ensemble diversity | ≥ 2 strategies in weights | Single strategy = no ensemble, fix that first |
+ | Run `--reoptimize` | Actual weights produced, verified | Must have real numbers, not just code that should work |
+ 
++**Critical (Iter #8/9/10 lesson)**: Before trusting any Sortino/alpha in `strategy_weights.json`, check `backtest_win_rate`. A value of NaN or ≈0 (e.g. 0.0053) means the strategy produced almost no closed trades — its "returns" are just mark-to-market on a never-closed position (degenerate buy-and-hold). Such a strategy must NOT enter weights regardless of how high its alpha looks. This is a data sanity check, not an optional nicety.
++
+ **If Gate 1 fails**: Continue iterating on strategy code. Do NOT go to paper.
+ 
+ #### Gate 2: System Is Complete (End-to-End Works)
+diff --git a/alignment/decision_log.md b/alignment/decision_log.md
+index 043c7bd..a361542 100644
+--- a/alignment/decision_log.md
++++ b/alignment/decision_log.md
+@@ -385,3 +385,51 @@
+ - **经验教训**: mock 是实现耦合的，当被测函数的内部依赖改变时，mock 需要同步更新。未来应优先用真实数据测试（如 `test_batch_backtest.py` 的数值一致性测试），减少 mock 依赖。
+ 
+ ---
++
++### [2026-07-07 UTC] 迭代 #11 — 三处模糊决策（vbt API、阈值取值、mock 同步）
++
++- **困境描述**: 实现健全性门槛时遇到三处需要判断的决策点：
++  1. spec §4.2 提到的 vbt API `pf.trades.status_closed.count()` 在 vbt 1.0.0 不存在
++  2. `DEGENERATE_NO_CLOSE_FRACTION` 阈值取 0.8 还是更低/更高
++  3. 现有 mock-based 测试（`test_top_k_selection_uses_alpha` 等 4 处）的 `SingleBacktestResult` 构造默认 `closed_trades=0`，会触发新的健全性门槛误判
++
++- **涉及 AI Constitution 条款**:
++  - L1: KPI 可解释 — 健全性门槛是 KPI 之前的硬门槛
++  - L7: 测试纪律 — 新增字段不应破坏现有测试
++  - L9: 进化 — 门槛设计要考虑可调性（回滚/调整成本）
++
++- **决策逻辑**:
++
++  **决策 1: vbt API 用 `pf.trades.closed.count()`**
++  - spec §4.2 已预见并要求实现者查证 vbt 1.0.0 实际 API
++  - 用最小验证脚本确认：单标的 `pf.trades.closed.count()` 返回 int（已平仓交易数）；多标的 `pf[sym].trades.closed.count()` 返回 per-symbol int
++  - 提取失败降级为 0（不抛异常），与 `_safe_float` 同保守语义
++  - **不**用 `pf.trades.records_readable['Status'].value_counts()['Closed']`（DataFrame 路径，慢且类型不稳）
++
++  **决策 2: 阈值取 0.8（保守）**
++  - 0.8 = "近乎全部标的零平仓"才触发，给低频合法策略（如 monthly rebalance 每标的 2-3 笔）留缓冲
++  - 边界：4/5=0.8 触发（>=）、3/5=0.6 不触发。spec §5.7 要求边界测试覆盖
++  - 0.5/0.6 太激进：单只标的数据不足（刚上市）就可能牵连整组判定
++  - 0.9/1.0 太宽松：5 标的里 1 笔 closed_trades 就能蒙混过关，拦不住 rsi_trend_filter 这种"少数熊市标的偶尔触发出场"的情形
++  - 0.8 是经验值，可调（`DEGENERATE_NO_CLOSE_FRACTION` 常量），未来若发现误伤合法策略可上调
++
++  **决策 3: 同步更新 mock 测试，显式传 `closed_trades`**
++  - mock 的 `SingleBacktestResult(sym, strat, params, sharpe, ret, dd, win, trades, returns)` 默认 `closed_trades=0` → 触发健全性门槛 → 测试失败
++  - 选项 A：改健全性门槛只对"多标的"生效（>=2）—— 这是 hack，破坏门槛语义
++  - 选项 B：在 mock 中显式传 `closed_trades=<total_trades>` —— 反映"mock 假定策略闭环"的语义，正确
++  - 选 B：4 处 mock 各加 `closed_trades=` kwarg，与 `total_trades` 同值
++  - 同步更新 `test_batch_backtest.py::_assert_results_match` 加 `closed_trades` 一致性断言
++
++- **决策结果**:
++  - vbt API 用 `pf.trades.closed.count()`，单/多标的一致
++  - `DEGENERATE_NO_CLOSE_FRACTION = 0.8`，注释说明阈值设计动机
++  - 4 处 mock 测试显式传 `closed_trades`，`_assert_results_match` 加一致性断言
++  - 全部 646 测试通过
++
++- **经验教训**:
++  - **spec 预见 API 差异是规范做法**：spec §4.2 明确写了"若 vbt API 名称不同，实现者需查 vbt 1.0.0 实际 API"，省去了与 spec 作者反复确认的成本
++  - **保守阈值 + 边界测试**：取 0.8 而非 0.5/1.0，并在测试中覆盖 4/5=0.8 触发、3/5=0.6 不触发两个边界。阈值是可调常量，未来调整无需改逻辑
++  - **mock 与实现耦合的代价再次验证**：Iter #10 的 decision_log 已记录此教训，Iter #11 再次遇到（新增字段 → mock 默认值触发新逻辑）。强化了"优先用真实数据测试"的原则
++
++---
++
+diff --git a/alignment/iteration_trajectory.md b/alignment/iteration_trajectory.md
+index 7a6196c..058a7d6 100644
+--- a/alignment/iteration_trajectory.md
++++ b/alignment/iteration_trajectory.md
+@@ -1138,3 +1138,114 @@ Full pytest (excluding live tests):
+ > - CodeBuddy 自行更新了 trajectory ✅
+ 
+ ---
++
++## 迭代 #11 — 选择器健全性门槛（Reject Degenerate Strategies）
++
++- **日期**: 2026-07-07 UTC
++- **类型**: 选择器治理漏洞修复（低风险，仅改 `matrix_backtest.py`）
++- **变更摘要**: 给 `SingleBacktestResult` 新增 `closed_trades` 字段（vbt 已平仓交易数），在 `_run_group` 排序前加健全性门槛剔除退化策略（≥ 80% 标的零平仓 = 入场/出场条件互斥的伪 buy-and-hold）；全退化组返回空权重 + `no_valid_strategy` 标记（持仓现金，不强行选退化策略）
++- **状态**: passed
++- **执行时长**: 1 轮对话（手动开发）
++- **测试数**: 626 → 646（+20 新测试用例）
++
++### 背景
++
++Iter #10 的 `--reoptimize`（Alpha 排序）产出灾难性结果：年化 -4.88%，Sortino -0.66，Alpha -25.26%。三方审计 + 本机实测（`tmp/audit_verify.py`）钉死根因 —— `rsi_trend_filter` 入场条件（close>SMA200，上升趋势）与出场条件（close<SMA200，下降趋势）在趋势方向上互斥，5 只股票产生 0 个出场信号，每只只开 1 仓挂到末尾强平，win_rate 全为 NaN。它的 Sortino/alpha 只是持仓盯市假象，不是真实交易能力。**选择器没有任何健全性门槛**让这个伪策略骗过 alpha 排序，进入 4/6 组权重。
++
++### 变更详情
++
++**P0: `SingleBacktestResult.closed_trades` 字段** (`matrix_backtest.py`)
++- 新增 `closed_trades: int = 0` 字段（vbt `pf.trades.closed.count()`，已平仓交易数）
++- 区分"真交易闭环"与"末尾强平计 1 笔的伪 buy-and-hold"
++- 在 `_backtest_one` 和 `_backtest_batch` 中填充；batch 与 single 数值一致（沿用 Iter #10 一致性范式）
++- vbt 1.0 实际 API 是 `pf.trades.closed.count()`（spec 中提到的 `status_closed` 在 1.0 不存在）
++
++**P0: `_is_degenerate_strategy()` 健全性判定函数** (`matrix_backtest.py`)
++- 退化定义：组内 `closed_trades==0` 的标的比例 ≥ `DEGENERATE_NO_CLOSE_FRACTION (0.8)`
++- 阈值取 0.8（保守）：只在"近乎全部标的零平仓"时触发，避免误伤低频合法策略
++- 空结果列表视为退化（True）
++
++**P0: `_run_group` 集成健全性过滤** (`matrix_backtest.py::_run_group`)
++- 在 candidates 构建**之前**插入过滤（`experience.md #8`：sanity → risk → rank）
++- 退化策略 WARNING 日志 + 不进入 candidates（其 `GroupBacktestResult` 存档条目保留供审计）
++- 全退化组：返回空 weights_list，`report.warnings` 追加 `no_valid_strategy` 标记，对应 `GroupBacktestResult.no_valid_strategy=True`
++- 后续 DD/Sortino/Alpha 三级过滤、Alpha 排序、ensemble 权重逻辑全部作用于"通过健全性过滤后的存活候选"，不变
++
++**P0: `GroupBacktestResult.no_valid_strategy` 字段** (`matrix_backtest.py`)
++- 新增 `no_valid_strategy: bool = False` 标记，标记该组是否因全退化而空仓
++- 与 `dd_constrained` 同义但更可读，下游消费方可读此字段判断该组权重的可靠性
++
++**测试** (`tests/test_degenerate_filter.py`, +20 用例)
++- `closed_trades` 字段存在性 + 默认值
++- 正常策略 `closed_trades > 0`；`rsi_trend_filter` 在强趋势上 `closed_trades=0`（退化）
++- batch vs single `closed_trades` 一致性（4 策略 × 多标的）
++- `_is_degenerate_strategy`：空列表、全零、正常、阈值边界（4/5=0.8 触发、3/5=0.6 不触发）、低频不被误伤、单零不牵连整组
++- `_run_group` 集成：退化策略剔除、全退化空仓 + 标记、正常策略不受影响
++- `GroupBacktestResult.no_valid_strategy` 默认 False
++- 同步更新 `test_batch_backtest.py::_assert_results_match` 加 `closed_trades` 一致性断言、`test_result_fields_populated` 加字段类型断言
++- 同步更新 `test_matrix_backtest.py` 中 4 处 mock `_backtest_batch` 的 `SingleBacktestResult` 构造，显式传 `closed_trades` 反映"mock 假定策略闭环"
++
++### 回测结果
++
++- 本轮不运行 `--reoptimize`（spec §6 验收阶段由 Meta-Agent 独立执行）
++- 单元/集成测试全部通过：646 passed, 0 failed, 16 deselected (live)
++- `closed_trades` 提取在真实数据上验证：`rsi_trend_filter` 5 标的 0 closed_trades → 退化；`rsi_mean_revert` 5 标的各 1-2 closed_trades → 不退化
++- batch vs single `closed_trades` 严格一致（4 策略 × 3 标的 × random walk 数据）
++
++### Constitution 合规
++
++- ✅ 未突破 DD 20% 约束（DD 过滤逻辑完全不变）
++- ✅ 测试覆盖率提升（+20 测试，626 → 646）
++- ✅ 未修改策略代码 / 指标代码 / risk / execution（spec §3 排除项遵守）
++- ✅ 未改 alpha 排序为 OOS（→ Iter #12）
++- ✅ 未加 `alpha>0` 硬门槛（→ Iter #12）
++- ✅ 未修 `rsi_trend_filter` 出场逻辑（健全性门槛会自动排除它；策略重设计是独立任务）
++- ✅ 决策可解释（健全性门槛先于排序，退化策略的 Sortino/alpha 假象被拦在 top-K 之前）
++- ✅ 未引入 RL / 未引入不安全依赖
++- ✅ 未触发真实交易
++- ✅ 文档与代码同步（07-backtest-module.md + CODEBUDDY.md + trajectory）
++
++### Experience Learned
++
++- **`closed_trades` 是更便宜的健全性信号**：比 OOS alpha / holdout 早一步、比 win_rate 非 NaN 更直接。`total_trades` 包含末尾强平的 open trade，无法区分"真交易"和"买一次不动"；`closed_trades` 直接反映"完成买卖闭环"的能力
++- **vbt 1.0 API 实测优先**：spec 提到的 `pf.trades.status_closed.count()` 在 vbt 1.0.0 不存在，实际 API 是 `pf.trades.closed.count()`（spec §4.2 已预见并要求实现者查证）。这印证了 `experience.md #1`：不要假设 API，先写最小验证脚本
++- **mock 测试需要同步更新**：当被测对象新增字段（`closed_trades`）且参与选择逻辑（健全性门槛），mock 出的 `SingleBacktestResult` 必须显式设置该字段，否则默认值（0）会触发误判。这是 mock 与实现耦合的代价
++- **0.8 阈值的边界设计**：4/5=0.8 触发（>=）、3/5=0.6 不触发。取 0.8 而非 0.5/0.6 是为了"只在近乎全标的全死时才判退化"，给低频合法策略留缓冲（spec §5.7 边界测试）
++- **健全性过滤先于 candidates 构建**：把退化策略拦在 DD/Sortino/Alpha 三级过滤之前，避免其"漂亮"的盯市假象污染任何后续指标。`experience.md #8` 顺序：sanity → risk → rank
++- **空仓是正确动作**：全退化组返回空权重（持仓现金）而非"矬子里拔将军"强行 top-K。`experience.md #8`：没有候选满足门槛时，正确动作是"空仓/降现金/回退 benchmark"
++
++### 后续建议
++
++1. **Meta-Agent 验收**（spec §6）：运行 `python main.py --reoptimize`，验证：
++   - `rsi_trend_filter` 不再出现在任何组权重中
++   - 各组权重 `backtest_win_rate` 不再是 ≈0 的退化值
++   - PortfolioBacktest 组合指标从 Iter #10 的 alpha=-25% 恢复到 ≈Iter #7 的可信基线（正收益、Sortino>0）
++2. **Iter #12 OOS alpha 排序 + alpha>0 硬门槛**（spec §3 排除项）：健全性门槛只解决"退化策略骗过排序"，不解决"样本内 alpha 过拟合"和"全负 alpha 矬子里拔将军"
++3. **修 `rsi_trend_filter` 出场逻辑**（独立任务）：出场改为均值回归自然出场（RSI 回中性 50）或去掉出场的趋势门槛；趋势过滤只作用于入场。健全性门槛会自动排除当前退化版本
++4. **WF gate 增加 alpha 校验**（`experience.md #8`）：当前 WF 只校验 DD/Sortino 不校验 alpha，Iter #10 WF 4/4 pass 但组合 alpha=-25.26%。需加：平均验证期 alpha>0、最近一轮 alpha>0、无单轮 alpha<-5%
++
++### L7 流水线状态
++```
++✅ Backtest (≥5年, alpha-based selection, batch-optimized, sanity-gated)
++✅ Walk-Forward (4轮, 自动继承 alpha 排序, batch-optimized)
++✅ Portfolio Backtest | ✅ Paper Trading Integrity
++✅ Harness Reliability | ✅ SignalRanker Sortino Priority
++✅ Strategy Diversity (5 策略 pool)
++✅ Alpha-Based Selection (迭代 #9 完成)
++✅ Batch Backtest Optimization (迭代 #10 完成)
++✅ Sanity Gate / Reject Degenerate (迭代 #11 完成)
++⬜ OOS Alpha Sort + alpha>0 Threshold (→ Iter #12)
++⬜ Paper Trade ≥1月 | ⬜ Live
++```
++
++---
++
++> **Orchestrator 验证记录** (自动追加)
++> - 迭代状态: passed
++> - 测试: 0 passed, 0 failed
++> - 违规: 0 条
++> - 高风险文件: 0 个
++> - 测试数变化: 626 → 646
++> - CodeBuddy 自行更新了 trajectory ✅
++
++---
+diff --git a/mytrader/config/strategy_weights.json b/mytrader/config/strategy_weights.json
+index 6dd6e96..8525ce0 100644
+--- a/mytrader/config/strategy_weights.json
++++ b/mytrader/config/strategy_weights.json
+@@ -1,7 +1,7 @@
+ {
+   "_meta": {
+-    "generated_at": "2026-07-05T14:52:10.563798+00:00",
+-    "backtest_window": "2021-07-06 ~ 2026-07-05",
++    "generated_at": "2026-07-07T03:45:01.533849+00:00",
++    "backtest_window": "2021-07-08 ~ 2026-07-07",
+     "reoptimize_freq": "monthly",
+     "survivorship_bias_warning": "使用当前成分股回测，S&P 500 5年成分变动约100只(~20%)，均值回归组(SPX_low_vol)结果可能系统性偏高"
+   },
+@@ -15,63 +15,59 @@
+           "overbought": 75
+         },
+         "weight": 0.5,
+-        "backtest_sharpe": 0.8464,
+-        "backtest_sortino": 1.2694,
+-        "backtest_max_drawdown": 13.9716,
+-        "backtest_win_rate": 0.7743,
+-        "backtest_alpha": -4.6629,
++        "backtest_sharpe": 0.8233,
++        "backtest_sortino": 1.2349,
++        "backtest_max_drawdown": 13.9164,
++        "backtest_win_rate": 0.7671,
++        "backtest_alpha": -5.2187,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       },
+       {
+-        "strategy": "rsi_trend_filter",
++        "strategy": "bollinger_band",
+         "params": {
+-          "rsi_period": 14,
+-          "oversold": 35,
+-          "overbought": 75,
+-          "trend_period": 200
++          "period": 25,
++          "std_dev": 1.5
+         },
+         "weight": 0.5,
+-        "backtest_sharpe": 0.9896,
+-        "backtest_sortino": 1.4723,
+-        "backtest_max_drawdown": 13.9374,
+-        "backtest_win_rate": 0.0053,
+-        "backtest_alpha": -5.7731,
++        "backtest_sharpe": 0.8674,
++        "backtest_sortino": 1.345,
++        "backtest_max_drawdown": 9.2915,
++        "backtest_win_rate": 0.7074,
++        "backtest_alpha": -6.7459,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       }
+     ],
+     "SPX_high_vol": [
+       {
+-        "strategy": "rsi_trend_filter",
++        "strategy": "rsi_mean_revert",
+         "params": {
+-          "rsi_period": 14,
++          "period": 21,
+           "oversold": 35,
+-          "overbought": 75,
+-          "trend_period": 200
++          "overbought": 75
+         },
+         "weight": 0.5,
+-        "backtest_sharpe": 0.9641,
+-        "backtest_sortino": 1.4327,
+-        "backtest_max_drawdown": 19.5924,
+-        "backtest_win_rate": 0.0387,
+-        "backtest_alpha": -2.8401,
++        "backtest_sharpe": 0.6797,
++        "backtest_sortino": 1.0112,
++        "backtest_max_drawdown": 16.9929,
++        "backtest_win_rate": 0.6754,
++        "backtest_alpha": -4.4056,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       },
+       {
+-        "strategy": "rsi_mean_revert",
++        "strategy": "bollinger_band",
+         "params": {
+-          "period": 21,
+-          "oversold": 35,
+-          "overbought": 75
++          "period": 15,
++          "std_dev": 1.5
+         },
+         "weight": 0.5,
+-        "backtest_sharpe": 0.6908,
+-        "backtest_sortino": 1.0224,
+-        "backtest_max_drawdown": 17.2401,
+-        "backtest_win_rate": 0.6777,
+-        "backtest_alpha": -3.7445,
++        "backtest_sharpe": 0.6981,
++        "backtest_sortino": 1.0708,
++        "backtest_max_drawdown": 14.426,
++        "backtest_win_rate": 0.6616,
++        "backtest_alpha": -6.105,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       }
+@@ -86,11 +82,11 @@
+           "trend_period": 200
+         },
+         "weight": 1.0,
+-        "backtest_sharpe": 1.341,
+-        "backtest_sortino": 1.9932,
++        "backtest_sharpe": 1.342,
++        "backtest_sortino": 1.9948,
+         "backtest_max_drawdown": 17.2169,
+         "backtest_win_rate": 0.6581,
+-        "backtest_alpha": 6.5914,
++        "backtest_alpha": 6.4967,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       }
+@@ -104,11 +100,11 @@
+           "overbought": 75
+         },
+         "weight": 0.5,
+-        "backtest_sharpe": 0.882,
+-        "backtest_sortino": 1.2959,
+-        "backtest_max_drawdown": 14.3284,
+-        "backtest_win_rate": 0.8534,
+-        "backtest_alpha": -3.9421,
++        "backtest_sharpe": 0.8631,
++        "backtest_sortino": 1.2694,
++        "backtest_max_drawdown": 14.3251,
++        "backtest_win_rate": 0.8363,
++        "backtest_alpha": -4.4881,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       },
+@@ -119,11 +115,11 @@
+           "std_dev": 1.5
+         },
+         "weight": 0.5,
+-        "backtest_sharpe": 0.9481,
+-        "backtest_sortino": 1.4254,
++        "backtest_sharpe": 0.9457,
++        "backtest_sortino": 1.4218,
+         "backtest_max_drawdown": 9.8925,
+-        "backtest_win_rate": 0.7408,
+-        "backtest_alpha": -5.9536,
++        "backtest_win_rate": 0.7404,
++        "backtest_alpha": -6.1019,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       }
+@@ -136,12 +132,12 @@
+           "oversold": 35,
+           "overbought": 65
+         },
+-        "weight": 0.9919,
+-        "backtest_sharpe": 1.1334,
+-        "backtest_sortino": 1.8441,
++        "weight": 0.9937,
++        "backtest_sharpe": 1.1766,
++        "backtest_sortino": 1.9275,
+         "backtest_max_drawdown": 13.6764,
+-        "backtest_win_rate": 0.8025,
+-        "backtest_alpha": 1.2322,
++        "backtest_win_rate": 0.8314,
++        "backtest_alpha": 1.5839,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       },
+@@ -151,12 +147,12 @@
+           "period": 25,
+           "std_dev": 1.5
+         },
+-        "weight": 0.0081,
+-        "backtest_sharpe": 1.0159,
+-        "backtest_sortino": 1.6168,
++        "weight": 0.0063,
++        "backtest_sharpe": 0.995,
++        "backtest_sortino": 1.5831,
+         "backtest_max_drawdown": 14.9034,
+-        "backtest_win_rate": 0.7476,
+-        "backtest_alpha": -1.0676,
++        "backtest_win_rate": 0.7453,
++        "backtest_alpha": -1.4877,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       }
+@@ -170,28 +166,26 @@
+           "overbought": 75
+         },
+         "weight": 0.5,
+-        "backtest_sharpe": 1.1631,
+-        "backtest_sortino": 1.7722,
+-        "backtest_max_drawdown": 8.9297,
+-        "backtest_win_rate": 0.8601,
+-        "backtest_alpha": -2.6483,
++        "backtest_sharpe": 1.1682,
++        "backtest_sortino": 1.7825,
++        "backtest_max_drawdown": 8.9292,
++        "backtest_win_rate": 0.8591,
++        "backtest_alpha": -2.7762,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       },
+       {
+-        "strategy": "rsi_trend_filter",
++        "strategy": "bollinger_band",
+         "params": {
+-          "rsi_period": 14,
+-          "oversold": 35,
+-          "overbought": 75,
+-          "trend_period": 200
++          "period": 25,
++          "std_dev": 1.5
+         },
+         "weight": 0.5,
+-        "backtest_sharpe": 1.1557,
+-        "backtest_sortino": 1.7468,
+-        "backtest_max_drawdown": 11.1623,
+-        "backtest_win_rate": 0.0345,
+-        "backtest_alpha": -4.5438,
++        "backtest_sharpe": 0.8913,
++        "backtest_sortino": 1.3677,
++        "backtest_max_drawdown": 8.6828,
++        "backtest_win_rate": 0.7065,
++        "backtest_alpha": -7.7934,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       }
+diff --git a/mytrader/designs/design_v2/07-backtest-module.md b/mytrader/designs/design_v2/07-backtest-module.md
+index 595a836..aba38f7 100644
+--- a/mytrader/designs/design_v2/07-backtest-module.md
++++ b/mytrader/designs/design_v2/07-backtest-module.md
+@@ -389,14 +389,18 @@ def run_matrix_backtest(universe: UniverseManager,
+ | **SPY Benchmark 获取**（迭代 #9 新增） | `_get_spy_returns(start, end)` 从 MarketDataStore 拉取 SPY 日收益率；`_compute_alpha(strat, spy)` 计算年化 alpha | SPY 不可用时 alpha 降级为 0.0（不阻塞回测），所有候选 alpha=0 ��退化为原顺序 |
+ | **per-strategy best params 用 Alpha**（迭代 #9 新增） | 每个策略的最优参数选择从 Sharpe 改为 Alpha | 与 top-K 排序口径一致，避免 per-strategy 用 Sharpe 选低收益高稳定的参数 |
+ | **ensemble weights 用 Alpha**（迭代 #9 新增） | `_optimize_ensemble_weights` 接收 `spy_returns` 参数，权重计算从 Sharpe 改为 Alpha | 与 top-K 排序口径一致，ensemble 权重直接反映"跑赢 SPY 的程度"；SPY 不可用时退化为等权 |
++| **健全性门槛（Reject Degenerate）**（迭代 #11 新增） | `SingleBacktestResult.closed_trades` 字段 + `_is_degenerate_strategy()` 函数；`_run_group` 在 candidates 构建前剔除 `>= 80%` 标的 `closed_trades==0` 的退化策略；全退化组返回空权重 + `no_valid_strategy=True` 标记 | 退化策略（入场/出场条件互斥，如 Iter #8 `rsi_trend_filter`）仓位靠末尾强平凑出 Sortino/alpha 假象，会骗过 alpha 排序进入权重（Iter #10 实测 alpha=-25%）。`closed_trades` 区分"真交易闭环"与"伪 buy-and-hold"。0.8 阈值保守，只拦"近乎全标的零平仓"，不误伤低频合法策略。`experience.md #8`：sanity → risk → rank，排序前必须先过硬门槛 |
+ | **参数按组** | 同组共用参数，不对单只优化 | 防过拟合（详见 02-strategy-engine.md 6.3） |
+ | **历史分组对齐** | 矩阵回测使用 point-in-time 分组（按回测时间点重算波动率），而非当前静态分组 | 避免回测静态分组而实盘动态分组导致回测/实盘不一致 |
+ | **实盘 ensemble 对齐** | MatrixBacktest 的 ensemble 权重优化须在"单点离散值聚合"语义下验证 | 实盘只取 iloc[-1] 单点离散值加权，与序列级加权不等价，权重必须在相同语义下产出 |
+ | **Walk-Forward** | 滚动训练窗口，月度重优化 | 平衡过拟合与适应性 |
+ 
+-### 10.4.1 Top-K 选择三级 Fallback（迭代 #9 新增）
++### 10.4.1 Top-K 选择三级 Fallback（迭代 #9 新增，迭代 #11 前置健全性门槛）
+ 
+ ```
++[迭代 #11 前置] 健全性过滤：剔除 closed_trades==0 比例 ≥ 80% 的退化策略
++                全退化组 → 空权重 + no_valid_strategy=True（hold cash）
++                    ↓
+ Tier 1: DD ≤ 20% AND Sortino > 0.5  →  Alpha 降序取 top-K
+    ↓ (若空)
+ Tier 2: DD ≤ 20%（放宽 Sortino）   →  Alpha 降序取 top-K，WARNING 日志
+@@ -404,6 +408,12 @@ Tier 2: DD ≤ 20%（放宽 Sortino）   →  Alpha 降序取 top-K，WARNING 
+ Tier 3: 无 DD 合规候选              →  DD 升序取 top-K，dd_constrained=True
+ ```
+ 
++**迭代 #11 健全性门槛（先于 Tier 1-3）**：
++- `SingleBacktestResult.closed_trades` 字段从 vbt `pf.trades.closed.count()` 提取（区分"真交易闭环"与"末尾强平计 1 笔的伪 buy-and-hold"）
++- 退化定义：组内 `closed_trades==0` 的标的比例 ≥ `DEGENERATE_NO_CLOSE_FRACTION (0.8)`
++- 全退化组返回空权重（持仓现金），不强行选退化策略；标记 `GroupBacktestResult.no_valid_strategy=True`
++- 设计动机（`experience.md #8`）：Iter #10 `rsi_trend_filter` 凭"持仓盯市 + 末尾强平"的 Sortino/alpha 假象骗过 alpha 排序进入 4/6 组权重 → 组合 alpha=-25.26%。`closed_trades` 信号缺失时无健全性门槛可拦住整个灾难。0.8 阈值保守，低频合法策略（每标的 2-3 笔）不会被误伤
++
+ **设计动机**（iteration #9 spec §1-2）：
+ - Constitution 目标：年化 20-30%（需 alpha +10~20%）
+ - 旧逻辑：Sortino 降序 → 永远选均值回归策略 → 年化 8.02%，alpha = -11.34%
+diff --git a/mytrader/mytrader/backtest/matrix_backtest.py b/mytrader/mytrader/backtest/matrix_backtest.py
+index a577903..e4d686d 100644
+--- a/mytrader/mytrader/backtest/matrix_backtest.py
++++ b/mytrader/mytrader/backtest/matrix_backtest.py
+@@ -46,6 +46,14 @@ WALK_FORWARD_VAL_DD_THRESHOLD: float = 15.0
+ # fallback：若无候选通过此门槛，放宽过滤（仅保留 DD 硬约束）
+ MIN_SORTINO_THRESHOLD: float = 0.5
+ 
++# 迭代 #11 新增：健全性门槛 —— 识别"退化策略"（几乎不平仓的伪 buy-and-hold）
++# 判定：组内"有效标的中，已平仓交易数为 0 的比例"超过此阈值 → 退化
++# 设计动机：真策略应在多数标的上完成买卖闭环；若近乎所有标的都从不平仓，
++#           说明入场/出场条件矛盾（如 Iter #8 rsi_trend_filter），其收益只是
++#           持仓盯市 + 末尾强平的假象，必须在排序前剔除（experience.md #8）。
++# 阈值取 0.8（保守）：只在"近乎全部标的零平仓"时触发，避免误伤低频合法策略。
++DEGENERATE_NO_CLOSE_FRACTION: float = 0.8
++
+ 
+ # ---------------------------------------------------------------------------
+ # 数据结构
+@@ -65,6 +73,7 @@ class SingleBacktestResult:
+     total_trades: int
+     daily_returns: pd.Series    # pf.returns() — 供组合 Sharpe / Sortino 计算
+     sortino: float = 0.0       # Constitution L1 首要 KPI（迭代 #1 新增）
++    closed_trades: int = 0     # 迭代 #11 新增：已平仓交易数（区分退化 buy-and-hold）
+ 
+ 
+ @dataclass
+@@ -83,6 +92,7 @@ class GroupBacktestResult:
+     portfolio_max_drawdown: float = 0.0     # 等权组合最大回撤（迭代 #2 新增，Constitution L1 KPI）
+     dd_constrained: bool = False            # 迭代 #3：该组是否用了 DD fallback（无合规候选）
+     backtest_alpha: float = 0.0              # 迭代 #9：alpha vs SPY（百分数），用于排序策略选择
++    no_valid_strategy: bool = False         # 迭代 #11：该组是否因全退化而空仓（hold cash）
+ 
+ 
+ @dataclass
+@@ -259,6 +269,27 @@ def _combine_daily_returns(results: list[SingleBacktestResult]) -> pd.Series:
+     return pd.concat(valid, axis=1).mean(axis=1)
+ 
+ 
++def _is_degenerate_strategy(results: list[SingleBacktestResult]) -> bool:
++    """判定一个策略在组内是否退化（几乎不产生已平仓交易）（迭代 #11 新增）。
++
++    退化定义：有效标的中 closed_trades==0 的比例 >= DEGENERATE_NO_CLOSE_FRACTION。
++    这类策略的入场/出场条件互斥（如 Iter #8 rsi_trend_filter 趋势过滤锁死均值
++    回归出场），仓位无法平仓，其 Sortino/alpha 只是持仓盯市假象，不代表真实
++    交易能力，必须在排序前剔除（experience.md #8：sanity → risk → rank）。
++
++    Args:
++        results: 单策略多标的的回测结果列表
++
++    Returns:
++        True 表示退化（应剔除）；空结果视为退化（True）
++    """
++    if not results:
++        return True
++    n = len(results)
++    no_close = sum(1 for r in results if r.closed_trades <= 0)
++    return (no_close / n) >= DEGENERATE_NO_CLOSE_FRACTION
++
++
+ def _compute_alpha(
+     strategy_daily_returns: pd.Series,
+     spy_daily_returns: pd.Series | None,
+@@ -373,6 +404,14 @@ def _backtest_one(
+ 
+         daily_returns = pf.returns()
+ 
++        # 迭代 #11：已平仓交易数（用于健全性门槛 _is_degenerate_strategy）
++        # vbt 1.0 API: pf.trades.closed.count() 返回 Status==Closed 的交易数
++        # 区分"真交易闭环"与"末尾强平计 1 笔的伪 buy-and-hold"
++        try:
++            closed_trades = int(pf.trades.closed.count())
++        except Exception:
++            closed_trades = 0
++
+         return SingleBacktestResult(
+             symbol=str(df.index.name or ""),
+             strategy=strategy_name,
+@@ -384,6 +423,7 @@ def _backtest_one(
+             total_trades=int(_safe_float(stats.get("Total Trades"), default=0.0)),
+             daily_returns=daily_returns,
+             sortino=_compute_sortino(daily_returns),
++            closed_trades=closed_trades,
+         )
+     except Exception as e:
+         logger.debug(f"[backtest_one] {strategy_name}({params}) failed: {e}")
+@@ -525,6 +565,12 @@ def _backtest_batch(
+             pf_sym = pf[sym]
+             stats = pf_sym.stats()
+             daily_returns = pf_sym.returns()
++            # 迭代 #11：已平仓交易数（与 _backtest_one 同 API、同语义）
++            # pf_sym 是单列 pf，pf_sym.trades.closed.count() 返回 int
++            try:
++                closed_trades = int(pf_sym.trades.closed.count())
++            except Exception:
++                closed_trades = 0
+             results.append(SingleBacktestResult(
+                 symbol=sym,
+                 strategy=strategy_name,
+@@ -536,6 +582,7 @@ def _backtest_batch(
+                 total_trades=int(_safe_float(stats.get("Total Trades"), default=0.0)),
+                 daily_returns=daily_returns,
+                 sortino=_compute_sortino(daily_returns),
++                closed_trades=closed_trades,
+             ))
+         except Exception as e:
+             logger.debug(
+@@ -1135,6 +1182,40 @@ class MatrixBacktest:
+             )
+             return []
+ 
++        # 迭代 #11：健全性过滤 —— 排序前先剔除退化策略
++        # （experience.md #8：sanity → risk → rank）
++        # 退化策略 = 组内 ≥ 80% 标的 closed_trades==0（入场/出场条件互斥，
++        # 仓位靠末尾强平凑出 Sortino/alpha 假象）。此类策略必须先于 DD/Sortino/
++        # Alpha 过滤剔除，否则其盯市假象会骗过 alpha 排序进入权重。
++        sane_results: list[tuple[str, dict, list[SingleBacktestResult]]] = []
++        for (strategy, params, results) in group_results:
++            if _is_degenerate_strategy(results):
++                logger.warning(
++                    f"[MatrixBacktest] {group_id}: strategy '{strategy}' is DEGENERATE "
++                    f"(>= {DEGENERATE_NO_CLOSE_FRACTION:.0%} symbols have 0 closed trades) "
++                    f"— excluded before ranking. Its Sortino/alpha is mark-to-market illusion."
++                )
++                continue
++            sane_results.append((strategy, params, results))
++
++        if not sane_results:
++            # 全组退化 → 空权重（持仓现金），标记 no_valid_strategy，不强行选退化策略
++            logger.warning(
++                f"[MatrixBacktest] {group_id}: ALL strategies degenerate — "
++                f"group produces EMPTY weights (hold cash). Marked no_valid_strategy."
++            )
++            report.warnings.append(
++                f"{group_id}: no_valid_strategy (all strategies degenerate)"
++            )
++            # 标记已 append 的 GroupBacktestResult 条目（供审计追溯）
++            for gr in report.group_results:
++                if gr.group_id == group_id:
++                    gr.no_valid_strategy = True
++            return []
++
++        # 后续 candidates 构建、DD/Sortino/Alpha 过滤、排序，全部改用 sane_results
++        group_results = sane_results
++
+         # 3. 迭代 #9：DD 硬约束 + Sortino 门槛 + Alpha 排序选 Top-K
+         #    Constitution L1: portfolio DD ≤ 20% 是硬约束（保留）
+         #    新增：Sortino > 0.5 最低质量门槛（可放宽）
+diff --git a/mytrader/tests/test_batch_backtest.py b/mytrader/tests/test_batch_backtest.py
+index bdfe672..1883e77 100644
+--- a/mytrader/tests/test_batch_backtest.py
++++ b/mytrader/tests/test_batch_backtest.py
+@@ -158,6 +158,10 @@ def _assert_results_match(
+     assert old.total_trades == new.total_trades, msg(
+         f"total_trades mismatch: old={old.total_trades}, new={new.total_trades}"
+     )
++    # 迭代 #11：closed_trades 严格一致（与 total_trades 同口径，从 vbt 提取）
++    assert old.closed_trades == new.closed_trades, msg(
++        f"closed_trades mismatch: old={old.closed_trades}, new={new.closed_trades}"
++    )
+     # sortino 从 daily_returns 派生，应严格一致
+     assert abs(old.sortino - new.sortino) < 1e-6, msg(
+         f"sortino mismatch: old={old.sortino}, new={new.sortino}"
+@@ -381,6 +385,9 @@ class TestBatchOutputFormat:
+             assert isinstance(r.win_rate_pct, float)
+             assert isinstance(r.total_trades, int)
+             assert isinstance(r.sortino, float)
++            # 迭代 #11：closed_trades 字段必须存在且为 int
++            assert isinstance(r.closed_trades, int)
++            assert r.closed_trades >= 0
+             assert not r.daily_returns.empty
+             # 所有数值字段都应是有限值（_safe_float 已处理 NaN）
+             for v in [r.sharpe, r.total_return_pct, r.max_drawdown_pct,
+diff --git a/mytrader/tests/test_matrix_backtest.py b/mytrader/tests/test_matrix_backtest.py
+index 014c064..20c8e0d 100644
+--- a/mytrader/tests/test_matrix_backtest.py
++++ b/mytrader/tests/test_matrix_backtest.py
+@@ -1100,11 +1100,13 @@ class TestAlphaBasedTopKSelection:
+                     continue
+                 if strategy_name == "dual_ma":
+                     results.append(SingleBacktestResult(
+-                        sym, strategy_name, params, 1.0, 10.0, 5.0, 55.0, 10, returns_a
++                        sym, strategy_name, params, 1.0, 10.0, 5.0, 55.0, 10, returns_a,
++                        closed_trades=10,
+                     ))
+                 else:  # rsi_mean_revert
+                     results.append(SingleBacktestResult(
+-                        sym, strategy_name, params, 1.0, 30.0, 8.0, 50.0, 10, returns_b
++                        sym, strategy_name, params, 1.0, 30.0, 8.0, 50.0, 10, returns_b,
++                        closed_trades=10,
+                     ))
+             return results
+ 
+@@ -1205,11 +1207,13 @@ class TestAlphaBasedTopKSelection:
+                     continue
+                 if strategy_name == "dual_ma":
+                     results.append(SingleBacktestResult(
+-                        sym, strategy_name, params, 0.5, 15.0, 10.0, 50.0, 5, returns_a
++                        sym, strategy_name, params, 0.5, 15.0, 10.0, 50.0, 5, returns_a,
++                        closed_trades=5,
+                     ))
+                 else:  # rsi_mean_revert
+                     results.append(SingleBacktestResult(
+-                        sym, strategy_name, params, 1.0, 20.0, 5.0, 55.0, 10, returns_b
++                        sym, strategy_name, params, 1.0, 20.0, 5.0, 55.0, 10, returns_b,
++                        closed_trades=10,
+                     ))
+             return results
+ 
+@@ -1346,7 +1350,8 @@ class TestAlphaBasedTopKSelection:
+                 if df is None or df.empty or len(df) < 30:
+                     continue
+                 results.append(SingleBacktestResult(
+-                    sym, strategy_name, params, 0.3, 5.0, 10.0, 50.0, 3, returns_garbage
++                    sym, strategy_name, params, 0.3, 5.0, 10.0, 50.0, 3, returns_garbage,
++                    closed_trades=3,
+                 ))
+             return results
+ 
+@@ -1533,11 +1538,13 @@ class TestAlphaBasedTopKSelection:
+                     continue
+                 if params.get("fast") == 5:  # 参数 A
+                     results.append(SingleBacktestResult(
+-                        sym, strategy_name, params, sharpe_a, 10.0, 5.0, 55.0, 10, returns_a
++                        sym, strategy_name, params, sharpe_a, 10.0, 5.0, 55.0, 10, returns_a,
++                        closed_trades=10,
+                     ))
+                 else:  # 参数 B (fast=10)
+                     results.append(SingleBacktestResult(
+-                        sym, strategy_name, params, sharpe_b, 30.0, 8.0, 50.0, 10, returns_b
++                        sym, strategy_name, params, sharpe_b, 30.0, 8.0, 50.0, 10, returns_b,
++                        closed_trades=10,
+                     ))
+             return results
+ 

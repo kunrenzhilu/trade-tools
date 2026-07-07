@@ -1,0 +1,35 @@
+{
+  "iteration": 8,
+  "iteration_id": "0eed5d39",
+  "timestamp_utc": "2026-07-04T13:26:10.083863+00:00",
+  "status": "failed",
+  "tests": {
+    "count_before": 574,
+    "count_after": 585,
+    "passed": 0,
+    "failed": 0,
+    "errors": 0,
+    "warnings": 11,
+    "exit_code": 0,
+    "summary": "tests/test_risk_manager.py: 11 warnings",
+    "has_test_failures": false
+  },
+  "snapshot": {
+    "changed_files_count": 18,
+    "includes_untracked": true,
+    "untracked_count": 1,
+    "git_status_file": "git_status.txt",
+    "untracked_files_file": "untracked_files.json",
+    "untracked_diff_file": "untracked_diff.patch"
+  },
+  "compliance": {
+    "violations": [
+      ".codebuddy/skills/cb-acp-dev/scripts/orchestrator.py: 高风险参数变更 (dd_threshold)，需用户审批"
+    ],
+    "high_risk_files_touched": [],
+    "buffer_overflow_count": 0
+  },
+  "trajectory_updated_by_codebuddy": true,
+  "decision_log_updated_by_codebuddy": true,
+  "error": null
+}

@@ -1,0 +1,597 @@
+diff --git a/mytrader/config/strategy_weights.json b/mytrader/config/strategy_weights.json
+index ee8be77..5b2d7ac 100644
+--- a/mytrader/config/strategy_weights.json
++++ b/mytrader/config/strategy_weights.json
+@@ -1,81 +1,170 @@
+ {
+   "_meta": {
+-    "generated_at": "2026-06-24T15:32:45.131138+00:00",
+-    "backtest_window": "2021-06-25 ~ 2026-06-24",
++    "generated_at": "2026-07-01T00:17:00.904798+00:00",
++    "backtest_window": "2021-07-02 ~ 2026-07-01",
+     "reoptimize_freq": "monthly",
+     "survivorship_bias_warning": "使用当前成分股回测，S&P 500 5年成分变动约100只(~20%)，均值回归组(SPX_low_vol)结果可能系统性偏高"
+   },
+   "groups": {
+     "SPX_mid_vol": [
+       {
+-        "strategy": "dual_ma",
++        "strategy": "rsi_mean_revert",
++        "params": {
++          "period": 14,
++          "oversold": 30,
++          "overbought": 65
++        },
++        "weight": 0.5298,
++        "backtest_sharpe": 0.9806,
++        "backtest_sortino": 1.5657,
++        "backtest_max_drawdown": 7.3709,
++        "backtest_win_rate": 0.7672
++      },
++      {
++        "strategy": "bollinger_band",
+         "params": {
+-          "fast": 10,
+-          "slow": 40
++          "period": 25,
++          "std_dev": 1.5
+         },
+-        "weight": 1.0,
+-        "backtest_sharpe": 0.2321,
+-        "backtest_win_rate": 0.3851
++        "weight": 0.4702,
++        "backtest_sharpe": 0.8704,
++        "backtest_sortino": 1.3496,
++        "backtest_max_drawdown": 9.3546,
++        "backtest_win_rate": 0.7089
+       }
+     ],
+     "SPX_high_vol": [
+       {
+-        "strategy": "dual_ma",
++        "strategy": "bollinger_band",
++        "params": {
++          "period": 15,
++          "std_dev": 1.5
++        },
++        "weight": 0.5115,
++        "backtest_sharpe": 0.6712,
++        "backtest_sortino": 1.0294,
++        "backtest_max_drawdown": 14.898,
++        "backtest_win_rate": 0.6632
++      },
++      {
++        "strategy": "rsi_mean_revert",
+         "params": {
+-          "fast": 10,
+-          "slow": 40
++          "period": 21,
++          "oversold": 35,
++          "overbought": 75
+         },
+-        "weight": 1.0,
+-        "backtest_sharpe": 0.6038,
+-        "backtest_win_rate": 0.3885
++        "weight": 0.4885,
++        "backtest_sharpe": 0.6411,
++        "backtest_sortino": 0.9435,
++        "backtest_max_drawdown": 19.4925,
++        "backtest_win_rate": 0.6591
+       }
+     ],
+     "NDX_high_vol": [
+       {
+         "strategy": "dual_ma",
+         "params": {
+-          "fast": 5,
+-          "slow": 60
++          "fast": 20,
++          "slow": 80
++        },
++        "weight": 0.5753,
++        "backtest_sharpe": 0.982,
++        "backtest_sortino": 1.4021,
++        "backtest_max_drawdown": 22.2166,
++        "backtest_win_rate": 0.372
++      },
++      {
++        "strategy": "bollinger_band",
++        "params": {
++          "period": 25,
++          "std_dev": 1.5
+         },
+-        "weight": 1.0,
+-        "backtest_sharpe": 0.9489,
+-        "backtest_win_rate": 0.3549
++        "weight": 0.4247,
++        "backtest_sharpe": 0.7249,
++        "backtest_sortino": 1.1013,
++        "backtest_max_drawdown": 21.9606,
++        "backtest_win_rate": 0.7131
+       }
+     ],
+     "SPX_low_vol": [
+       {
+-        "strategy": "dual_ma",
++        "strategy": "rsi_mean_revert",
+         "params": {
+-          "fast": 5,
+-          "slow": 20
++          "period": 14,
++          "oversold": 25,
++          "overbought": 65
+         },
+-        "weight": 1.0,
+-        "backtest_sharpe": 0.0727,
+-        "backtest_win_rate": 0.3158
++        "weight": 0.567,
++        "backtest_sharpe": 1.1384,
++        "backtest_sortino": 1.8197,
++        "backtest_max_drawdown": 4.7776,
++        "backtest_win_rate": 0.8876
++      },
++      {
++        "strategy": "bollinger_band",
++        "params": {
++          "period": 25,
++          "std_dev": 1.5
++        },
++        "weight": 0.433,
++        "backtest_sharpe": 0.8696,
++        "backtest_sortino": 1.3018,
++        "backtest_max_drawdown": 9.7659,
++        "backtest_win_rate": 0.7421
+       }
+     ],
+     "NDX_mid_vol": [
+       {
+-        "strategy": "dual_ma",
++        "strategy": "rsi_mean_revert",
+         "params": {
+-          "fast": 10,
+-          "slow": 40
++          "period": 14,
++          "oversold": 25,
++          "overbought": 65
+         },
+-        "weight": 1.0,
+-        "backtest_sharpe": 0.5161,
+-        "backtest_win_rate": 0.4299
++        "weight": 0.5935,
++        "backtest_sharpe": 1.0869,
++        "backtest_sortino": 1.705,
++        "backtest_max_drawdown": 4.035,
++        "backtest_win_rate": 0.7966
++      },
++      {
++        "strategy": "bollinger_band",
++        "params": {
++          "period": 15,
++          "std_dev": 1.5
++        },
++        "weight": 0.4065,
++        "backtest_sharpe": 0.7443,
++        "backtest_sortino": 1.109,
++        "backtest_max_drawdown": 10.792,
++        "backtest_win_rate": 0.6738
+       }
+     ],
+     "NDX_low_vol": [
+       {
+-        "strategy": "dual_ma",
++        "strategy": "rsi_mean_revert",
++        "params": {
++          "period": 14,
++          "oversold": 35,
++          "overbought": 65
++        },
++        "weight": 0.5448,
++        "backtest_sharpe": 1.1768,
++        "backtest_sortino": 1.9528,
++        "backtest_max_drawdown": 10.7112,
++        "backtest_win_rate": 0.8196
++      },
++      {
++        "strategy": "bollinger_band",
+         "params": {
+-          "fast": 10,
+-          "slow": 20
++          "period": 25,
++          "std_dev": 1.5
+         },
+-        "weight": 1.0,
+-        "backtest_sharpe": 0.1077,
+-        "backtest_win_rate": 0.4194
++        "weight": 0.4552,
++        "backtest_sharpe": 0.9834,
++        "backtest_sortino": 1.5717,
++        "backtest_max_drawdown": 12.7388,
++        "backtest_win_rate": 0.7286
+       }
+     ]
+   }
+diff --git a/mytrader/designs/design_v2/07-backtest-module.md b/mytrader/designs/design_v2/07-backtest-module.md
+index 573715f..c927118 100644
+--- a/mytrader/designs/design_v2/07-backtest-module.md
++++ b/mytrader/designs/design_v2/07-backtest-module.md
+@@ -381,6 +381,8 @@ def run_matrix_backtest(universe: UniverseManager,
+ |--------|------|------|
+ | **组内取平均** | 等权合并组内日收益率序列，计算组合 Sharpe（而非直接平均各标的 Sharpe 比率） | 避免单只过拟合；Sharpe 是比率，不能直接平均；需要组合视角 |
+ | **组合 Sortino**（迭代 #1 新增） | 与组合 Sharpe 同口径：等权合并日收益率 → `_compute_sortino(combined)` | Constitution L1 首要 KPI；比率不可直接平均；与 Sharpe 同口径保证可比 |
++| **组合 Max Drawdown**（迭代 #2 新增） | 等权合并组内日收益率 → cumprod → cummax → drawdown → max，返回正百分数 | Constitution L1 DD≤20% 硬约束；DD 是路径依赖比率不可直接平均；per-stock avg DD 虚高（无分散化效应） |
++| **NaN 安全处理**（迭代 #2 新增） | `_safe_float()` 拦截 NaN/None/Inf；`_safe_mean()` 拦截空列表/全 NaN | vectorbt 无交易时 stats 返回 NaN；`NaN or 0.0` 仍为 NaN（NaN 是 truthy）导致 JSON 序列化失败 |
+ | **策略名校验**（迭代 #1 新增） | `_run_group` 进入策略循环前检查 `strategy not in STRATEGY_REGISTRY` → `logger.warning` + `continue` | 防止策略名拼写错误被静默跳过（迭代 #1 修复的 bug：`main.py` 误用 `"rsi"/"macd"/"bollinger"` 简称导致 3 个策略 6 天未跑） |
+ | **参数按组** | 同组共用参数，不对单只优化 | 防过拟合（详见 02-strategy-engine.md 6.3） |
+ | **历史分组对齐** | 矩阵回测使用 point-in-time 分组（按回测时间点重算波动率），而非当前静态分组 | 避免回测静态分组而实盘动态分组导致回测/实盘不一致 |
+diff --git a/mytrader/main.py b/mytrader/main.py
+index c6d8a79..375fef9 100644
+--- a/mytrader/main.py
++++ b/mytrader/main.py
+@@ -40,10 +40,16 @@ REOPTIMIZE_STRATEGIES: list[str] = [
+ ]
+ 
+ REOPTIMIZE_PARAM_GRIDS: dict[str, dict[str, list]] = {
+-    "dual_ma":         {"fast": [5, 10], "slow": [20, 40, 60]},
+-    "rsi_mean_revert": {"period": [14], "oversold": [30], "overbought": [70]},
+-    "macd_cross":      {"fast": [12], "slow": [26], "signal_period": [9]},
+-    "bollinger_band":  {"period": [20], "std_dev": [2.0]},
++    # 迭代 #2：从单点扩展为真网格。原单点网格（fast=[5,10], slow=[20,40,60]）
++    # 仅 6 个组合，无法充分探索参数空间。扩展后 4×5=20 个组合。
++    "dual_ma":         {"fast": [5, 10, 15, 20], "slow": [20, 30, 40, 60, 80]},
++    # 迭代 #2：从单点 [14,30,70] 扩展为 3×3×3=27 个组合，覆盖均值回归周期
++    # 与超买超卖阈值的常用范围。oversold/overbought 保持对称（25/75、30/70、35/65）。
++    "rsi_mean_revert": {"period": [7, 14, 21], "oversold": [25, 30, 35], "overbought": [65, 70, 75]},
++    # 迭代 #2：MACD 快/慢/信号周期网格 3×3×3=27 个组合，包含经典 12/26/9。
++    "macd_cross":      {"fast": [8, 12, 16], "slow": [21, 26, 32], "signal_period": [5, 9, 12]},
++    # 迭代 #2：布林带 3×3=9 个组合，覆盖常用 std_dev 范围 [1.5, 2.0, 2.5]。
++    "bollinger_band":  {"period": [15, 20, 25], "std_dev": [1.5, 2.0, 2.5]},
+ }
+ 
+ 
+diff --git a/mytrader/mytrader/backtest/matrix_backtest.py b/mytrader/mytrader/backtest/matrix_backtest.py
+index 71c8edc..7c06830 100644
+--- a/mytrader/mytrader/backtest/matrix_backtest.py
++++ b/mytrader/mytrader/backtest/matrix_backtest.py
+@@ -60,7 +60,8 @@ class GroupBacktestResult:
+     avg_max_drawdown_pct: float
+     avg_win_rate_pct: float
+     symbol_count: int
+-    portfolio_sortino: float = 0.0   # 等权组合 Sortino（迭代 #1 新增）
++    portfolio_sortino: float = 0.0          # 等权组合 Sortino（迭代 #1 新增）
++    portfolio_max_drawdown: float = 0.0     # 等权组合最大回撤（迭代 #2 新增，Constitution L1 KPI）
+ 
+ 
+ @dataclass
+@@ -78,6 +79,49 @@ class MatrixBacktestReport:
+ # 核心函数
+ # ---------------------------------------------------------------------------
+ 
++def _safe_float(value: Any, default: float = 0.0) -> float:
++    """NaN/None/非数值安全转 float（迭代 #2 新增）。
++
++    问题背景：vectorbt 在无交易场景下，`pf.stats()` 的 Win Rate / Sharpe 等
++    字段会返回 NaN。`float(NaN or 0.0)` 仍是 NaN（NaN 是 truthy），导致
++    JSON 序列化写出非法 JSON（NaN/Infinity 非 JSON 规范）。
++
++    处理顺序：
++        1. None → default
++        2. 数值类型但 NaN/Inf → default
++        3. 非数值（字符串等）尝试 float() 转换，失败 → default
++    """
++    if value is None:
++        return default
++    try:
++        f = float(value)
++    except (TypeError, ValueError):
++        return default
++    if not np.isfinite(f):   # 拦截 NaN / +Inf / -Inf
++        return default
++    return f
++
++
++def _safe_mean(values: Any, default: float = 0.0) -> float:
++    """空列表 / 全 NaN 安全的均值（迭代 #2 新增）。
++
++    问题背景：`np.mean([])` 会触发 RuntimeWarning 并返回 NaN；
++    `np.mean([NaN, NaN])` 直接返回 NaN。在 GroupBacktestResult 聚合时
++    若某组只有 1 个标的且其字段为 NaN，会导致下游 JSON 序列化失败。
++
++    行为：
++        - 空列表 / 全 NaN → default
++        - 部分 NaN → 自动忽略 NaN 后取均值（np.nanmean 语义）
++    """
++    arr = np.asarray(values, dtype=float)
++    if arr.size == 0:
++        return default
++    mask = np.isfinite(arr)
++    if not mask.any():
++        return default
++    return float(arr[mask].mean())
++
++
+ def _compute_sharpe(returns: pd.Series, periods_per_year: int = 252) -> float:
+     """从日收益率序列计算年化 Sharpe Ratio。"""
+     returns = returns.dropna()
+@@ -186,11 +230,11 @@ def _backtest_one(
+             symbol=str(df.index.name or ""),
+             strategy=strategy_name,
+             params=params,
+-            sharpe=float(stats.get("Sharpe Ratio", 0.0) or 0.0),
+-            total_return_pct=float(stats.get("Total Return [%]", 0.0) or 0.0),
+-            max_drawdown_pct=float(stats.get("Max Drawdown [%]", 0.0) or 0.0),
+-            win_rate_pct=float(stats.get("Win Rate [%]", 0.0) or 0.0),
+-            total_trades=int(stats.get("Total Trades", 0) or 0),
++            sharpe=_safe_float(stats.get("Sharpe Ratio")),
++            total_return_pct=_safe_float(stats.get("Total Return [%]")),
++            max_drawdown_pct=_safe_float(stats.get("Max Drawdown [%]")),
++            win_rate_pct=_safe_float(stats.get("Win Rate [%]")),
++            total_trades=int(_safe_float(stats.get("Total Trades"), default=0.0)),
+             daily_returns=daily_returns,
+             sortino=_compute_sortino(daily_returns),
+         )
+@@ -226,6 +270,40 @@ def _portfolio_sortino_from_results(results: list[SingleBacktestResult]) -> floa
+     return _compute_sortino(combined)
+ 
+ 
++def _portfolio_max_drawdown_from_results(
++    results: list[SingleBacktestResult],
++) -> float:
++    """等权合并组内日收益率序列，计算组合最大回撤（迭代 #2 新增，Constitution L1 KPI）。
++
++    与 `_portfolio_sharpe_from_results` 同语义：不能取各标的 DD 算术平均，
++    因为 DD 是路径依赖的比率。正确做法是先把��内日收益率等权合并为组合序列，
++    再 cumprod → cummax → drawdown → max。
++
++    返回值约定：百分比形式（与 `SingleBacktestResult.max_drawdown_pct` 一致，
++    vectorbt stats 中 `Max Drawdown [%]` 同样是百分数，例如 -15.2 表示 15.2% 回撤）。
++    本函数返回正值（0.0 ~ 100.0）便于聚合与 JSON 输出。
++
++    退化处理：
++        - 无有效日收益率 → 0.0
++        - 全 0 收益率（cumprod 恒为 1.0）→ 0.0
++    """
++    valid = [r.daily_returns for r in results if not r.daily_returns.empty]
++    if not valid:
++        return 0.0
++    combined = pd.concat(valid, axis=1).mean(axis=1).dropna()
++    if len(combined) < 2:
++        return 0.0
++    # 组合累计净值：初始 1.0，每日乘 (1 + r)
++    cumvalue = (1.0 + combined).cumprod()
++    peak = cumvalue.cummax()
++    drawdown = (cumvalue - peak) / peak   # 负值，0 表示无回撤
++    dd_max_pct = float(drawdown.min())    # 最负值，例如 -0.152
++    if not np.isfinite(dd_max_pct):
++        return 0.0
++    # 转为正百分数（与 vectorbt Max Drawdown [%] 的口径一致但取正号）
++    return abs(dd_max_pct) * 100.0
++
++
+ def _optimize_ensemble_weights(
+     group_results: list[tuple[str, dict, list[SingleBacktestResult]]],
+     conflict_threshold: float = 0.3,
+@@ -444,17 +522,20 @@ class MatrixBacktest:
+                     strategy=strategy,
+                     params=best_params,
+                     portfolio_sharpe=best_sharpe,
+-                    avg_total_return_pct=float(
+-                        np.mean([r.total_return_pct for r in best_results])
++                    avg_total_return_pct=_safe_mean(
++                        [r.total_return_pct for r in best_results]
+                     ),
+-                    avg_max_drawdown_pct=float(
+-                        np.mean([r.max_drawdown_pct for r in best_results])
++                    avg_max_drawdown_pct=_safe_mean(
++                        [r.max_drawdown_pct for r in best_results]
+                     ),
+-                    avg_win_rate_pct=float(
+-                        np.mean([r.win_rate_pct for r in best_results])
++                    avg_win_rate_pct=_safe_mean(
++                        [r.win_rate_pct for r in best_results]
+                     ),
+                     symbol_count=len(best_results),
+                     portfolio_sortino=best_sortino,
++                    portfolio_max_drawdown=_portfolio_max_drawdown_from_results(
++                        best_results
++                    ),
+                 ))
+ 
+         if not group_results:
+@@ -483,6 +564,7 @@ class MatrixBacktest:
+                 "weight": round(weight, 4),
+                 "backtest_sharpe": round(gr.portfolio_sharpe if gr else 0.0, 4),
+                 "backtest_sortino": round(gr.portfolio_sortino if gr else 0.0, 4),
++                "backtest_max_drawdown": round(gr.portfolio_max_drawdown if gr else 0.0, 4),
+                 "backtest_win_rate": round(gr.avg_win_rate_pct / 100 if gr else 0.5, 4),
+             })
+ 
+diff --git a/mytrader/mytrader/universe/grouping.py b/mytrader/mytrader/universe/grouping.py
+index 1c61c1c..560c18d 100644
+--- a/mytrader/mytrader/universe/grouping.py
++++ b/mytrader/mytrader/universe/grouping.py
+@@ -16,7 +16,10 @@ from mytrader.strategy.indicators import atr as compute_atr
+ 
+ # 波动率分层阈值（ATR% = ATR / close，近 60 日均值）
+ _VOL_HIGH_THRESHOLD = 0.03   # ATR% > 3% → high
+-_VOL_LOW_THRESHOLD  = 0.01   # ATR% < 1% → low；否则 mid
++# 迭代 #2：从 0.01 调到 0.02。原因：516 标的中 ATR% < 0.01 的仅 2 个，
++# 导致 low_vol 组只有 1 个标的、无分散化效应，组合 Sharpe/Sortino 退化为
++# 单标的指标。0.02 阈值下 low_vol 组约 30~50 只标的，分散化更充分。
++_VOL_LOW_THRESHOLD  = 0.02   # ATR% < 2% → low；否则 mid
+ 
+ 
+ def compute_volatility_tier(df: pd.DataFrame, lookback: int = 20) -> str:
+diff --git a/mytrader/tests/test_matrix_backtest.py b/mytrader/tests/test_matrix_backtest.py
+index 6766e26..90747ce 100644
+--- a/mytrader/tests/test_matrix_backtest.py
++++ b/mytrader/tests/test_matrix_backtest.py
+@@ -19,8 +19,11 @@ from mytrader.backtest.matrix_backtest import (
+     _backtest_one,
+     _compute_sharpe,
+     _compute_sortino,
++    _portfolio_max_drawdown_from_results,
+     _portfolio_sharpe_from_results,
+     _portfolio_sortino_from_results,
++    _safe_float,
++    _safe_mean,
+     SingleBacktestResult,
+ )
+ 
+@@ -196,6 +199,92 @@ class TestHelpers:
+             f"差异应 >1e-6，否则说明实现退化为算术平均"
+         )
+ 
++    # ── _safe_float / _safe_mean（迭代 #2 新增）─────────────────────────────
++
++    def test_safe_float_handles_nan(self):
++        """NaN 是 truthy，`NaN or 0.0` 仍为 NaN；_safe_float 必须返回 default。"""
++        nan = float("nan")
++        assert _safe_float(nan) == 0.0
++        assert _safe_float(nan, default=-1.0) == -1.0
++
++    def test_safe_float_handles_none(self):
++        assert _safe_float(None) == 0.0
++        assert _safe_float(None, default=3.14) == 3.14
++
++    def test_safe_float_handles_inf(self):
++        assert _safe_float(float("inf")) == 0.0
++        assert _safe_float(float("-inf")) == 0.0
++
++    def test_safe_float_passes_normal_numbers(self):
++        assert _safe_float(1.5) == 1.5
++        assert _safe_float(0) == 0.0
++        assert _safe_float(-2.7) == -2.7
++        assert _safe_float("3.14") == 3.14   # 字符串数字可转
++
++    def test_safe_float_handles_non_numeric(self):
++        assert _safe_float("abc") == 0.0
++        assert _safe_float([1, 2, 3]) == 0.0
++        assert _safe_float(object()) == 0.0
++
++    def test_safe_mean_empty_list(self):
++        """空列表返回 default（np.mean([]) 会触发 RuntimeWarning 并返回 NaN）。"""
++        assert _safe_mean([]) == 0.0
++        assert _safe_mean([], default=2.0) == 2.0
++
++    def test_safe_mean_all_nan(self):
++        """全 NaN 列表返回 default。"""
++        assert _safe_mean([float("nan"), float("nan")]) == 0.0
++
++    def test_safe_mean_partial_nan(self):
++        """部分 NaN 自动忽略（nanmean 语义）。"""
++        result = _safe_mean([1.0, float("nan"), 3.0])
++        assert abs(result - 2.0) < 1e-9
++
++    def test_safe_mean_normal(self):
++        assert abs(_safe_mean([1.0, 2.0, 3.0]) - 2.0) < 1e-9
++
++    # ── _portfolio_max_drawdown_from_results（迭代 #2 新增）────────────────
++
++    def test_portfolio_max_drawdown_no_returns(self):
++        """无有效日收益率 → 0.0。"""
++        results: list[SingleBacktestResult] = []
++        assert _portfolio_max_drawdown_from_results(results) == 0.0
++
++    def test_portfolio_max_drawdown_all_positive(self):
++        """全正收益 → 无回撤，返回 0.0。"""
++        r = pd.Series([0.001] * 100)
++        results = [SingleBacktestResult("S1", "s", {}, 0.0, 0, 0, 0, 0, r)]
++        assert _portfolio_max_drawdown_from_results(results) == 0.0
++
++    def test_portfolio_max_drawdown_known_value(self):
++        """已知值验算：先涨后跌回测组合 DD。
++
++        组合等权日收益率 = r。cumvalue 从 1.0 涨到 1.05，再跌到 0.95。
++        peak = 1.05, trough = 0.95, DD = (0.95 - 1.05) / 1.05 ≈ -9.524%。
++        """
++        # 10 天 +1% → cumvalue 涨到 1.01^10 ≈ 1.1046
++        # 10 天 -1% → cumvalue 跌到 1.1046 * 0.99^10 ≈ 0.9994
++        # peak=1.1046, trough=0.9994, DD = (0.9994 - 1.1046) / 1.1046 ≈ -9.52%
++        returns = pd.Series([0.01] * 10 + [-0.01] * 10)
++        results = [SingleBacktestResult("S1", "s", {}, 0.0, 0, 0, 0, 0, returns)]
++        dd = _portfolio_max_drawdown_from_results(results)
++        assert dd > 0.0, "存在回撤时应返回正值"
++        assert 8.0 < dd < 11.0, f"DD 应在 9.5% 附近，实际 {dd:.4f}%"
++
++    def test_portfolio_max_drawdown_returns_positive_pct(self):
++        """返回值为正百分数（与 backtest_max_drawdown 输出口径一致）。"""
++        np.random.seed(42)
++        # 模拟一个带回撤的序列
++        r = pd.Series(np.concatenate([
++            np.random.normal(0.002, 0.005, 50),
++            np.random.normal(-0.003, 0.008, 30),
++            np.random.normal(0.001, 0.004, 50),
++        ]))
++        results = [SingleBacktestResult("S1", "s", {}, 0.0, 0, 0, 0, 0, r)]
++        dd = _portfolio_max_drawdown_from_results(results)
++        assert dd >= 0.0
++        assert isinstance(dd, float)
++
+     def test_backtest_one_with_open(self):
+         """传入 open= 参数，回测正常运行。"""
+         df = _make_ohlcv(300)
+@@ -424,3 +513,64 @@ class TestMatrixBacktest:
+             assert isinstance(gr.portfolio_sortino, float), (
+                 f"portfolio_sortino 应为 float，实际 {type(gr.portfolio_sortino)}"
+             )
++
++    # ── 迭代 #2 新增：portfolio_max_drawdown 字段 + backtest_max_drawdown 输出 ──
++
++    def test_group_results_have_portfolio_max_drawdown(self, mock_store, mock_universe):
++        """GroupBacktestResult.portfolio_max_drawdown 是非负浮点数。"""
++        mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=1)
++        report = mb.run(
++            strategies=["dual_ma"],
++            param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
++        )
++        for gr in report.group_results:
++            assert isinstance(gr.portfolio_max_drawdown, float), (
++                f"portfolio_max_drawdown 应为 float，实际 {type(gr.portfolio_max_drawdown)}"
++            )
++            assert gr.portfolio_max_drawdown >= 0.0, (
++                f"portfolio_max_drawdown 应非负，实际 {gr.portfolio_max_drawdown}"
++            )
++
++    def test_output_file_contains_max_drawdown(self, mock_store, mock_universe, tmp_path):
++        """strategy_weights.json 每个权重条目含 backtest_max_drawdown 字段。"""
++        output = tmp_path / "weights_with_dd.json"
++        mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=1)
++        mb.run(
++            strategies=["dual_ma"],
++            param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
++            output_file=output,
++        )
++        data = json.loads(output.read_text())
++        for gid, weights in data["groups"].items():
++            for w in weights:
++                assert "backtest_max_drawdown" in w, (
++                    f"{gid}: 权重条目缺少 backtest_max_drawdown 字段，"
++                    f"实际 keys={list(w.keys())}"
++                )
++                assert isinstance(w["backtest_max_drawdown"], (int, float)), (
++                    f"{gid}: backtest_max_drawdown 应为数值，"
++                    f"实际 {type(w['backtest_max_drawdown'])}"
++                )
++
++    def test_output_file_no_nan(self, mock_store, mock_universe, tmp_path):
++        """输出的 JSON 文件不能包含 NaN（否则非法 JSON）。
++
++        迭代 #2 修复的核心问题：vectorbt 无交易场景下 Win Rate 返回 NaN，
++        `float(NaN or 0.0)` 仍为 NaN（NaN 是 truthy），导致 JSON 序列化写出
++        非法 JSON（NaN/Infinity 非 JSON 规范）。_safe_float 修复后不应再出现。
++        """
++        output = tmp_path / "weights_no_nan.json"
++        mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=1)
++        mb.run(
++            strategies=["dual_ma"],
++            param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
++            output_file=output,
++        )
++        # 用严格模式解析 JSON：json.loads 默认接受 NaN，需用 parse_constant 拦截
++        raw = output.read_text()
++        # 替换 NaN/Infinity 为哨兵字符串，再用 json 解析检测
++        import re as _re
++        bad_tokens = _re.findall(r"\bNaN\b|\bInfinity\b|\b-Infinity\b", raw)
++        assert not bad_tokens, (
++            f"JSON 中发现非法 token: {bad_tokens}（应为有限数值）"
++        )

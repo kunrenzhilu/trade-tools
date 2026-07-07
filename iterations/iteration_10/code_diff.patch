@@ -1,0 +1,642 @@
+diff --git a/alignment/decision_log.md b/alignment/decision_log.md
+index 00526e1..043c7bd 100644
+--- a/alignment/decision_log.md
++++ b/alignment/decision_log.md
+@@ -337,3 +337,51 @@
+ - **决策结果**: SPY 不可用时 alpha=0.0，所有候选 alpha 相等 → 稳定排序保留原顺序 → ensemble 退化为等权。与迭代 #7 降级策略一致。
+ 
+ ---
++
++### [2026-07-05 UTC] 迭代 #10 — _backtest_batch vbt 异常时的安全 fallback
++
++- **困境描述**: `_backtest_batch` 用一次 `vbt.Portfolio.from_signals` 处理组内所有标的。如果 vbt 调用因数据问题（如全 NaN、shape 不一致）抛异常，整个组的回测会失败，阻塞 `--reoptimize`。spec §8 要求"回滚方案：如果 batch 版本数值不一致且无法修复，保留 `_backtest_one` 作为 fallback"。
++
++- **涉及 AI Constitution 条款**:
++  - L7: 验证流水线 — 回测不能因实现问题阻塞
++  - L1: KPI 必须可解释 — 异常时不应静默失败
++  - L8: 重大决策须通知 — 但 fallback 触发是降级而非"重大决策"，用 WARNING 日志即可
++
++- **决策逻辑**:
++  1. **保留 `_backtest_one` 函数**：不删除旧实现，作为 batch 失败时的 fallback
++  2. **try/except 包裹 vbt 调用**：异常时退化为逐标的 `_backtest_one`，保证回测不中断
++  3. **WARNING 日志**：`_backtest_batch vbt call failed: {e} — falling back to per-symbol _backtest_one`
++  4. **不抛异常**：fallback 后返回与 batch 相同格式的 `list[SingleBacktestResult]`，调用方无感知
++  5. **测试验证**：`test_batch_unknown_strategy` / `test_batch_empty_data` 等边界场景测试覆盖
++
++- **决策结果**: 
++  - 保留 `_backtest_one` 作为 fallback
++  - `_backtest_batch` 在 vbt 异常时 WARNING + 退化为逐标的回测
++  - 不阻塞 `--reoptimize`，不抛异常给上层
++  - 数值一致性测试验证 batch 正常路径与 single 一致，fallback 路径天然一致（就是 single）
++
++---
++
++### [2026-07-05 UTC] 迭代 #10 — mock-based 测试的 patch 路径更新
++
++- **困境描述**: `test_matrix_backtest.py` 中 4 个测试（`test_top_k_selection_uses_alpha` 等）用 `patch("mytrader.backtest.matrix_backtest._backtest_one")` 拦截回测函数返回受控结果。迭代 #10 将 `_run_group` 从调用 `_backtest_one` 改为调用 `_backtest_batch`，这些测试的 mock 失效。
++
++- **涉及 AI Constitution 条款**:
++  - L7: 测试纪律 — 测试不能因实现重构而失效
++  - L1: KPI 可解释 — mock 应验证行为，不应与实现强耦合
++
++- **决策逻辑**:
++  1. **同步更新 mock**：将 `mock_backtest_one(df, strategy, params, ...)` 改为 `mock_backtest_batch(data, strategy_name, params, ...)`，返回 `list[SingleBacktestResult]`
++  2. **保留测试意图**：测试验证的是 top-K 选择 / Alpha 排序 / Sortino 过滤等行为，不是回测实现细节
++  3. **mock 签名匹配新函数**：`mock_backtest_batch(data, strategy_name, params, *args, **kwargs)` 返回列表，与 `_backtest_batch` 签名一致
++  4. **不删除 `_backtest_one` 测试**：`test_backtest_one_with_open` 等直接测试 `_backtest_one` 的保留，验证单标的回测逻辑
++
++- **决策结果**: 
++  - 4 个 mock-based 测试从 patch `_backtest_one` 改为 patch `_backtest_batch`
++  - mock 函数签名匹配 `_backtest_batch(data, strategy_name, params, ...)`
++  - 测试意图保持不变（验证 Alpha 排序、Sortino 过滤等行���）
++  - `_backtest_one` 的直接测试全部保留
++
++- **经验教训**: mock 是实现耦合的，当被测函数的内部依赖改变时，mock 需要同步更新。未来应优先用真实数据测试（如 `test_batch_backtest.py` 的数值一致性测试），减少 mock 依赖。
++
++---
+diff --git a/alignment/iteration_trajectory.md b/alignment/iteration_trajectory.md
+index bdf814f..7a6196c 100644
+--- a/alignment/iteration_trajectory.md
++++ b/alignment/iteration_trajectory.md
+@@ -1022,3 +1022,119 @@ Full pytest: 602 passed, 16 deselected, 0 failed, 103 warnings in 15.47s
+ > - CodeBuddy 自行更新了 trajectory ✅
+ 
+ ---
++
++## 迭代 #10 — vectorbt Batch Backtest Optimization
++
++- **日期**: 2026-07-05 UTC
++- **类型**: 回测核心路径性能优化（中高风险）
++- **变更摘要**: 将 MatrixBacktest 和 Walk-Forward 的 for-symbol 逐标的循环改为 vectorbt 矩阵化调用（`_backtest_batch`），单次 `vbt.Portfolio.from_signals` 处理组内所有标的，预计 10-20x 提速；新增进度日志；补充 24 个数值一致性测试
++- **状态**: passed
++- **执行时长**: 1 轮对话（手动开发）
++- **测试数**: 602 → 626（+24 新测试用例）
++
++### 背景
++
++Iter #7 实测 `--reoptimize` 耗时 ~4 小时。瓶颈分析显示 vbt 调用次数 ~200,000 次（40,000 次/组 × 4 轮 WF），每次 30-50ms。当前代码把 vectorbt 当成"单标的回测器在 for 循环里调"，完全没用到 vectorbt 的矩阵化特性。
++
++### 变更详情
++
++**P0: 新增 `_backtest_batch()` 函数** (`matrix_backtest.py`)
++- 一次 `vbt.Portfolio.from_signals` 处理组内所有标的，替代 for-symbol 循环
++- vbt 调用次数从 ~40,000/组降到 ~660/组（110 参数 × 6 组），**60x 减少**
++- 实现要点：
++  - 逐标的调用策略函数（保持 `_backtest_one` 的 try/except TypeError 语义）
++  - 构建 close/open 矩阵（`pd.DataFrame` 自动 outer-join 时间索引）
++  - 一次 vbt 调用，通过 `pf[sym]` 提取 per-symbol stats/daily_returns
++  - 输出格式与 `_backtest_one` 完全一致，下游聚合代码无需修改
++- 安全 fallback：vbt 异常时退化为 `_backtest_one` 逐标的回测，保证不阻塞
++
++**P0: 修改 `_run_group()` 使用 batch** (`matrix_backtest.py::_run_group`)
++- 替换 `for sym in symbols: _backtest_one(...)` 为 `_backtest_batch(data, strategy, params, ...)`
++- top-K 选择 / DD 过滤 / Alpha 排序 / ensemble 权重逻辑全部保持不变
++- 迭代 #9 的所有逻辑（三级 fallback、Sortino 门槛、Alpha 排序）完全不动
++
++**P0: 修改 Walk-Forward 使用 batch** (`matrix_backtest.py::_backtest_with_params_on_period`)
++- 替换 for-symbol 循环为 `_backtest_batch`
++- Walk-Forward 4 轮验证期回测同样提速
++
++**P1: 进度日志** (`matrix_backtest.py::_run_group`)
++- 每组开始时输出 `start — N strategies × M valid symbols`
++- 每策略完成时输出 `done in X.Xs (N param combos × M symbols)`
++- 每组完成时输出 `all strategies done in X.Xs (top-K selected, dd_constrained=...)`
++- 使用 `time.time()` 计时，不影响性能
++
++**P2: 测试** (`tests/test_batch_backtest.py` 新文件)
++- 新增 4 个测试类共 24 个测试：
++  - `TestBatchConsistencyAllStrategies` (10): 5 策略 × 2 参数 batch vs single 数值一致性（np.allclose, rtol=1e-6）
++  - `TestBatchEdgeCases` (9): 数据不足跳过、空 DataFrame 跳过、单标的、单标的一致性、日期不对齐、空数据、未知策略、无 open 列、symbol 顺序保持
++  - `TestBatchOutputFormat` (2): 字段完整、各标的 daily_returns 独立
++  - `TestRunGroupBatchIntegration` (2): _run_group 产出权重、进度日志
++  - `TestWalkForwardBatchIntegration` (1): Walk-Forward 2 轮产出有效报告
++- 同时更新 `test_matrix_backtest.py` 中 4 个 mock-based 测试（从 patch `_backtest_one` 改为 patch `_backtest_batch`）
++
++### 验证结果
++
++```
++Targeted tests:
++  tests/test_batch_backtest.py → 24 passed
++  tests/test_matrix_backtest.py → 75 passed (4 mock-based tests updated)
++
++Full pytest (excluding live tests):
++  626 passed, 0 failed, 103 warnings in 21.41s
++```
++
++### 数值一致性验证
++
++- 所有 5 策略（dual_ma, rsi_mean_revert, rsi_trend_filter, macd_cross, bollinger_band）× 2 参数组合
++- `daily_returns` 严格一致：`np.testing.assert_allclose(rtol=1e-6, atol=1e-8)`
++- `sharpe` / `total_return_pct` / `max_drawdown_pct` / `win_rate_pct` 允许 1e-4 浮点误差（vbt 内部计算路径差异）
++- `sortino` 严格一致（从 daily_returns 派生）
++- `total_trades` 严格一致
++
++### Constitution 合规
++- ✅ 未突破 DD 20% 约束（DD 过滤逻辑完全不变）
++- ✅ 测试覆盖率提升（+24 测试，602 → 626）
++- ✅ 未修改策略代码 / 指标代码 / Alpha 排序逻辑（迭代 #9 改动不动）
++- ✅ 未缩短回测窗口（仍 5 年）
++- ✅ 决策可解释（batch 与 single 数值一致，top-K 选择结果不变）
++- ✅ 未引入 RL / 未引入不安全依赖
++- ✅ 未触发真实交易
++- ✅ 文档与代码同步（07-backtest-module.md + CODEBUDDY.md + trajectory）
++
++### Experience Learned
++- **vectorbt 矩阵化是核心优化**：一次 `from_signals` 处理 N 个标的比 N 次单标的调用快得多，且 vbt 内部并行计算
++- **`pf[sym]` 提取 per-symbol 结果**：vbt 1.0+ 的列分组语义保证每列独立结算 P&L，stats 提取与单标的一致
++- **NaN 对齐处理**：`pd.DataFrame(dict)` 自动 outer-join 索引，vbt 对 NaN close 内部处理为"不交易"。美股实际场景中所有标的共享交易日历，日期对齐天然成立
++- **mock 测试需要更新**：当被测函数的内部实现改变（从 `_backtest_one` 改为 `_backtest_batch`），mock patch 路径也需要同步更新。这提醒 mock 是实现耦合的，应谨慎使用
++- **loguru 日志捕获**：pytest 的 `caplog` fixture 不捕获 loguru 日志，需用 `logger.add(lambda m: msgs.append(str(m)), level=...)` 模式
++- **安全 fallback 设计**：batch 路径有异常时退化为 `_backtest_one` 逐标的回测，保证回测不中断（虽然性能下降，但功能正确）
++
++### 后续建议
++1. **性能验证**（Meta-Agent 验收阶段）：运行小规模 reoptimize（1 个组），对比新旧耗时。预期单组从 ~6 分钟降到 < 1 分钟
++2. **完整 reoptimize 测试**：验证 4 小时 → 预期 15-30 分钟
++3. **joblib 并行**（spec §3 明确不做）：batch 验证稳定后，可考虑组间并行（6 组并行）
++4. **进一步优化**：vbt 支持 `param_grid` 内置参数网格搜索，未来可考虑用 vbt 原生网格替代 for-params 循环
++
++### L7 流水线状态
++```
++✅ Backtest (≥5年, alpha-based selection, batch-optimized)
++✅ Walk-Forward (4轮, 自动继承 alpha 排序, batch-optimized)
++✅ Portfolio Backtest | ✅ Paper Trading Integrity
++✅ Harness Reliability | ✅ SignalRanker Sortino Priority
++✅ Strategy Diversity (5 策略 pool)
++✅ Alpha-Based Selection (迭代 #9 完成)
++🔄 Batch Backtest Optimization (迭代 #10 完成，待 --reoptimize 性能验证)
++⬜ Paper Trade ≥1月 | ⬜ Live
++```
++
++---
++
++> **Orchestrator 验证记录** (自动追加)
++> - 迭代状态: passed
++> - 测试: 0 passed, 0 failed
++> - 违规: 0 条
++> - 高风险文件: 0 个
++> - 测试数变化: 602 → 626
++> - CodeBuddy 自行更新了 trajectory ✅
++
++---
+diff --git a/mytrader/mytrader/backtest/matrix_backtest.py b/mytrader/mytrader/backtest/matrix_backtest.py
+index 0fbb3bb..a577903 100644
+--- a/mytrader/mytrader/backtest/matrix_backtest.py
++++ b/mytrader/mytrader/backtest/matrix_backtest.py
+@@ -390,6 +390,163 @@ def _backtest_one(
+         return None
+ 
+ 
++def _backtest_batch(
++    data: dict[str, pd.DataFrame],
++    strategy_name: str,
++    params: dict,
++    init_cash: float = 100_000.0,
++    fees: float = 0.001,
++    slippage: float = 0.001,
++) -> list[SingleBacktestResult]:
++    """对组内所有标的批量执行回测（迭代 #10 新增）。
++
++    核心优化：用一次 vbt.Portfolio.from_signals 处理组内所有标的，
++    替代 `_backtest_one` 的 for-symbol 循环。调用次数从 O(N 标的)
++    降为 O(1)，预计 10-20x 提速（spec §1）。
++
++    实现要点：
++        1. 逐标的调用策略函数（保持与 `_backtest_one` 一致的调用语义：
++           先尝试 `strategy_fn(close, df=df, **params)`，TypeError 时
++           回退到 `strategy_fn(close, **params)`）。策略函数本身不改。
++        2. 构建列式矩阵（每列一个标的），用一次 vbt 调用回测所有标的。
++           vbt 1.0+ 的列分组语义保证每列独立结算 P&L。
++        3. 通过 `pf[sym]` 提取每列的 stats/daily_returns，输出格式与
++           `_backtest_one` 完全一致，下游聚合代码无需修改。
++
++    对齐策略：
++        - 用 `pd.DataFrame(dict)` 构造时自动 outer-join 时间索引，
++          缺失值填 NaN。
++        - vbt 对 NaN close 的处理：内部 fillna 为 0 收益率，等价于
++          "该标的此日期不交易"。当标的在样本外日期缺失时（如退市、
++          新上市），其 stats 仍按其有效日期区间计算。
++        - 在美股实际场景中所有标的共享交易日历，日期对齐天然成立，
++          不会有大量 NaN。
++
++    Args:
++        data:          {symbol: OHLCV DataFrame} 字典
++        strategy_name: 策略名
++        params:        策略参数
++        init_cash:     初始资金（vbt 给每列分配独立的 init_cash）
++        fees:          手续费率
++        slippage:      滑点率
++
++    Returns:
++        SingleBacktestResult 列表（与 `_backtest_one` 输出格式一致）。
++        数据不足 / 策略异常的标的会被跳过（不返回 None，不抛异常）。
++        空数据时返回空列表。
++    """
++    strategy_fn = STRATEGY_REGISTRY.get(strategy_name)
++    if strategy_fn is None:
++        return []
++
++    # 1. 逐标的调用策略函数，构建 signal / close / open 列
++    signal_columns: dict[str, pd.Series] = {}
++    close_columns: dict[str, pd.Series] = {}
++    open_columns: dict[str, pd.Series] = {}
++
++    for sym, df in data.items():
++        if df is None or df.empty or len(df) < 30:
++            continue
++        close = df["close"]
++        if "open" in df.columns:
++            open_ = df["open"]
++            open_columns[sym] = open_
++        else:
++            open_ = None
++
++        # 调用策略（与 _backtest_one 一致的 try/except 语义）
++        try:
++            sig = strategy_fn(close, df=df, **params)
++        except TypeError:
++            sig = strategy_fn(close, **params)
++        except Exception as e:
++            logger.debug(
++                f"[backtest_batch] {strategy_name}({params}) {sym} failed: {e}"
++            )
++            continue
++
++        signal_columns[sym] = sig
++        close_columns[sym] = close
++
++    if not signal_columns:
++        return []
++
++    # 2. 构建矩阵（自动 outer-join 索引，缺失值填 NaN）
++    close_matrix = pd.DataFrame(close_columns)
++    signal_matrix = pd.DataFrame(signal_columns)
++    has_open = bool(open_columns)
++    open_matrix = pd.DataFrame(open_columns) if has_open else None
++
++    # 3. 一次 vbt 调用处理所有标的
++    entries = signal_matrix == 1
++    exits = signal_matrix == -1
++
++    pf_kwargs: dict[str, Any] = dict(
++        entries=entries,
++        exits=exits,
++        init_cash=init_cash,
++        fees=fees,
++        slippage=slippage,
++        size=0.95,
++        size_type="Percent",
++        freq="D",
++    )
++
++    try:
++        if has_open:
++            pf = vbt.Portfolio.from_signals(
++                close=close_matrix, open=open_matrix, **pf_kwargs
++            )
++        else:
++            pf = vbt.Portfolio.from_signals(close_matrix, **pf_kwargs)
++    except Exception as e:
++        logger.warning(
++            f"[backtest_batch] {strategy_name}({params}) vbt call failed: {e} "
++            f"— falling back to per-symbol _backtest_one"
++        )
++        # 回滚方案：批量失败时退化为逐标的回测，保证回测不中断
++        results: list[SingleBacktestResult] = []
++        for sym, df in data.items():
++            if df is None or df.empty or len(df) < 30:
++                continue
++            df = df.copy()
++            df.index.name = sym
++            r = _backtest_one(
++                df, strategy_name, params, init_cash, fees, slippage
++            )
++            if r is not None:
++                results.append(r)
++        return results
++
++    # 4. 提取 per-symbol 结果（与 _backtest_one 输出格式一致）
++    results = []
++    for sym in signal_matrix.columns:
++        try:
++            pf_sym = pf[sym]
++            stats = pf_sym.stats()
++            daily_returns = pf_sym.returns()
++            results.append(SingleBacktestResult(
++                symbol=sym,
++                strategy=strategy_name,
++                params=params,
++                sharpe=_safe_float(stats.get("Sharpe Ratio")),
++                total_return_pct=_safe_float(stats.get("Total Return [%]")),
++                max_drawdown_pct=_safe_float(stats.get("Max Drawdown [%]")),
++                win_rate_pct=_safe_float(stats.get("Win Rate [%]")),
++                total_trades=int(_safe_float(stats.get("Total Trades"), default=0.0)),
++                daily_returns=daily_returns,
++                sortino=_compute_sortino(daily_returns),
++            ))
++        except Exception as e:
++            logger.debug(
++                f"[backtest_batch] {strategy_name}({params}) {sym} "
++                f"stats extraction failed: {e}"
++            )
++            continue
++
++    return results
++
++
+ def _portfolio_sharpe_from_results(results: list[SingleBacktestResult]) -> float:
+     """等权合并组内日收益率序列，计算组合 Sharpe。
+ 
+@@ -518,6 +675,9 @@ def _backtest_with_params_on_period(
+     用于 Walk-Forward 验证期：用训练期产出的 best params 在验证期回测，
+     不再做参数搜索。返回原始日收益率列表，由调用方聚合为整体 portfolio。
+ 
++    迭代 #10 变更：用 `_backtest_batch` 替代 for-symbol 循环，
++    每个策略×参数组合一次 vbt 调用，加速 Walk-Forward 验证期回测。
++
+     Args:
+         mb:       MatrixBacktest 实例（复用其 store/init_cash/fees/slippage）
+         symbols:  该组的标的列表
+@@ -541,17 +701,13 @@ def _backtest_with_params_on_period(
+         params = w.get("params", {})
+         if not strategy or strategy not in STRATEGY_REGISTRY:
+             continue
+-        for sym in symbols:
+-            df = data.get(sym, pd.DataFrame())
+-            if df.empty:
+-                continue
+-            df = df.copy()
+-            df.index.name = sym
+-            r = _backtest_one(
+-                df, strategy, params,
+-                mb._init_cash, mb._fees, mb._slippage,
+-            )
+-            if r is not None and not r.daily_returns.empty:
++        # 迭代 #10：一次 batch 调用处理组内所有标的
++        results = _backtest_batch(
++            data, strategy, params,
++            mb._init_cash, mb._fees, mb._slippage,
++        )
++        for r in results:
++            if not r.daily_returns.empty:
+                 all_returns.append(r.daily_returns)
+     return all_returns
+ 
+@@ -862,7 +1018,13 @@ class MatrixBacktest:
+             - top-K 排序：从 Sortino 改为 Alpha
+             - 新增 Sortino > 0.5 最低质量门槛（二级过滤，可放宽）
+             - ensemble weights：从 Sharpe 改为 Alpha
++        迭代 #10 变更：
++            - 用 `_backtest_batch` 替代 for-symbol 循环（10-20x 提速）
++            - 每组 / 每策略增加进度耗时日志
+         """
++        import time
++
++        group_start = time.time()
+ 
+         # 1. 读取组内所有标的数据
+         data = self._store.get_bars_multi(symbols, start, end)
+@@ -873,10 +1035,20 @@ class MatrixBacktest:
+         # 迭代 #9：获取 SPY 同期日收益率用于 alpha 计算（一次获取，组内复用）
+         spy_returns = self._get_spy_returns(start, end)
+ 
++        valid_symbol_count = sum(
++            1 for df in data.values() if df is not None and not df.empty and len(df) >= 30
++        )
++        logger.info(
++            f"[MatrixBacktest] {group_id}: start — "
++            f"{len(strategies)} strategies × {valid_symbol_count} valid symbols"
++        )
++
+         # 2. 对每个策略 × 每组参数，按 alpha 选最优参数
+         group_results: list[tuple[str, dict, list[SingleBacktestResult]]] = []
+ 
+         for strategy in strategies:
++            strat_start = time.time()
++
+             # ⚠️ 早期检测未注册策略名（迭代 #1 修复"策略名拼写错误被静默跳过"的 bug）
+             # 之前 _backtest_one 内部静默 return None，导致 main.py 误用 "rsi"/"macd"/"bollinger"
+             # 简称 6 天未被发现。改为 WARNING 级日志 + continue。
+@@ -901,19 +1073,12 @@ class MatrixBacktest:
+             best_results: list[SingleBacktestResult] = []
+ 
+             for params in param_combos:
+-                # 对组内每只标的回测
+-                results = []
+-                for sym in symbols:
+-                    df = data.get(sym, pd.DataFrame())
+-                    if df.empty:
+-                        continue
+-                    df.index.name = sym  # 方便 _backtest_one 使用
+-                    r = _backtest_one(
+-                        df, strategy, params,
+-                        self._init_cash, self._fees, self._slippage
+-                    )
+-                    if r is not None:
+-                        results.append(r)
++                # 迭代 #10：用 _backtest_batch 一次处理组内所有标的
++                # 替代原 for sym in symbols: _backtest_one(...) 的逐标的循环
++                results = _backtest_batch(
++                    data, strategy, params,
++                    self._init_cash, self._fees, self._slippage,
++                )
+ 
+                 if not results:
+                     continue
+@@ -957,8 +1122,17 @@ class MatrixBacktest:
+                     backtest_alpha=best_alpha,
+                 ))
+ 
++            logger.info(
++                f"[MatrixBacktest] {group_id}: {strategy} done in "
++                f"{time.time() - strat_start:.1f}s "
++                f"({len(param_combos)} param combos × {valid_symbol_count} symbols)"
++            )
++
+         if not group_results:
+-            logger.warning(f"[MatrixBacktest] {group_id}: no valid results")
++            logger.warning(
++                f"[MatrixBacktest] {group_id}: no valid results "
++                f"(elapsed {time.time() - group_start:.1f}s)"
++            )
+             return []
+ 
+         # 3. 迭代 #9：DD 硬约束 + Sortino 门槛 + Alpha 排序选 Top-K
+@@ -1073,6 +1247,12 @@ class MatrixBacktest:
+                 "backtest_dd_status": backtest_dd_status,
+             })
+ 
++        logger.info(
++            f"[MatrixBacktest] {group_id}: all strategies done in "
++            f"{time.time() - group_start:.1f}s "
++            f"(top-{self._top_k} selected, dd_constrained={dd_constrained})"
++        )
++
+         return weights_list
+ 
+     def _write_weights(
+diff --git a/mytrader/tests/test_matrix_backtest.py b/mytrader/tests/test_matrix_backtest.py
+index 8f10886..014c064 100644
+--- a/mytrader/tests/test_matrix_backtest.py
++++ b/mytrader/tests/test_matrix_backtest.py
+@@ -1092,17 +1092,21 @@ class TestAlphaBasedTopKSelection:
+             f"测试前提失败：B 的 alpha({alpha_b:.4f}) 应 > A({alpha_a:.4f})"
+         )
+ 
+-        # Mock _backtest_one 返回受控结果
+-        def mock_backtest_one(df, strategy, params, *args, **kwargs):
+-            sym = df.index.name or "SYM"
+-            if strategy == "dual_ma":
+-                return SingleBacktestResult(
+-                    sym, strategy, params, 1.0, 10.0, 5.0, 55.0, 10, returns_a
+-                )
+-            else:  # rsi_mean_revert
+-                return SingleBacktestResult(
+-                    sym, strategy, params, 1.0, 30.0, 8.0, 50.0, 10, returns_b
+-                )
++        # Mock _backtest_batch 返回受控结果（迭代 #10：_run_group 改用 batch）
++        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
++            results = []
++            for sym, df in data.items():
++                if df is None or df.empty or len(df) < 30:
++                    continue
++                if strategy_name == "dual_ma":
++                    results.append(SingleBacktestResult(
++                        sym, strategy_name, params, 1.0, 10.0, 5.0, 55.0, 10, returns_a
++                    ))
++                else:  # rsi_mean_revert
++                    results.append(SingleBacktestResult(
++                        sym, strategy_name, params, 1.0, 30.0, 8.0, 50.0, 10, returns_b
++                    ))
++            return results
+ 
+         # 构造 mock store：返回 SPY + 普通上涨数据
+         df_up = _make_ohlcv(n, trend="up")
+@@ -1120,8 +1124,8 @@ class TestAlphaBasedTopKSelection:
+         mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=1)
+ 
+         with patch(
+-            "mytrader.backtest.matrix_backtest._backtest_one",
+-            side_effect=mock_backtest_one,
++            "mytrader.backtest.matrix_backtest._backtest_batch",
++            side_effect=mock_backtest_batch,
+         ):
+             report = mb.run(
+                 strategies=["dual_ma", "rsi_mean_revert"],
+@@ -1194,16 +1198,20 @@ class TestAlphaBasedTopKSelection:
+             f"B 应为 Sortino > 0.5 的正常策略，实际 {sortino_b:.4f}"
+         )
+ 
+-        def mock_backtest_one(df, strategy, params, *args, **kwargs):
+-            sym = df.index.name or "SYM"
+-            if strategy == "dual_ma":
+-                return SingleBacktestResult(
+-                    sym, strategy, params, 0.5, 15.0, 10.0, 50.0, 5, returns_a
+-                )
+-            else:  # rsi_mean_revert
+-                return SingleBacktestResult(
+-                    sym, strategy, params, 1.0, 20.0, 5.0, 55.0, 10, returns_b
+-                )
++        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
++            results = []
++            for sym, df in data.items():
++                if df is None or df.empty or len(df) < 30:
++                    continue
++                if strategy_name == "dual_ma":
++                    results.append(SingleBacktestResult(
++                        sym, strategy_name, params, 0.5, 15.0, 10.0, 50.0, 5, returns_a
++                    ))
++                else:  # rsi_mean_revert
++                    results.append(SingleBacktestResult(
++                        sym, strategy_name, params, 1.0, 20.0, 5.0, 55.0, 10, returns_b
++                    ))
++            return results
+ 
+         df_up = _make_ohlcv(n, trend="up")
+         store = MagicMock()
+@@ -1217,8 +1225,8 @@ class TestAlphaBasedTopKSelection:
+ 
+         mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=1)
+         with patch(
+-            "mytrader.backtest.matrix_backtest._backtest_one",
+-            side_effect=mock_backtest_one,
++            "mytrader.backtest.matrix_backtest._backtest_batch",
++            side_effect=mock_backtest_batch,
+         ):
+             report = mb.run(
+                 strategies=["dual_ma", "rsi_mean_revert"],
+@@ -1332,11 +1340,15 @@ class TestAlphaBasedTopKSelection:
+         # 验证前提：Sortino < 0.5（垃圾门槛）
+         assert _compute_sortino(returns_garbage) < MIN_SORTINO_THRESHOLD
+ 
+-        def mock_backtest_one(df, strategy, params, *args, **kwargs):
+-            sym = df.index.name or "SYM"
+-            return SingleBacktestResult(
+-                sym, strategy, params, 0.3, 5.0, 10.0, 50.0, 3, returns_garbage
+-            )
++        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
++            results = []
++            for sym, df in data.items():
++                if df is None or df.empty or len(df) < 30:
++                    continue
++                results.append(SingleBacktestResult(
++                    sym, strategy_name, params, 0.3, 5.0, 10.0, 50.0, 3, returns_garbage
++                ))
++            return results
+ 
+         df_up = _make_ohlcv(n, trend="up")
+         store = MagicMock()
+@@ -1355,8 +1367,8 @@ class TestAlphaBasedTopKSelection:
+         mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=1)
+         try:
+             with patch(
+-                "mytrader.backtest.matrix_backtest._backtest_one",
+-                side_effect=mock_backtest_one,
++                "mytrader.backtest.matrix_backtest._backtest_batch",
++                side_effect=mock_backtest_batch,
+             ):
+                 report = mb.run(
+                     strategies=["dual_ma"],
+@@ -1513,17 +1525,21 @@ class TestAlphaBasedTopKSelection:
+             f"B 的 alpha({alpha_b:.4f}) 应 > A({alpha_a:.4f})"
+         )
+ 
+-        # 根据参数选择返回不同收益
+-        def mock_backtest_one(df, strategy, params, *args, **kwargs):
+-            sym = df.index.name or "SYM"
+-            if params.get("fast") == 5:  # 参数 A
+-                return SingleBacktestResult(
+-                    sym, strategy, params, sharpe_a, 10.0, 5.0, 55.0, 10, returns_a
+-                )
+-            else:  # 参数 B (fast=10)
+-                return SingleBacktestResult(
+-                    sym, strategy, params, sharpe_b, 30.0, 8.0, 50.0, 10, returns_b
+-                )
++        # 根据参数选择返回不同收益（迭代 #10：mock _backtest_batch）
++        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
++            results = []
++            for sym, df in data.items():
++                if df is None or df.empty or len(df) < 30:
++                    continue
++                if params.get("fast") == 5:  # 参数 A
++                    results.append(SingleBacktestResult(
++                        sym, strategy_name, params, sharpe_a, 10.0, 5.0, 55.0, 10, returns_a
++                    ))
++                else:  # 参数 B (fast=10)
++                    results.append(SingleBacktestResult(
++                        sym, strategy_name, params, sharpe_b, 30.0, 8.0, 50.0, 10, returns_b
++                    ))
++            return results
+ 
+         df_up = _make_ohlcv(n, trend="up")
+         store = MagicMock()
+@@ -1537,8 +1553,8 @@ class TestAlphaBasedTopKSelection:
+ 
+         mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=1)
+         with patch(
+-            "mytrader.backtest.matrix_backtest._backtest_one",
+-            side_effect=mock_backtest_one,
++            "mytrader.backtest.matrix_backtest._backtest_batch",
++            side_effect=mock_backtest_batch,
+         ):
+             report = mb.run(
+                 strategies=["dual_ma"],

@@ -1,0 +1,1638 @@
+diff --git a/.codebuddy/skills/cb-acp-dev/scripts/orchestrator.py b/.codebuddy/skills/cb-acp-dev/scripts/orchestrator.py
+index f1bf393..0c0d991 100644
+--- a/.codebuddy/skills/cb-acp-dev/scripts/orchestrator.py
++++ b/.codebuddy/skills/cb-acp-dev/scripts/orchestrator.py
+@@ -17,6 +17,7 @@ Orchestrator — CodeBuddy 监控循环
+ """
+ 
+ import asyncio
++import hashlib
+ import json
+ import os
+ import re
+@@ -35,13 +36,22 @@ from acp.interfaces import Client
+ 
+ # ─── 路径常量 ───────────────────────────────────────────────────────────
+ 
+-PROJECT_ROOT = Path(__file__).resolve().parent.parent
++# 自动检测项目根目录：从本文件所在位置向上查找同时包含 `mytrader/` 和 `.codebuddy/` 的目录。
++# 这样 alignment/orchestrator.py 和 .codebuddy/skills/cb-acp-dev/scripts/orchestrator.py
++# 可以保持字节级同步，无需为路径常量写不同分支。
++_FILE_DIR = Path(__file__).resolve().parent
++PROJECT_ROOT: Path = _FILE_DIR
++for _candidate in [_FILE_DIR, *_FILE_DIR.parents]:
++    if (_candidate / "mytrader").is_dir() and (_candidate / ".codebuddy").is_dir():
++        PROJECT_ROOT = _candidate
++        break
+ MYTRADER_ROOT = PROJECT_ROOT / "mytrader"
+ ALIGNMENT_DIR = PROJECT_ROOT / "alignment"
+ CONSTITUTION_FILE = ALIGNMENT_DIR / "ai_constitution.md"
+ TRAJECTORY_FILE = ALIGNMENT_DIR / "iteration_trajectory.md"
+ DECISION_LOG_FILE = ALIGNMENT_DIR / "decision_log.md"
+ CODEBUDDY_FILE = PROJECT_ROOT / ".codebuddy" / "CODEBUDDY.md"
++ITERATIONS_DIR = PROJECT_ROOT / "iterations"  # 每次迭代的完整快照
+ 
+ PYTHON_BIN = "/Users/rickouyang/miniforge3/envs/py312trade/bin/python"
+ 
+@@ -85,6 +95,9 @@ class IterationResult:
+     # 文件变更
+     changed_files: list[str] = field(default_factory=list)
+     error: str | None = None
++    # ACP buffer 溢出统计（LimitOverrunError，非致命）
++    buffer_overflow_count: int = 0
++    buffer_overflow_errors: list[str] = field(default_factory=list)
+ 
+ 
+ @dataclass
+@@ -288,20 +301,61 @@ HIGH_RISK_PATTERNS = {
+ 
+ 
+ def get_changed_files() -> list[str]:
+-    """获取 git diff 变更文件列表"""
++    """获取变更文件列表（tracked modified + untracked）。
++
++    基于 `git status --porcelain` 解析，能捕获 `git diff` 漏掉的 untracked 新文件。
++    失败时 fallback 到 `git diff --name-only HEAD`。
++    """
+     try:
+         result = subprocess.run(
+-            ["git", "diff", "--name-only"],
++            ["git", "status", "--porcelain=v1"],
+             capture_output=True,
+             text=True,
+             cwd=str(PROJECT_ROOT),
+             timeout=10,
+         )
+-        if result.stdout.strip():
+-            return [f for f in result.stdout.strip().split("\n") if f]
+-        return []
++        if result.returncode != 0:
++            raise RuntimeError(f"git status rc={result.returncode}: {result.stderr[:200]}")
++
++        changed: list[str] = []
++        for line in result.stdout.splitlines():
++            if not line.strip():
++                continue
++            # porcelain 格式: "XY path" 或 "XY path -> dest"
++            # X = staged, Y = working tree；?? = untracked, M = modified, A = added
++            if len(line) < 4:
++                continue
++            path_part = line[3:]
++            # 处理 rename: "old -> new" → 取 new
++            if " -> " in path_part:
++                path_part = path_part.split(" -> ", 1)[1]
++            # 去掉引号包裹（路径含空格时 git 会包引号）
++            if path_part.startswith('"') and path_part.endswith('"'):
++                path_part = path_part[1:-1]
++            changed.append(path_part)
++        # 去重（同一文件可能 staged + working 均有变更）
++        seen: set[str] = set()
++        unique: list[str] = []
++        for f in changed:
++            if f not in seen:
++                seen.add(f)
++                unique.append(f)
++        return unique
+     except Exception:
+-        return []
++        # fallback: 只看 tracked diff
++        try:
++            result = subprocess.run(
++                ["git", "diff", "--name-only", "HEAD"],
++                capture_output=True,
++                text=True,
++                cwd=str(PROJECT_ROOT),
++                timeout=10,
++            )
++            if result.stdout.strip():
++                return [f for f in result.stdout.strip().split("\n") if f]
++            return []
++        except Exception:
++            return []
+ 
+ 
+ def check_git_diff_violations(changed_files: list[str]) -> tuple[list[str], list[str]]:
+@@ -344,65 +398,229 @@ def check_git_diff_violations(changed_files: list[str]) -> tuple[list[str], list
+     return violations, high_risk_files
+ 
+ 
++# ─── pytest harness ──────────────────────────────────────────────────────
++
++
++def build_pytest_command(*, collect_only: bool = False) -> list[str]:
++    """构造统一的 pytest 命令。
++
++    默认 live 测试由 `mytrader/pyproject.toml` 的 `addopts = "-q -m 'not live'"` 隔离，
++    因此本命令不再显式添加 `-m 'not live'`，避免与 pyproject 重复导致参数冲突。
++
++    Args:
++        collect_only: True 则仅收集不运行（用于 count_tests）；False 则运行测试。
++    """
++    cmd = [PYTHON_BIN, "-m", "pytest"]
++    if collect_only:
++        cmd += ["--collect-only", "-q"]
++    else:
++        cmd += ["--tb=short", "-q"]
++    return cmd
++
++
++def parse_pytest_summary(output: str) -> dict[str, Any]:
++    """解析 pytest 输出的末尾 summary 行。
++
++    支持以下格式（pytest 8.x）：
++      - "562 passed, 103 warnings in 15.70s"
++      - "562 passed, 5 failed, 103 warnings in 20.1s"
++      - "1 error, 10 passed in 2.0s"
++      - "no tests ran in 0.01s"
++      - "562/578 tests collected (16 deselected) in 1.63s"  (--collect-only)
++
++    Returns:
++        dict 至少包含 passed/failed/errors/warnings/summary 字段。
++    """
++    passed = 0
++    failed = 0
++    errors = 0
++    warnings = 0
++    summary = ""
++    collected = None  # collect-only summary 的数量（如有）
++
++    if output:
++        # 从后向前找最后一个包含 pytest 关键字的非空行
++        for line in reversed(output.strip().splitlines()):
++            line_stripped = line.strip()
++            if not line_stripped:
++                continue
++            lower = line_stripped.lower()
++            if any(
++                kw in lower
++                for kw in ("passed", "failed", "error", "warning", "no tests ran", "collected")
++            ):
++                summary = line_stripped
++                break
++
++    if summary:
++        # collect-only 格式: "562/578 tests collected (16 deselected) in 1.63s"
++        m = re.search(r"(\d+)\s*/\s*\d+\s+tests?\s+collected", summary)
++        if m:
++            collected = int(m.group(1))
++
++        # 常规 summary: "N passed[, N failed][, N errors][, N warnings] in Xs"
++        for match in re.finditer(r"(\d+)\s+(passed|failed|errors?|warnings?)", summary):
++            count = int(match.group(1))
++            status = match.group(2).lower().rstrip("s")  # 归一化为单数
++            if status == "passed":
++                passed = count
++            elif status == "failed":
++                failed = count
++            elif status == "error":
++                errors = count
++            elif status == "warning":
++                warnings = count
++
++        # "no tests ran" 特殊处理
++        if "no tests ran" in summary.lower():
++            passed = 0
++            failed = 0
++            errors = 0
++
++    return {
++        "passed": passed,
++        "failed": failed,
++        "errors": errors,
++        "warnings": warnings,
++        "summary": summary,
++        "collected": collected,  # 仅 collect-only 模式有意义
++    }
++
++
++def has_test_failures(test_result: dict | None) -> bool:
++    """判定 pytest 结果是否包含失败（用于状态判定）。
++
++    失败条件：
++        - test_result 为 None
++        - test_result.error 存在（subprocess 异常等）
++        - exit_code != 0
++        - failed > 0
++        - errors > 0
++    """
++    if not test_result:
++        return True
++    if test_result.get("error"):
++        return True
++    if int(test_result.get("exit_code", 1)) != 0:
++        return True
++    if int(test_result.get("failed", 0)) > 0:
++        return True
++    if int(test_result.get("errors", 0)) > 0:
++        return True
++    return False
++
++
+ def count_tests() -> int:
+-    """收集当前测试数量（仅收集，不运行）"""
++    """收集当前测试数量（仅收集，不运行）。
++
++    解析顺序：
++        1. 优先从 stdout/stderr 的 `N tests collected` / `N collected` 解析
++        2. fallback 统计包含 `::` 的 nodeid 行
++        3. fallback 统计 `tests/xxx.py: N` 行并求和（pytest 8.x `-q` collect 格式）
++        4. 命令 exit_code 非 0 → 返回 -1（不假装 0）
++    """
+     try:
++        cmd = build_pytest_command(collect_only=True)
+         result = subprocess.run(
+-            [PYTHON_BIN, "-m", "pytest", "--co", "-q"],
++            cmd,
+             capture_output=True,
+             text=True,
+             cwd=str(MYTRADER_ROOT),
+-            timeout=30,
++            timeout=60,
++        )
++        if result.returncode != 0:
++            return -1
++
++        stdout = result.stdout or ""
++        stderr = result.stderr or ""
++        # summary 行可能在 stdout 或 stderr（pytest 版本差异）
++        combined = stdout + "\n" + stderr
++        summary = parse_pytest_summary(combined)
++
++        # 1. collect-only summary 中解析到 collected 数量
++        if summary.get("collected") is not None:
++            return int(summary["collected"])
++
++        # 2. 尝试解析 "N tests collected" / "N items collected" 形态
++        m = re.search(
++            r"(\d+)\s+tests?\s+collected|(\d+)\s+items?\s+collected|(\d+)\s+collected\s+in",
++            combined,
+         )
+-        count = 0
+-        for line in result.stdout.strip().split("\n"):
+-            if "::" in line:
+-                count += 1
+-        return count
++        if m:
++            for grp in m.groups():
++                if grp:
++                    return int(grp)
++
++        # 3. fallback: 统计包含 `::` 的 nodeid 行（仅看 stdout）
++        nodeid_count = sum(1 for line in stdout.splitlines() if "::" in line)
++        if nodeid_count > 0:
++            return nodeid_count
++
++        # 4. fallback: pytest 8.x `-q --collect-only` 的 "tests/xxx.py: N" 格式
++        #    严格匹配相对路径（排除 site-packages 的 __init__.py:6 警告行）
++        per_file_count = 0
++        for line in stdout.splitlines():
++            stripped = line.strip()
++            # 仅匹配不以 / 或 . 开头的相对路径（即项目内文件）
++            if stripped.startswith(("/", ".")):
++                continue
++            m = re.match(r"^(tests/)?[^:\s]+\.py:\s*(\d+)\s*$", stripped)
++            if m:
++                per_file_count += int(m.group(2))
++        if per_file_count > 0:
++            return per_file_count
++
++        # 5. 什么都没收集到 → 0（仅在输出明确为 "no tests collected" 时合理）
++        return 0
+     except Exception:
+         return -1
+ 
+ 
+ def run_tests() -> dict:
+-    """运行 pytest 并返回结果"""
++    """运行 pytest 并返回结果。
++
++    Returns:
++        dict 包含 passed/failed/errors/warnings/exit_code/summary/stdout_tail/stderr_tail/command。
++        subprocess 异常时返回 {"error": str(e), "exit_code": -1, "command": cmd}。
++    """
++    cmd = build_pytest_command(collect_only=False)
+     try:
+         result = subprocess.run(
+-            [PYTHON_BIN, "-m", "pytest", "--tb=short", "-q"],
++            cmd,
+             capture_output=True,
+             text=True,
+             cwd=str(MYTRADER_ROOT),
+-            timeout=120,
++            timeout=300,
+         )
+-        # 解析 "478 passed, 5 failed" 格式
+-        summary_line = ""
+-        for line in result.stdout.strip().split("\n"):
+-            if "passed" in line or "failed" in line or "error" in line:
+-                summary_line = line
+-                break
+-
+-        passed = 0
+-        failed = 0
+-        errors = 0
+-        for m in re.finditer(r"(\d+)\s+(passed|failed|error)", summary_line):
+-            count = int(m.group(1))
+-            status = m.group(2)
+-            if status == "passed":
+-                passed = count
+-            elif status == "failed":
+-                failed = count
+-            elif status == "error":
+-                errors = count
++        stdout = result.stdout or ""
++        stderr = result.stderr or ""
++        combined = stdout + "\n" + stderr
++        summary = parse_pytest_summary(combined)
+ 
+         return {
+-            "passed": passed,
+-            "failed": failed,
+-            "errors": errors,
++            "passed": summary["passed"],
++            "failed": summary["failed"],
++            "errors": summary["errors"],
++            "warnings": summary["warnings"],
+             "exit_code": result.returncode,
+-            "summary": summary_line,
+-            "stdout_tail": result.stdout[-500:],
++            "summary": summary["summary"],
++            "stdout_tail": stdout[-2000:],
++            "stderr_tail": stderr[-500:],
++            "command": cmd,
+         }
+     except Exception as e:
+-        return {"error": str(e)}
++        return {
++            "error": str(e),
++            "exit_code": -1,
++            "command": cmd,
++            "passed": 0,
++            "failed": 0,
++            "errors": 0,
++            "warnings": 0,
++            "summary": "",
++            "stdout_tail": "",
++            "stderr_tail": str(e),
++        }
+ 
+ 
+ # ─── 留痕检查 ────────────────────────────────────────────────────────────
+@@ -519,6 +737,13 @@ def log_iteration(result: IterationResult, rules: ConstitutionRules):
+         for f in result.high_risk_files_touched:
+             entry += f"- ⚠️ {f}（需用户审批）\n"
+ 
++    if result.buffer_overflow_count > 0:
++        entry += f"\n### ACP Buffer 溢出（{result.buffer_overflow_count} 次）\n"
++        entry += "- 非致命错误：某条 JSON-RPC 消息超过 StreamReader limit\n"
++        entry += "- CodeBuddy 可能已完成部分工作，验证结果反映实际产出\n"
++        for err in result.buffer_overflow_errors:
++            entry += f"- ⚠️ {err}\n"
++
+     entry += f"""
+ ### Constitution 合规
+ - DD 20% 约束: {"✅" if not result.violations else "⚠️ 检查违规"}
+@@ -605,13 +830,400 @@ def log_decision_if_needed(result: IterationResult):
+ - **涉及 AI Constitution 条款**: L8 高风险变更 / 禁止行为
+ - **决策逻辑**: Orchestrator 自动检测到合规风险
+ - **决策结果**: {d['action']}
+-- **详情**: {d['details']}
++        - **详情**: {d['details']}
+ - **用户反馈**: 待用户确认
+ 
+ ---
+ """)
+ 
+ 
++# ─── 迭代快照保存 ──────────────────────────────────────────────────────────
++
++
++def save_iteration_snapshot(result: IterationResult):
++    """将完整迭代快照保存到 iterations/iteration_N/ 目录。
++
++    与 iteration_trajectory.md（摘要留痕）互补，快照包含完整原始数据：
++    - prompt_template.md: 发送给 CodeBuddy 的完整 prompt（含 Constitution 注入）
++    - full_response.md: CodeBuddy 的全部文本输出
++    - heartbeat_log.txt: stdout 中的心跳和时间线（从 print 捕获）
++    - code_diff.patch: 迭代结束时的 git diff
++    - result.json: IterationResult 的结构化序列化
++    """
++    iter_num = get_next_iteration_number() - 1  # log_iteration 已调用，编号已分配
++    if iter_num < 1:
++        iter_num = 1
++    snapshot_dir = ITERATIONS_DIR / f"iteration_{iter_num}"
++    snapshot_dir.mkdir(parents=True, exist_ok=True)
++
++    # 1. result.json — 结构化结果
++    result_data = {
++        "iteration_id": result.iteration_id,
++        "task": result.task,
++        "status": result.status,
++        "start_time": result.start_time,
++        "end_time": result.end_time,
++        "duration_seconds": result.end_time - result.start_time if result.end_time else 0,
++        "updates_count": result.updates_count,
++        "tool_calls_count": len(result.tool_calls),
++        "team_events_count": len(result.team_events),
++        "permission_requests_count": len(result.permission_requests),
++        "changed_files": result.changed_files,
++        "violations": result.violations,
++        "high_risk_files_touched": result.high_risk_files_touched,
++        "test_count_before": result.test_count_before,
++        "test_count_after": result.test_count_after,
++        "test_result": result.test_result,
++        "trajectory_updated_by_codebuddy": result.trajectory_updated_by_codebuddy,
++        "decision_log_updated_by_codebuddy": result.decision_log_updated_by_codebuddy,
++        "buffer_overflow_count": result.buffer_overflow_count,
++        "buffer_overflow_errors": result.buffer_overflow_errors,
++        "error": result.error,
++    }
++    (snapshot_dir / "result.json").write_text(
++        json.dumps(result_data, indent=2, ensure_ascii=False, default=str),
++        encoding="utf-8",
++    )
++
++    # 2. full_response.md — CodeBuddy 的全部文本输出
++    response_text = "\n---\n".join(result.text_responses) if result.text_responses else "(无文本输出)"
++    (snapshot_dir / "full_response.md").write_text(response_text, encoding="utf-8")
++
++    # 3. code_diff.patch — git diff 快照（tracked 文件的变更）
++    try:
++        diff_result = subprocess.run(
++            ["git", "diff", "HEAD"],
++            capture_output=True,
++            text=True,
++            cwd=str(PROJECT_ROOT),
++            timeout=15,
++        )
++        diff_content = diff_result.stdout if diff_result.stdout.strip() else "(无代码变更)"
++    except Exception as e:
++        diff_content = f"(git diff 失败: {e})"
++    (snapshot_dir / "code_diff.patch").write_text(diff_content, encoding="utf-8")
++
++    # 3a. git_status.txt — 完整 `git status --porcelain=v1` 输出
++    #     用于捕获 untracked 新文件（`git diff HEAD` 会漏掉这些）。
++    untracked_files: list[dict[str, Any]] = []
++    try:
++        status_result = subprocess.run(
++            ["git", "status", "--porcelain=v1"],
++            capture_output=True,
++            text=True,
++            cwd=str(PROJECT_ROOT),
++            timeout=15,
++        )
++        status_content = status_result.stdout if status_result.stdout else "(git status 无输出)"
++        untracked_files = _collect_untracked_files(status_content)
++    except Exception as e:
++        status_content = f"(git status 失败: {e})"
++    (snapshot_dir / "git_status.txt").write_text(status_content, encoding="utf-8")
++
++    # 3b. untracked_files.json — untracked 文件路径、大小、sha256
++    if untracked_files:
++        (snapshot_dir / "untracked_files.json").write_text(
++            json.dumps(untracked_files, indent=2, ensure_ascii=False, default=str),
++            encoding="utf-8",
++        )
++
++    # 3c. untracked_diff.patch — 对文本型 untracked 文件生成 diff 形式快照
++    untracked_diff = _build_untracked_diff(untracked_files)
++    if untracked_diff:
++        (snapshot_dir / "untracked_diff.patch").write_text(
++            untracked_diff, encoding="utf-8"
++        )
++
++    # 4. prompt_template.md — 记录任务描述（prompt 本身在 build_constitution_prompt 中构造）
++    (snapshot_dir / "prompt_template.md").write_text(
++        f"# 迭代 #{iter_num} Prompt\n\n"
++        f"**任务**: {result.task}\n\n"
++        f"**时间**: {datetime.fromtimestamp(result.start_time, tz=timezone.utc).isoformat()}\n\n"
++        f"**注**: 完整 prompt 由 build_constitution_prompt() 动态生成，"
++        f"注入了 ai_constitution.md 的禁止行为、验证流水线、代码规范等规则。\n",
++        encoding="utf-8",
++    )
++
++    # 5. tool_calls.json — 工具调用时间线
++    if result.tool_calls:
++        (snapshot_dir / "tool_calls.json").write_text(
++            json.dumps(result.tool_calls, indent=2, ensure_ascii=False, default=str),
++            encoding="utf-8",
++        )
++
++    # 6. gate_status.json — 机器可读的 gate/harness 健康状态
++    #    让 Meta-Agent 不只依赖 markdown summary 判定迭代质量。
++    _write_gate_status(result, snapshot_dir, iter_num, untracked_files)
++
++    print(f"  快照已保存: {snapshot_dir}")
++
++
++# untracked 文件快照过滤规则（避免泄露敏感文件 / 收集过大文件）
++_UNTRACKED_SKIP_DIRS = (".codebuddy/teams/", "__pycache__/", ".git/", "node_modules/")
++_UNTRACKED_SKIP_SUFFIXES = (".pyc", ".pyo", ".swp")
++_UNTRACKED_MAX_SIZE = 1024 * 1024  # 1MB
++_UNTRACKED_SENSITIVE_NAME_PARTS = (".env", "secret", "token", "key", "credential")
++
++
++def _is_sensitive_path(path_str: str) -> bool:
++    lower = path_str.lower()
++    for part in _UNTRACKED_SENSITIVE_NAME_PARTS:
++        if part in lower:
++            return True
++    return False
++
++
++def _collect_untracked_files(porcelain_output: str) -> list[dict[str, Any]]:
++    """从 `git status --porcelain=v1` 输出解析 untracked 文件（?? 前缀）。
++
++    Returns:
++        list of {path, size, sha256}；敏感文件仅记录路径，不读内容。
++    """
++    files: list[dict[str, Any]] = []
++    for line in porcelain_output.splitlines():
++        if len(line) < 4:
++            continue
++        xy = line[:2]
++        if xy != "??":
++            continue
++        path_part = line[3:]
++        if " -> " in path_part:
++            path_part = path_part.split(" -> ", 1)[1]
++        if path_part.startswith('"') and path_part.endswith('"'):
++            path_part = path_part[1:-1]
++
++        # 跳过黑名单目录/后缀
++        if any(path_part.startswith(d) for d in _UNTRACKED_SKIP_DIRS):
++            continue
++        if any(path_part.endswith(s) for s in _UNTRACKED_SKIP_SUFFIXES):
++            continue
++        if _is_sensitive_path(path_part):
++            # 仍记录路径，但不读内容
++            files.append({
++                "path": path_part,
++                "size": None,
++                "sha256": None,
++                "sensitive": True,
++            })
++            continue
++
++        full_path = PROJECT_ROOT / path_part
++        if not full_path.exists() or not full_path.is_file():
++            continue
++        try:
++            stat = full_path.stat()
++            if stat.st_size > _UNTRACKED_MAX_SIZE:
++                files.append({
++                    "path": path_part,
++                    "size": stat.st_size,
++                    "sha256": None,
++                    "skipped_reason": "file_too_large",
++                })
++                continue
++            content = full_path.read_bytes()
++            sha = hashlib.sha256(content).hexdigest()
++            files.append({
++                "path": path_part,
++                "size": stat.st_size,
++                "sha256": sha,
++                "sensitive": False,
++            })
++        except Exception as e:
++            files.append({
++                "path": path_part,
++                "size": None,
++                "sha256": None,
++                "error": str(e),
++            })
++    return files
++
++
++def _build_untracked_diff(untracked_files: list[dict[str, Any]]) -> str:
++    """对文本型 untracked 文件生成类似 `git diff` 的 patch。
++
++    跳过：敏感文件、过大文件、二进制文件（基于内容嗅探）。
++    """
++    patches: list[str] = []
++    for info in untracked_files:
++        if info.get("sensitive"):
++            continue
++        if info.get("skipped_reason") == "file_too_large":
++            continue
++        if info.get("sha256") is None:
++            continue
++
++        path_str = info["path"]
++        full_path = PROJECT_ROOT / path_str
++        try:
++            content_bytes = full_path.read_bytes()
++        except Exception:
++            continue
++        # 简单二进制检测：包含 NUL 字节视为二进制
++        if b"\x00" in content_bytes:
++            continue
++        try:
++            content = content_bytes.decode("utf-8")
++        except UnicodeDecodeError:
++            continue
++
++        # 构造类似 git diff 的 patch
++        patches.append(
++            f"diff --git a/{path_str} b/{path_str}\n"
++            f"new file mode 100644\n"
++            f"--- /dev/null\n"
++            f"+++ b/{path_str}\n"
++            f"@@ -0,0 +1,{len(content.splitlines())} @@\n"
++            + "".join(f"+{line}\n" for line in content.splitlines())
++        )
++    return "".join(patches)
++
++
++def _write_gate_status(
++    result: IterationResult,
++    snapshot_dir: Path,
++    iter_num: int,
++    untracked_files: list[dict[str, Any]],
++) -> None:
++    """写出 iterations/iteration_N/gate_status.json — 机器可读的 gate/harness 健康状态。"""
++    test_result = result.test_result or {}
++    gate = {
++        "iteration": iter_num,
++        "iteration_id": result.iteration_id,
++        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
++        "status": result.status,
++        "tests": {
++            "count_before": result.test_count_before,
++            "count_after": result.test_count_after,
++            "passed": int(test_result.get("passed", 0) or 0),
++            "failed": int(test_result.get("failed", 0) or 0),
++            "errors": int(test_result.get("errors", 0) or 0),
++            "warnings": int(test_result.get("warnings", 0) or 0),
++            "exit_code": int(test_result.get("exit_code", -1) or 0),
++            "summary": test_result.get("summary", ""),
++            "has_test_failures": has_test_failures(result.test_result),
++        },
++        "snapshot": {
++            "changed_files_count": len(result.changed_files),
++            "includes_untracked": len(untracked_files) > 0,
++            "untracked_count": len(untracked_files),
++            "git_status_file": "git_status.txt",
++            "untracked_files_file": "untracked_files.json" if untracked_files else None,
++            "untracked_diff_file": "untracked_diff.patch" if untracked_files else None,
++        },
++        "compliance": {
++            "violations": result.violations,
++            "high_risk_files_touched": result.high_risk_files_touched,
++            "buffer_overflow_count": result.buffer_overflow_count,
++        },
++        "trajectory_updated_by_codebuddy": result.trajectory_updated_by_codebuddy,
++        "decision_log_updated_by_codebuddy": result.decision_log_updated_by_codebuddy,
++        "error": result.error,
++    }
++    (snapshot_dir / "gate_status.json").write_text(
++        json.dumps(gate, indent=2, ensure_ascii=False, default=str),
++        encoding="utf-8",
++    )
++
++
++def save_iteration_summary_template(
++    result: IterationResult,
++    rules: ConstitutionRules,
++    summary_text: str = "",
++):
++    """在 iterations/iteration_N/ 中生成 summary.md 模板。
++
++    Orchestrator 自动生成骨架（含客观数据），Meta-Agent 负责补充判断和评估。
++    如果 summary.md 已存在（Meta-Agent 已手写），不覆盖。
++
++    Args:
++        result: 迭代结果
++        rules: Constitution 规则
++        summary_text: 额外的摘要文本（可选，通常由 Meta-Agent 在 orchestrator 外写入）
++    """
++    iter_num = get_next_iteration_number() - 1
++    if iter_num < 1:
++        iter_num = 1
++    snapshot_dir = ITERATIONS_DIR / f"iteration_{iter_num}"
++    summary_file = snapshot_dir / "summary.md"
++
++    if summary_file.exists():
++        # Meta-Agent 已手写 summary，不覆盖
++        print(f"  summary.md 已存在，跳过模板生成")
++        return
++
++    snapshot_dir.mkdir(parents=True, exist_ok=True)
++
++    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
++    duration = result.end_time - result.start_time if result.end_time else 0
++
++    # 客观数据（orchestrator 自动填写）
++    test_info = "N/A"
++    if result.test_result and not result.test_result.get("error"):
++        test_info = f"{result.test_result.get('passed', 0)} passed, {result.test_result.get('failed', 0)} failed"
++
++    files_changed_str = "\n".join(f"- {f}" for f in result.changed_files[:15]) if result.changed_files else "- (无)"
++    if len(result.changed_files) > 15:
++        files_changed_str += f"\n- ... ({len(result.changed_files)} files total)"
++
++    violations_str = "\n".join(f"- ❌ {v}" for v in result.violations) if result.violations else "- ✅ 无违规"
++
++    template = f"""# Iteration #{iter_num} Summary
++
++> **自动生成**: {now}（orchestrator 模板，Meta-Agent 需补充判断部分）
++> **Spec**: `iterations/iteration_{iter_num}/spec.md`
++
++## Requested
++
++{result.task[:200]}
++
++## Delivered
++
++### Files Changed
++{files_changed_str}
++
++### Tests
++- Before: {result.test_count_before}
++- After: {result.test_count_after}
++- Result: {test_info}
++
++### Duration
++{duration:.0f}s ({duration/60:.1f}min)
++
++### Status: {result.status}
++
++## Meta-Agent Judgment
++
++> ⚠️ 以下部分由 Meta-Agent 填写（orchestrator 仅生成骨架）
++
++### Technical: [PASS/FAIL/PARTIAL]
++- [补充测试分析]
++
++### Business Impact: [HIGH/MEDIUM/LOW/NONE]
++- [补充业务指标变化]
++
++### Strategic Fit: [GOOD/NEUTRAL/POOR]
++- [补充策略评估]
++
++## Bugs Fixed by Meta-Agent
++- [如有补充]
++
++## Gate Status
++| Gate | Condition | Result |
++|------|-----------|--------|
++| [补充] | [补充] | [补充] |
++
++## Next Steps
++- [补充下一轮迭代方向，作为下一轮 Plan 的输入]
++
++## Lessons Learned
++- [补充]
++"""
++
++    summary_file.write_text(template, encoding="utf-8")
++    print(f"  summary 模板已生成: {summary_file}")
++
++
++
+ # ─── Telegram 通知 ───────────────────────────────────────────────────────
+ 
+ 
+@@ -662,6 +1274,9 @@ def notify_iteration_result(result: IterationResult):
+         delta = result.test_count_after - result.test_count_before
+         msg += f"测试数变化: {result.test_count_before} → {result.test_count_after} ({delta:+d})\n"
+ 
++    if result.buffer_overflow_count > 0:
++        msg += f"⚠️ ACP buffer 溢出: {result.buffer_overflow_count} 次（非致命）\n"
++
+     if result.violations:
+         msg += f"\n*违规检测 ({len(result.violations)} 条):*\n"
+         for v in result.violations[:5]:
+@@ -687,10 +1302,11 @@ async def run_iteration(
+ ) -> IterationResult:
+     """执行一次完整的迭代循环
+ 
+-    等待策略：time-based（确定性，简单可靠）:
+-    - 等满 timeout_seconds，不提前退出
++    等待策略：process-based（CodeBuddy 退出即结束）:
++    - 每 5 秒检查 CodeBuddy 子进程是否仍在运行
++    - 子进程退出 → 立即进入后置验证
++    - timeout_seconds 仅作为最大保护上限（防止进程僵死）
+     - 每 30 秒打印心跳（agentPhase + 距上次 session_update 多久）
+-    - session_update 实时刷新 last_update_time（用于心跳显示，不改变退出逻辑）
+     """
+ 
+     iteration_id = str(uuid4())[:8]
+@@ -735,6 +1351,7 @@ async def run_iteration(
+             "--permission-mode", "bypassPermissions",
+             "--max-turns", str(max_turns),
+             cwd=str(MYTRADER_ROOT),
++            transport_kwargs={"limit": 1024 * 1024},  # 64KB → 1MB
+         ) as (conn, proc):
+ 
+             await conn.initialize(protocol_version=PROTOCOL_VERSION)
+@@ -775,6 +1392,23 @@ async def run_iteration(
+                     heartbeat_log("心跳")
+                     last_heartbeat = time.time()
+ 
++    except ValueError as e:
++        # ACP _receive_loop 中 readline() 超限时，acp 库将 LimitOverrunError
++        # 包装为 ValueError("Separator is found, but chunk is longer than limit")。
++        # 这意味着某条 JSON-RPC 消息（如 tool result）超过了 StreamReader limit。
++        # 非致命：CodeBuddy 可能已完成大部分工作，应继续做迭代后验证。
++        err_msg = str(e)
++        if "Separator is found" in err_msg or "chunk is longer than limit" in err_msg:
++            result.buffer_overflow_count += 1
++            result.buffer_overflow_errors.append(
++                f"[{time.strftime('%H:%M:%S')}] {err_msg[:200]}"
++            )
++            elapsed = time.time() - result.start_time
++            print(f"[{elapsed//60:.0f}m{elapsed%60:02.0f}] ⚠️  ACP buffer overflow "
++                  f"(#{result.buffer_overflow_count}), 跳过此消息，继续验证")
++        else:
++            result.error = err_msg
++            result.status = "failed"
+     except Exception as e:
+         result.error = str(e)
+         result.status = "failed"
+@@ -783,6 +1417,7 @@ async def run_iteration(
+ 
+     # ─── 迭代后验证 ──────────────────────────────────────────────────
+ 
++    # buffer overflow 不阻止验证（result.error 未设置）
+     if not result.error:
+         # 1. 获取变更文件列表
+         result.changed_files = get_changed_files()
+@@ -800,15 +1435,17 @@ async def run_iteration(
+         result.trajectory_updated_by_codebuddy = check_trajectory_updated(result.start_time)
+         result.decision_log_updated_by_codebuddy = check_decision_log_updated(result.start_time)
+ 
+-        # 5. 判定状态
++        # 5. 判定状态（严格使用 pytest exit_code + failed + errors + error 字段）
+         if result.violations:
+             result.status = "failed"
++        elif has_test_failures(result.test_result):
++            result.status = "failed"  # 测试失败 / exit_code != 0 / subprocess error
+         elif result.test_count_after < result.test_count_before and result.test_count_before > 0:
+             result.status = "failed"  # 测试数下降 = 禁止行为 #9
+         elif result.high_risk_files_touched:
+             result.status = "partial"  # 高风险变更需审批
+-        elif result.test_result and result.test_result.get("error"):
+-            result.status = "partial"
++        elif result.buffer_overflow_count > 0:
++            result.status = "partial"  # ACP 通信中断，结果可能不完整
+         else:
+             result.status = "passed"
+ 
+@@ -818,10 +1455,16 @@ async def run_iteration(
+     # 7. 补写 decision_log（如有需要）
+     log_decision_if_needed(result)
+ 
+-    # 8. Telegram 通知
++    # 8. 保存完整迭代快照到 iterations/iteration_N/
++    save_iteration_snapshot(result)
++
++    # 9. 生成 summary.md 模板（Meta-Agent 后续补充判断）
++    save_iteration_summary_template(result, rules)
++
++    # 10. Telegram 通知
+     notify_iteration_result(result)
+ 
+-    # 9. 打印留痕状态
++    # 11. 打印留痕状态
+     heartbeat_log(f"迭代完成 status={result.status}")
+     print(f"  trajectory_updated_by_codebuddy: {result.trajectory_updated_by_codebuddy}")
+     print(f"  decision_log_updated_by_codebuddy: {result.decision_log_updated_by_codebuddy}")
+@@ -881,6 +1524,8 @@ def main():
+         for f in result.high_risk_files_touched:
+             print(f"  ⚠️ {f}")
+     print(f"测试数: {result.test_count_before} → {result.test_count_after}")
++    if result.buffer_overflow_count > 0:
++        print(f"⚠️  ACP buffer 溢出: {result.buffer_overflow_count} 次（非致命，验证仍执行）")
+     print(f"trajectory 更新: {'CodeBuddy' if result.trajectory_updated_by_codebuddy else 'orchestrator 补写'}")
+     print(f"decision_log 更新: {'CodeBuddy' if result.decision_log_updated_by_codebuddy else 'orchestrator 补写'}")
+     if result.error:
+diff --git a/alignment/iteration_trajectory.md b/alignment/iteration_trajectory.md
+index dfb992d..3492ecb 100644
+--- a/alignment/iteration_trajectory.md
++++ b/alignment/iteration_trajectory.md
+@@ -613,3 +613,45 @@ Live tests (pre-existing, 与本次无关):
+ > - CodeBuddy 自行更新了 trajectory ✅
+ 
+ ---
++
++## 迭代 #6 — 按 iterations/iteration_6/spec.md 进行开发。先读 spec 文件理解完整需求，然后实施 Harness Reliability & Live Test Isolation：隔离默认 live tests、修复 orchestrator pytest 统计/状态判定/快照 untracked 留痕、生成 gate_status.json、补充 harness 测试并同步两份 orchestrator 副本。严格遵守 spec scope；不得修改交易策略、风控阈值或下单逻辑；不得触发真实下单；完成后运行 targeted harness tests 和默认非 live pytest，并更新 trajectory / CODEBUDDY / 必要文档。
++
++- **日期**: 2026-07-03 19:45 UTC
++- **类型**: 自动化迭代 (Orchestrator → CodeBuddy via ACP)
++- **变更摘要**: 按 iterations/iteration_6/spec.md 进行开发。先读 spec 文件理解完整需求，然后实施 Harness Reliability & Live Test Isolation：隔离默认 live tests、修复 orchestrator pytest 统计/状态判定/快照 untracked 留痕、生成 gate_status.json、补充 harness 测试并同步两份 orchestrator 副本。严格遵守 spec scope；不得修改交易策略、风控阈值或下单逻辑；不得触发真实下单；完成后运行 targeted harness tests 和默认非 live pytest，并更新 trajectory / CODEBUDDY / 必要文档。
++- **执行时长**: 11146s (185.8min)
++- **状态**: passed
++- **CodeBuddy 更新数**: 4773
++- **工具调用数**: 365
++- **团队事件数**: 0
++- **权限请求数**: 1
++
++### 变更文件
++.codebuddy/skills/cb-acp-dev/scripts/orchestrator.py, alignment/orchestrator.py, mytrader/pyproject.toml, mytrader/tests/test_integration_live.py
++
++### 测试结果
++0 passed, 0 failed
++
++### 违规详情
++- ✅ 无违规
++
++### Constitution 合规
++- DD 20% 约束: ✅
++- 测试覆盖率: ✅ 不降 (before=0, after=0)
++- 黑箱策略: ✅ 未引入
++- RL 引入: ✅ 未引入
++- 文档同步: ⚠️ CodeBuddy 未更新，orchestrator 自动补写
++
++### CodeBuddy 响应摘要（自动提取）
++Successfully edited file: /Users/rickouyang/Github/trade-tools/alignment/orchestrator.py
++
++### Experience Learned
++- 迭代通过 ACP 协议执行，状态: passed
++- trajectory_updated_by_codebuddy: False
++- decision_log_updated_by_codebuddy: False
++
++### 后续建议
++- 检查测试是否全部通过
++- 无高风险文件触及
++
++---
+diff --git a/alignment/orchestrator.py b/alignment/orchestrator.py
+index 1e2af48..d7ad681 100644
+--- a/alignment/orchestrator.py
++++ b/alignment/orchestrator.py
+@@ -17,6 +17,7 @@ Orchestrator — CodeBuddy 监控循环
+ """
+ 
+ import asyncio
++import hashlib
+ import json
+ import os
+ import re
+@@ -35,7 +36,15 @@ from acp.interfaces import Client
+ 
+ # ─── 路径常量 ───────────────────────────────────────────────────────────
+ 
+-PROJECT_ROOT = Path(__file__).resolve().parent.parent
++# 自动检测项目根目录：从本文件所在位置向上查找同时包含 `mytrader/` 和 `.codebuddy/` 的目录。
++# 这样 alignment/orchestrator.py 和 .codebuddy/skills/cb-acp-dev/scripts/orchestrator.py
++# 可以保持字节级同步，无需为路径常量写不同分支。
++_FILE_DIR = Path(__file__).resolve().parent
++PROJECT_ROOT: Path = _FILE_DIR
++for _candidate in [_FILE_DIR, *_FILE_DIR.parents]:
++    if (_candidate / "mytrader").is_dir() and (_candidate / ".codebuddy").is_dir():
++        PROJECT_ROOT = _candidate
++        break
+ MYTRADER_ROOT = PROJECT_ROOT / "mytrader"
+ ALIGNMENT_DIR = PROJECT_ROOT / "alignment"
+ CONSTITUTION_FILE = ALIGNMENT_DIR / "ai_constitution.md"
+@@ -292,20 +301,61 @@ HIGH_RISK_PATTERNS = {
+ 
+ 
+ def get_changed_files() -> list[str]:
+-    """获取 git diff 变更文件列表"""
++    """获取变更文件列表（tracked modified + untracked）。
++
++    基于 `git status --porcelain` 解析，能捕获 `git diff` 漏掉的 untracked 新文件。
++    失败时 fallback 到 `git diff --name-only HEAD`。
++    """
+     try:
+         result = subprocess.run(
+-            ["git", "diff", "--name-only"],
++            ["git", "status", "--porcelain=v1"],
+             capture_output=True,
+             text=True,
+             cwd=str(PROJECT_ROOT),
+             timeout=10,
+         )
+-        if result.stdout.strip():
+-            return [f for f in result.stdout.strip().split("\n") if f]
+-        return []
++        if result.returncode != 0:
++            raise RuntimeError(f"git status rc={result.returncode}: {result.stderr[:200]}")
++
++        changed: list[str] = []
++        for line in result.stdout.splitlines():
++            if not line.strip():
++                continue
++            # porcelain 格式: "XY path" 或 "XY path -> dest"
++            # X = staged, Y = working tree；?? = untracked, M = modified, A = added
++            if len(line) < 4:
++                continue
++            path_part = line[3:]
++            # 处理 rename: "old -> new" → 取 new
++            if " -> " in path_part:
++                path_part = path_part.split(" -> ", 1)[1]
++            # 去掉引号包裹（路径含空格时 git 会包引号）
++            if path_part.startswith('"') and path_part.endswith('"'):
++                path_part = path_part[1:-1]
++            changed.append(path_part)
++        # 去重（同一文件可能 staged + working 均有变更）
++        seen: set[str] = set()
++        unique: list[str] = []
++        for f in changed:
++            if f not in seen:
++                seen.add(f)
++                unique.append(f)
++        return unique
+     except Exception:
+-        return []
++        # fallback: 只看 tracked diff
++        try:
++            result = subprocess.run(
++                ["git", "diff", "--name-only", "HEAD"],
++                capture_output=True,
++                text=True,
++                cwd=str(PROJECT_ROOT),
++                timeout=10,
++            )
++            if result.stdout.strip():
++                return [f for f in result.stdout.strip().split("\n") if f]
++            return []
++        except Exception:
++            return []
+ 
+ 
+ def check_git_diff_violations(changed_files: list[str]) -> tuple[list[str], list[str]]:
+@@ -348,65 +398,237 @@ def check_git_diff_violations(changed_files: list[str]) -> tuple[list[str], list
+     return violations, high_risk_files
+ 
+ 
++# ─── pytest harness ──────────────────────────────────────────────────────
++
++
++def build_pytest_command(*, collect_only: bool = False) -> list[str]:
++    """构造统一的 pytest 命令。
++
++    默认 live 测试由 `mytrader/pyproject.toml` 的 `addopts = "-q -m 'not live'"` 隔离，
++    因此本命令不再显式添加 `-m 'not live'`，避免与 pyproject 重复导致参数冲突。
++
++    Args:
++        collect_only: True 则仅收集不运行（用于 count_tests）；False 则运行测试。
++    """
++    cmd = [PYTHON_BIN, "-m", "pytest"]
++    if collect_only:
++        cmd += ["--collect-only", "-q"]
++    else:
++        cmd += ["--tb=short", "-q"]
++    return cmd
++
++
++def parse_pytest_summary(output: str) -> dict[str, Any]:
++    """解析 pytest 输出的末尾 summary 行。
++
++    支持以下格式（pytest 8.x）：
++      - "562 passed, 103 warnings in 15.70s"
++      - "562 passed, 5 failed, 103 warnings in 20.1s"
++      - "1 error, 10 passed in 2.0s"
++      - "no tests ran in 0.01s"
++      - "562/578 tests collected (16 deselected) in 1.63s"  (--collect-only)
++
++    Returns:
++        dict 至少包含 passed/failed/errors/warnings/summary 字段。
++    """
++    passed = 0
++    failed = 0
++    errors = 0
++    warnings = 0
++    summary = ""
++    collected = None  # collect-only summary 的数量（如有）
++
++    if output:
++        # 从后向前找最后一个包含 pytest summary 关键模式的非空行。
++        # 严格匹配 "N passed/failed/error/warning" 形态，避免误匹配
++        # `-- Docs: .../capture-warnings.html`（含 "warning" 子串但非 summary）。
++        summary_patterns = [
++            re.compile(r"\d+\s+passed", re.IGNORECASE),
++            re.compile(r"\d+\s+failed", re.IGNORECASE),
++            re.compile(r"\d+\s+errors?", re.IGNORECASE),
++            re.compile(r"\d+\s+warnings?", re.IGNORECASE),
++            re.compile(r"no tests ran", re.IGNORECASE),
++            re.compile(r"\d+\s*/\s*\d+\s+tests?\s+collected", re.IGNORECASE),
++            re.compile(r"\d+\s+tests?\s+collected", re.IGNORECASE),
++            re.compile(r"\d+\s+items?\s+collected", re.IGNORECASE),
++        ]
++        for line in reversed(output.strip().splitlines()):
++            line_stripped = line.strip()
++            if not line_stripped:
++                continue
++            if any(p.search(line_stripped) for p in summary_patterns):
++                summary = line_stripped
++                break
++
++    if summary:
++        # collect-only 格式: "562/578 tests collected (16 deselected) in 1.63s"
++        m = re.search(r"(\d+)\s*/\s*\d+\s+tests?\s+collected", summary)
++        if m:
++            collected = int(m.group(1))
++
++        # 常规 summary: "N passed[, N failed][, N errors][, N warnings] in Xs"
++        for match in re.finditer(r"(\d+)\s+(passed|failed|errors?|warnings?)", summary):
++            count = int(match.group(1))
++            status = match.group(2).lower().rstrip("s")  # 归一化为单数
++            if status == "passed":
++                passed = count
++            elif status == "failed":
++                failed = count
++            elif status == "error":
++                errors = count
++            elif status == "warning":
++                warnings = count
++
++        # "no tests ran" 特殊处理
++        if "no tests ran" in summary.lower():
++            passed = 0
++            failed = 0
++            errors = 0
++
++    return {
++        "passed": passed,
++        "failed": failed,
++        "errors": errors,
++        "warnings": warnings,
++        "summary": summary,
++        "collected": collected,  # 仅 collect-only 模式有意义
++    }
++
++
++def has_test_failures(test_result: dict | None) -> bool:
++    """判定 pytest 结果是否包含失败（用于状态判定）。
++
++    失败条件：
++        - test_result 为 None
++        - test_result.error 存在（subprocess 异常等）
++        - exit_code != 0
++        - failed > 0
++        - errors > 0
++    """
++    if not test_result:
++        return True
++    if test_result.get("error"):
++        return True
++    if int(test_result.get("exit_code", 1)) != 0:
++        return True
++    if int(test_result.get("failed", 0)) > 0:
++        return True
++    if int(test_result.get("errors", 0)) > 0:
++        return True
++    return False
++
++
+ def count_tests() -> int:
+-    """收集当前测试数量（仅收集，不运行）"""
++    """收集当前测试数量（仅收集，不运行）。
++
++    解析顺序：
++        1. 优先从 stdout/stderr 的 `N tests collected` / `N collected` 解析
++        2. fallback 统计包含 `::` 的 nodeid 行
++        3. fallback 统计 `tests/xxx.py: N` 行并求和（pytest 8.x `-q` collect 格式）
++        4. 命令 exit_code 非 0 → 返回 -1（不假装 0）
++    """
+     try:
++        cmd = build_pytest_command(collect_only=True)
+         result = subprocess.run(
+-            [PYTHON_BIN, "-m", "pytest", "--co", "-q"],
++            cmd,
+             capture_output=True,
+             text=True,
+             cwd=str(MYTRADER_ROOT),
+-            timeout=30,
++            timeout=60,
++        )
++        if result.returncode != 0:
++            return -1
++
++        stdout = result.stdout or ""
++        stderr = result.stderr or ""
++        # summary 行可能在 stdout 或 stderr（pytest 版本差异）
++        combined = stdout + "\n" + stderr
++        summary = parse_pytest_summary(combined)
++
++        # 1. collect-only summary 中解析到 collected 数量
++        if summary.get("collected") is not None:
++            return int(summary["collected"])
++
++        # 2. 尝试解析 "N tests collected" / "N items collected" 形态
++        m = re.search(
++            r"(\d+)\s+tests?\s+collected|(\d+)\s+items?\s+collected|(\d+)\s+collected\s+in",
++            combined,
+         )
+-        count = 0
+-        for line in result.stdout.strip().split("\n"):
+-            if "::" in line:
+-                count += 1
+-        return count
++        if m:
++            for grp in m.groups():
++                if grp:
++                    return int(grp)
++
++        # 3. fallback: 统计包含 `::` 的 nodeid 行（仅看 stdout）
++        nodeid_count = sum(1 for line in stdout.splitlines() if "::" in line)
++        if nodeid_count > 0:
++            return nodeid_count
++
++        # 4. fallback: pytest 8.x `-q --collect-only` 的 "tests/xxx.py: N" 格式
++        #    严格匹配相对路径（排除 site-packages 的 __init__.py:6 警告行）
++        per_file_count = 0
++        for line in stdout.splitlines():
++            stripped = line.strip()
++            # 仅匹配不以 / 或 . 开头的相对路径（即项目内文件）
++            if stripped.startswith(("/", ".")):
++                continue
++            m = re.match(r"^(tests/)?[^:\s]+\.py:\s*(\d+)\s*$", stripped)
++            if m:
++                per_file_count += int(m.group(2))
++        if per_file_count > 0:
++            return per_file_count
++
++        # 5. 什么都没收集到 → 0（仅在输出明确为 "no tests collected" 时合理）
++        return 0
+     except Exception:
+         return -1
+ 
+ 
+ def run_tests() -> dict:
+-    """运行 pytest 并返回结果"""
++    """运行 pytest 并返回结果。
++
++    Returns:
++        dict 包含 passed/failed/errors/warnings/exit_code/summary/stdout_tail/stderr_tail/command。
++        subprocess 异常时返回 {"error": str(e), "exit_code": -1, "command": cmd}。
++    """
++    cmd = build_pytest_command(collect_only=False)
+     try:
+         result = subprocess.run(
+-            [PYTHON_BIN, "-m", "pytest", "--tb=short", "-q"],
++            cmd,
+             capture_output=True,
+             text=True,
+             cwd=str(MYTRADER_ROOT),
+-            timeout=120,
++            timeout=300,
+         )
+-        # 解析 "478 passed, 5 failed" 格式
+-        summary_line = ""
+-        for line in result.stdout.strip().split("\n"):
+-            if "passed" in line or "failed" in line or "error" in line:
+-                summary_line = line
+-                break
+-
+-        passed = 0
+-        failed = 0
+-        errors = 0
+-        for m in re.finditer(r"(\d+)\s+(passed|failed|error)", summary_line):
+-            count = int(m.group(1))
+-            status = m.group(2)
+-            if status == "passed":
+-                passed = count
+-            elif status == "failed":
+-                failed = count
+-            elif status == "error":
+-                errors = count
++        stdout = result.stdout or ""
++        stderr = result.stderr or ""
++        combined = stdout + "\n" + stderr
++        summary = parse_pytest_summary(combined)
+ 
+         return {
+-            "passed": passed,
+-            "failed": failed,
+-            "errors": errors,
++            "passed": summary["passed"],
++            "failed": summary["failed"],
++            "errors": summary["errors"],
++            "warnings": summary["warnings"],
+             "exit_code": result.returncode,
+-            "summary": summary_line,
+-            "stdout_tail": result.stdout[-500:],
++            "summary": summary["summary"],
++            "stdout_tail": stdout[-2000:],
++            "stderr_tail": stderr[-500:],
++            "command": cmd,
+         }
+     except Exception as e:
+-        return {"error": str(e)}
++        return {
++            "error": str(e),
++            "exit_code": -1,
++            "command": cmd,
++            "passed": 0,
++            "failed": 0,
++            "errors": 0,
++            "warnings": 0,
++            "summary": "",
++            "stdout_tail": "",
++            "stderr_tail": str(e),
++        }
+ 
+ 
+ # ─── 留痕检查 ────────────────────────────────────────────────────────────
+@@ -675,7 +897,7 @@ def save_iteration_snapshot(result: IterationResult):
+     response_text = "\n---\n".join(result.text_responses) if result.text_responses else "(无文本输出)"
+     (snapshot_dir / "full_response.md").write_text(response_text, encoding="utf-8")
+ 
+-    # 3. code_diff.patch — git diff 快照
++    # 3. code_diff.patch — git diff 快照（tracked 文件的变更）
+     try:
+         diff_result = subprocess.run(
+             ["git", "diff", "HEAD"],
+@@ -689,6 +911,37 @@ def save_iteration_snapshot(result: IterationResult):
+         diff_content = f"(git diff 失败: {e})"
+     (snapshot_dir / "code_diff.patch").write_text(diff_content, encoding="utf-8")
+ 
++    # 3a. git_status.txt — 完整 `git status --porcelain=v1` 输出
++    #     用于捕获 untracked 新文件（`git diff HEAD` 会漏掉这些）。
++    untracked_files: list[dict[str, Any]] = []
++    try:
++        status_result = subprocess.run(
++            ["git", "status", "--porcelain=v1"],
++            capture_output=True,
++            text=True,
++            cwd=str(PROJECT_ROOT),
++            timeout=15,
++        )
++        status_content = status_result.stdout if status_result.stdout else "(git status 无输出)"
++        untracked_files = _collect_untracked_files(status_content)
++    except Exception as e:
++        status_content = f"(git status 失败: {e})"
++    (snapshot_dir / "git_status.txt").write_text(status_content, encoding="utf-8")
++
++    # 3b. untracked_files.json — untracked 文件路径、大小、sha256
++    if untracked_files:
++        (snapshot_dir / "untracked_files.json").write_text(
++            json.dumps(untracked_files, indent=2, ensure_ascii=False, default=str),
++            encoding="utf-8",
++        )
++
++    # 3c. untracked_diff.patch — 对文本型 untracked 文件生成 diff 形式快照
++    untracked_diff = _build_untracked_diff(untracked_files)
++    if untracked_diff:
++        (snapshot_dir / "untracked_diff.patch").write_text(
++            untracked_diff, encoding="utf-8"
++        )
++
+     # 4. prompt_template.md — 记录任务描述（prompt 本身在 build_constitution_prompt 中构造）
+     (snapshot_dir / "prompt_template.md").write_text(
+         f"# 迭代 #{iter_num} Prompt\n\n"
+@@ -706,9 +959,180 @@ def save_iteration_snapshot(result: IterationResult):
+             encoding="utf-8",
+         )
+ 
++    # 6. gate_status.json — 机器可读的 gate/harness 健康状态
++    #    让 Meta-Agent 不只依赖 markdown summary 判定迭代质量。
++    _write_gate_status(result, snapshot_dir, iter_num, untracked_files)
++
+     print(f"  快照已保存: {snapshot_dir}")
+ 
+ 
++# untracked 文件快照过滤规则（避免泄露敏感文件 / 收集过大文件）
++_UNTRACKED_SKIP_DIRS = (".codebuddy/teams/", "__pycache__/", ".git/", "node_modules/")
++_UNTRACKED_SKIP_SUFFIXES = (".pyc", ".pyo", ".swp")
++_UNTRACKED_MAX_SIZE = 1024 * 1024  # 1MB
++_UNTRACKED_SENSITIVE_NAME_PARTS = (".env", "secret", "token", "key", "credential")
++
++
++def _is_sensitive_path(path_str: str) -> bool:
++    lower = path_str.lower()
++    for part in _UNTRACKED_SENSITIVE_NAME_PARTS:
++        if part in lower:
++            return True
++    return False
++
++
++def _collect_untracked_files(porcelain_output: str) -> list[dict[str, Any]]:
++    """从 `git status --porcelain=v1` 输出解析 untracked 文件（?? 前缀）。
++
++    Returns:
++        list of {path, size, sha256}；敏感文件仅记录路径，不读内容。
++    """
++    files: list[dict[str, Any]] = []
++    for line in porcelain_output.splitlines():
++        if len(line) < 4:
++            continue
++        xy = line[:2]
++        if xy != "??":
++            continue
++        path_part = line[3:]
++        if " -> " in path_part:
++            path_part = path_part.split(" -> ", 1)[1]
++        if path_part.startswith('"') and path_part.endswith('"'):
++            path_part = path_part[1:-1]
++
++        # 跳过黑名单目录/后缀
++        if any(path_part.startswith(d) for d in _UNTRACKED_SKIP_DIRS):
++            continue
++        if any(path_part.endswith(s) for s in _UNTRACKED_SKIP_SUFFIXES):
++            continue
++        if _is_sensitive_path(path_part):
++            # 仍记录路径，但不读内容
++            files.append({
++                "path": path_part,
++                "size": None,
++                "sha256": None,
++                "sensitive": True,
++            })
++            continue
++
++        full_path = PROJECT_ROOT / path_part
++        if not full_path.exists() or not full_path.is_file():
++            continue
++        try:
++            stat = full_path.stat()
++            if stat.st_size > _UNTRACKED_MAX_SIZE:
++                files.append({
++                    "path": path_part,
++                    "size": stat.st_size,
++                    "sha256": None,
++                    "skipped_reason": "file_too_large",
++                })
++                continue
++            content = full_path.read_bytes()
++            sha = hashlib.sha256(content).hexdigest()
++            files.append({
++                "path": path_part,
++                "size": stat.st_size,
++                "sha256": sha,
++                "sensitive": False,
++            })
++        except Exception as e:
++            files.append({
++                "path": path_part,
++                "size": None,
++                "sha256": None,
++                "error": str(e),
++            })
++    return files
++
++
++def _build_untracked_diff(untracked_files: list[dict[str, Any]]) -> str:
++    """对文本型 untracked 文件生成类似 `git diff` 的 patch。
++
++    跳过：敏感文件、过大文件、二进制文件（基于内容嗅探）。
++    """
++    patches: list[str] = []
++    for info in untracked_files:
++        if info.get("sensitive"):
++            continue
++        if info.get("skipped_reason") == "file_too_large":
++            continue
++        if info.get("sha256") is None:
++            continue
++
++        path_str = info["path"]
++        full_path = PROJECT_ROOT / path_str
++        try:
++            content_bytes = full_path.read_bytes()
++        except Exception:
++            continue
++        # 简单二进制检测：包含 NUL 字节视为二进制
++        if b"\x00" in content_bytes:
++            continue
++        try:
++            content = content_bytes.decode("utf-8")
++        except UnicodeDecodeError:
++            continue
++
++        # 构造类似 git diff 的 patch
++        patches.append(
++            f"diff --git a/{path_str} b/{path_str}\n"
++            f"new file mode 100644\n"
++            f"--- /dev/null\n"
++            f"+++ b/{path_str}\n"
++            f"@@ -0,0 +1,{len(content.splitlines())} @@\n"
++            + "".join(f"+{line}\n" for line in content.splitlines())
++        )
++    return "".join(patches)
++
++
++def _write_gate_status(
++    result: IterationResult,
++    snapshot_dir: Path,
++    iter_num: int,
++    untracked_files: list[dict[str, Any]],
++) -> None:
++    """写出 iterations/iteration_N/gate_status.json — 机器可读的 gate/harness 健康状态。"""
++    test_result = result.test_result or {}
++    gate = {
++        "iteration": iter_num,
++        "iteration_id": result.iteration_id,
++        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
++        "status": result.status,
++        "tests": {
++            "count_before": result.test_count_before,
++            "count_after": result.test_count_after,
++            "passed": int(test_result.get("passed", 0) or 0),
++            "failed": int(test_result.get("failed", 0) or 0),
++            "errors": int(test_result.get("errors", 0) or 0),
++            "warnings": int(test_result.get("warnings", 0) or 0),
++            "exit_code": int(test_result.get("exit_code", -1) or 0),
++            "summary": test_result.get("summary", ""),
++            "has_test_failures": has_test_failures(result.test_result),
++        },
++        "snapshot": {
++            "changed_files_count": len(result.changed_files),
++            "includes_untracked": len(untracked_files) > 0,
++            "untracked_count": len(untracked_files),
++            "git_status_file": "git_status.txt",
++            "untracked_files_file": "untracked_files.json" if untracked_files else None,
++            "untracked_diff_file": "untracked_diff.patch" if untracked_files else None,
++        },
++        "compliance": {
++            "violations": result.violations,
++            "high_risk_files_touched": result.high_risk_files_touched,
++            "buffer_overflow_count": result.buffer_overflow_count,
++        },
++        "trajectory_updated_by_codebuddy": result.trajectory_updated_by_codebuddy,
++        "decision_log_updated_by_codebuddy": result.decision_log_updated_by_codebuddy,
++        "error": result.error,
++    }
++    (snapshot_dir / "gate_status.json").write_text(
++        json.dumps(gate, indent=2, ensure_ascii=False, default=str),
++        encoding="utf-8",
++    )
++
++
+ def save_iteration_summary_template(
+     result: IterationResult,
+     rules: ConstitutionRules,
+@@ -1019,17 +1443,17 @@ async def run_iteration(
+         result.trajectory_updated_by_codebuddy = check_trajectory_updated(result.start_time)
+         result.decision_log_updated_by_codebuddy = check_decision_log_updated(result.start_time)
+ 
+-        # 5. 判定状态
++        # 5. 判定状态（严格使用 pytest exit_code + failed + errors + error 字段）
+         if result.violations:
+             result.status = "failed"
++        elif has_test_failures(result.test_result):
++            result.status = "failed"  # 测试失败 / exit_code != 0 / subprocess error
+         elif result.test_count_after < result.test_count_before and result.test_count_before > 0:
+             result.status = "failed"  # 测试数下降 = 禁止行为 #9
+         elif result.high_risk_files_touched:
+             result.status = "partial"  # 高风险变更需审批
+         elif result.buffer_overflow_count > 0:
+             result.status = "partial"  # ACP 通信中断，结果可能不完整
+-        elif result.test_result and result.test_result.get("error"):
+-            result.status = "partial"
+         else:
+             result.status = "passed"
+ 
+diff --git a/mytrader/pyproject.toml b/mytrader/pyproject.toml
+index d3ac6de..c03f7cc 100644
+--- a/mytrader/pyproject.toml
++++ b/mytrader/pyproject.toml
+@@ -85,4 +85,9 @@ ignore = ["E501"]               # line-length 由 formatter 控制
+ [tool.pytest.ini_options]
+ testpaths = ["tests"]
+ python_files = "test_*.py"
+-addopts = "-q"
++markers = [
++    "live: tests that call real broker/notification/network services; skipped by default",
++]
++# 默认排除 live 测试：避免本地未启动 TWS / 未配置 .env 时误触真实下单 / Telegram。
++# 显式运行 live 测试：`python -m pytest tests/test_integration_live.py -m live -v -s`
++addopts = "-q -m 'not live'"
+diff --git a/mytrader/tests/test_integration_live.py b/mytrader/tests/test_integration_live.py
+index 5d7696b..ca7b51e 100644
+--- a/mytrader/tests/test_integration_live.py
++++ b/mytrader/tests/test_integration_live.py
+@@ -1,13 +1,26 @@
+ """Phase 3 真实集成测试：Alpaca Paper 账户 + Telegram Bot。
+ 
+-运行方式：
++⚠️ Live 测试隔离
++----------------
++本文件所有测试均标记为 `@pytest.mark.live`，默认 `pytest` 不会收集或运行它们
++（见 `pyproject.toml` 的 `addopts = "-q -m 'not live'"`）。
++
++为什么隔离：
++- Alpaca 测试需要真实 `.env`（ALPACA__API_KEY / SECRET_KEY）
++- Telegram 测试会真实发送消息到手机
++- IBKR 测试需要本地 TWS Paper 运行并开启 API 端口
++- 默认运行这些测试会污染 orchestrator 验证结果（exit_code=1 但非业务 bug）
++
++显式运行 live 测试（应仅在手动验证时使用）：
++
+     cd mytrader
+-    python -m pytest tests/test_integration_live.py -v -s
++    python -m pytest tests/test_integration_live.py -m live -v -s
+ 
+ 前提：
+     - .env 已配置 ALPACA__API_KEY / ALPACA__SECRET_KEY
+     - .env 已配置 NOTIFICATION__TELEGRAM_ENABLED=true / BOT_TOKEN / CHAT_ID
+     - alpaca-py 已安装
++    - IBKR 测试额外需要本地 TWS/Gateway 运行（IBKR__HOST 配置）
+ """
+ from __future__ import annotations
+ 
+@@ -19,6 +32,9 @@ from alpaca.trading.client import TradingClient
+ 
+ from mytrader.infra.config import load_config
+ 
++# 整个模块标记为 live：默认 pytest 不收集，仅 `-m live` 时运行
++pytestmark = pytest.mark.live
++
+ 
+ # ---------------------------------------------------------------------------
+ # 配置预检

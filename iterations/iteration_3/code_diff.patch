@@ -1,0 +1,18 @@
+diff --git a/alignment/iteration_trajectory.md b/alignment/iteration_trajectory.md
+index 8fe78de..1385468 100644
+--- a/alignment/iteration_trajectory.md
++++ b/alignment/iteration_trajectory.md
+@@ -356,3 +356,13 @@ CodeBuddy 因 ACP buffer 溢出未完成 `--reoptimize`，由 Meta-Agent 独立
+ 
+ ---
+ 
++
++> **Orchestrator 验证记录** (自动追加)
++> - 迭代状态: passed
++> - 测试: 0 passed, 0 failed
++> - 违规: 0 条
++> - 高风险文件: 0 个
++> - 测试数变化: 0 → 0
++> - CodeBuddy 自行更新了 trajectory ✅
++
++---

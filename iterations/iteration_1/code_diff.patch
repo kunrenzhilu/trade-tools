@@ -1,0 +1,1099 @@
+diff --git a/.codebuddy/skills/cb-acp-dev/SKILL.md b/.codebuddy/skills/cb-acp-dev/SKILL.md
+index 6c486fd..0df6a72 100644
+--- a/.codebuddy/skills/cb-acp-dev/SKILL.md
++++ b/.codebuddy/skills/cb-acp-dev/SKILL.md
+@@ -73,10 +73,10 @@ Execute the orchestrator script with the task:
+     --max-turns 50 \
+     --timeout 1800
+ 
+-# Long task (> 30 min): run in background
++# Long task: run in background
+ nohup /Users/rickouyang/miniforge3/envs/py312trade/bin/python alignment/orchestrator.py \
+     --task "具体任务描述" \
+-    --max-turns 100 \
++    --max-turns 80 \
+     --timeout 86400 \
+     > /tmp/orchestrator.log 2>&1 &
+ 
+@@ -90,20 +90,31 @@ nohup /Users/rickouyang/miniforge3/envs/py312trade/bin/python alignment/orchestr
+ Key parameters:
+ - `--task`: The development task description (required)
+ - `--max-turns`: Max agent turns (default 50, increase for complex tasks)
+-- `--timeout`: Max runtime in seconds (default 300, increase for long tasks)
++- `--timeout`: Max runtime in seconds before force-exit (default 900=15min)
+ - `--team-research`: Trigger CodeBuddy to create an Agent Team for parallel research
+ 
+ ### Step 4: Monitor
+ 
+-During execution, the orchestrator captures all `session_update` events:
+-- **Text responses**: CodeBuddy's outputs and explanations
+-- **Tool calls**: Which tools CodeBuddy invoked (Read, Write, Bash, etc.)
+-- **Team events**: If Agent Teams are used, track `teamUpdate` and `memberEvent`
+-- **Permission requests**: Tools that needed permission (auto-approved in bypassPermissions mode)
++During execution, the orchestrator prints a **heartbeat line every 30 seconds** to stdout:
+ 
+-For long-running background tasks, periodically check the log:
++```
++[2m30s] 心跳 | phase=model_streaming idle_since_last_update=0s updates=145 tools=28
++[5m00s] 心跳 | phase=idle idle_since_last_update=120s updates=200 tools=35
++[7m30s] 心跳 | phase=idle idle_since_last_update=270s updates=200 tools=35
++```
++
++Heartbeat format: `[elapsed] 心跳 | phase=<agentPhase> idle_since_last_update=<seconds> updates=<count> tools=<count>`
++
++- **agentPhase**: `idle` → `preparing` → `model_requesting` → `model_streaming` → `model_done` → `idle`
++- **idle_since_last_update**: Seconds since last `session_update` event — growing = CodeBuddy may be done or stuck
++- **updates**: Total session_update events received
++- **tools**: Total tool calls made
++
++> The heartbeat is for **observability only** — it does not change the exit logic. The orchestrator always waits the full `--timeout` seconds (deterministic and predictable).
++
++For long-running background tasks, check the log:
+ ```bash
+-tail -50 /tmp/orchestrator.log
++tail -20 /tmp/orchestrator.log | grep -E '^\['
+ ```
+ 
+ ### Step 5: Post-Iteration Validation
+@@ -183,6 +194,37 @@ Extracted from `ai_constitution.md`:
+ 
+ **High-risk changes** (require user approval): risk param changes, execution logic, validation thresholds, new Alpha sources, major refactors, cash/leverage changes
+ 
++## Troubleshooting
++
++### CodeBuddy goes silent during iteration
++
++**Symptom**: Log stops updating, process shows SN (sleeping) at 0% CPU, heartbeat shows growing `idle_since_last_update`.
++
++**How to diagnose**:
++
++```bash
++# See current heartbeat and agent phase
++tail -10 /tmp/orchestrator.log | grep -E '^\['
++
++# Check if process alive
++ps aux | grep orchestrator
++
++# See what CodeBuddy already produced
++git diff --stat
++```
++
++**Interpretation guide**:
++
++| Heartbeat pattern | Likely meaning | Action |
++|---|---|---|
++| `phase=idle, idle_since_last_update > 60s` | CodeBuddy finished or max-turns reached | Wait for timeout or kill and check git diff |
++| `phase=model_requesting, idle_since_last_update > 60s` | Stuck waiting for model API | May need to kill and retry |
++| `phase=model_streaming, idle_since_last_update < 5s` | Actively working | Normal, wait |
++
++### Telegram notification during iteration
++
++If CodeBuddy runs `pytest` and `test_integration_live.py::test_send_test_message` triggers a real Telegram message, this is expected behavior — the test is designed to validate Telegram connectivity. Record it in `decision_log.md` and consider adding `@pytest.mark.live` skip markers in a future iteration.
++
+ ## Resources
+ 
+ ### scripts/
+diff --git a/.codebuddy/skills/cb-acp-dev/scripts/orchestrator.py b/.codebuddy/skills/cb-acp-dev/scripts/orchestrator.py
+index 2d29a42..9c915aa 100644
+--- a/.codebuddy/skills/cb-acp-dev/scripts/orchestrator.py
++++ b/.codebuddy/skills/cb-acp-dev/scripts/orchestrator.py
+@@ -58,6 +58,9 @@ class IterationResult:
+     tool_calls: list[dict] = field(default_factory=list)
+     team_events: list[dict] = field(default_factory=list)
+     permission_requests: list[dict] = field(default_factory=list)
++    # 空闲检测
++    agent_phase: str = "unknown"        # 当前 agentPhase（仅用于心跳日志，不参与退出决策）
++    last_update_time: float = 0.0       # 最后一次 session_update 的时间戳
+     violations: list[str] = field(default_factory=list)
+     test_result: dict | None = None
+     error: str | None = None
+@@ -164,8 +167,9 @@ def build_constitution_prompt(task: str, rules: ConstitutionRules) -> str:
+ class OrchestratorClient(Client):
+     """ACP 客户端 — 监控 CodeBuddy 的工作"""
+ 
+-    def __init__(self, result: IterationResult):
++    def __init__(self, result: IterationResult, heartbeat_cb=None):
+         self.result = result
++        self._heartbeat_cb = heartbeat_cb
+ 
+     async def request_permission(
+         self, options, session_id, tool_call, **kwargs
+@@ -193,13 +197,15 @@ class OrchestratorClient(Client):
+         return {"outcome": {"outcome": "cancelled"}}
+ 
+     async def session_update(self, session_id, update, **kwargs):
+-        """接收 CodeBuddy 的实时更新"""
++        """接收 CodeBuddy 的实时更新 — 追踪 agentPhase 用于心跳监控"""
++        now = time.time()
+         if hasattr(update, "model_dump"):
+             d = update.model_dump()
+         else:
+             d = update
+ 
+         self.result.updates_count += 1
++        self.result.last_update_time = now
+ 
+         # 提取文本
+         for chunk in _extract_text(d):
+@@ -210,9 +216,18 @@ class OrchestratorClient(Client):
+         tool_name = meta.get("codebuddy.ai/toolName")
+         if tool_name:
+             self.result.tool_calls.append(
+-                {"tool": tool_name, "timestamp": time.time()}
++                {"tool": tool_name, "timestamp": now}
+             )
+ 
++        # 追踪 agentPhase（心跳监控信号，不参与退出决策）
++        phase_info = meta.get("codebuddy.ai/agentPhase")
++        if phase_info and isinstance(phase_info, dict):
++            new_phase = phase_info.get("phase", "")
++            if new_phase and new_phase != self.result.agent_phase:
++                self.result.agent_phase = new_phase
++                if self._heartbeat_cb:
++                    self._heartbeat_cb(f"agentPhase → {new_phase}")
++
+         # 提取团队事件
+         for key in meta:
+             if "team" in key.lower() or "member" in key.lower():
+@@ -395,10 +410,16 @@ def log_iteration(result: IterationResult, rules: ConstitutionRules):
+ async def run_iteration(
+     task: str,
+     max_turns: int = 50,
+-    timeout_seconds: int = 300,
++    timeout_seconds: int = 900,
+     use_team: bool = False,
+ ) -> IterationResult:
+-    """执行一次完整的迭代循环"""
++    """执行一次完整的迭代循环
++
++    等待策略：time-based（确定性，简单可靠）:
++    - 等满 timeout_seconds，不提前退出
++    - 每 30 秒打印心跳（agentPhase + 距上次 session_update 多久）
++    - session_update 实时刷新 last_update_time（用于心跳显示，不改变退出逻辑）
++    """
+ 
+     iteration_id = str(uuid4())[:8]
+     result = IterationResult(
+@@ -411,10 +432,8 @@ async def run_iteration(
+     rules = load_constitution()
+     prompt = build_constitution_prompt(task, rules)
+ 
+-    # 如果需要团队调研，追加团队指令
+     if use_team:
+         prompt += """
+-
+ ## 并行调研指令
+ 请使用 TeamCreate 工具创建团队 'research-team'，
+ 派出两个成员并行工作：
+@@ -422,7 +441,15 @@ async def run_iteration(
+ 2. 'module-researcher-2' — 调研相关模块的测试覆盖情况
+ 完成后汇总结果再开始开发。"""
+ 
+-    client = OrchestratorClient(result)
++    def heartbeat_log(msg: str):
++        """心跳 — 输出到 stdout（nohup 日志可见），只用于监控，不参与退出决策"""
++        elapsed = time.time() - result.start_time
++        since_last = time.time() - result.last_update_time if result.last_update_time else 0
++        print(f"[{elapsed//60:.0f}m{elapsed%60:02.0f}s] {msg} | "
++              f"phase={result.agent_phase} idle_since_last_update={since_last:.0f}s "
++              f"updates={result.updates_count} tools={len(result.tool_calls)}")
++
++    client = OrchestratorClient(result, heartbeat_cb=heartbeat_log)
+ 
+     try:
+         async with spawn_agent_process(
+@@ -434,29 +461,34 @@ async def run_iteration(
+             cwd=str(MYTRADER_ROOT),
+         ) as (conn, proc):
+ 
+-            # 初始化
+             await conn.initialize(protocol_version=PROTOCOL_VERSION)
+ 
+-            # 创建会话
+             session = await conn.new_session(
+                 cwd=str(MYTRADER_ROOT),
+                 mcp_servers=[],
+             )
+ 
+-            # 发送任务
+-            await conn.prompt(
++            prompt_response = await conn.prompt(
+                 session_id=session.session_id,
+                 prompt=[text_block(prompt)],
+                 message_id=str(uuid4()),
+             )
++            heartbeat_log(f"prompt 已发送, stop_reason={prompt_response.stop_reason}")
+ 
+-            # 等待完成或超时
++            # time-based 等待（确定性，不提前退出）
+             elapsed = 0
++            check_interval = 5
++            heartbeat_interval = 30
++            last_heartbeat = time.time()
++
+             while elapsed < timeout_seconds:
+-                await asyncio.sleep(5)
+-                elapsed += 5
+-                # 如果 CodeBuddy 已经 idle（没有新更新），提前退出
+-                # (简化处理：等待固定时间)
++                await asyncio.sleep(check_interval)
++                elapsed += check_interval
++
++                # 心跳（仅日志，不改变退出逻辑）
++                if time.time() - last_heartbeat > heartbeat_interval:
++                    heartbeat_log("心跳")
++                    last_heartbeat = time.time()
+ 
+     except Exception as e:
+         result.error = str(e)
+@@ -466,14 +498,11 @@ async def run_iteration(
+ 
+     # 迭代后验证
+     if not result.error:
+-        # 检查 git diff 违规
+         violations = check_git_diff_violations()
+         result.violations.extend(violations)
+ 
+-        # 运行测试收集
+         result.test_result = run_tests()
+ 
+-        # 判定状态
+         if result.violations:
+             result.status = "failed"
+         elif result.test_result and result.test_result.get("error"):
+@@ -481,9 +510,7 @@ async def run_iteration(
+         else:
+             result.status = "passed"
+ 
+-    # 记录日志
+     log_iteration(result, rules)
+-
+     return result
+ 
+ 
+@@ -499,7 +526,7 @@ def main():
+     parser.add_argument("--task", required=True, help="迭代任务描述")
+     parser.add_argument("--max-turns", type=int, default=50, help="最大代理轮次")
+     parser.add_argument(
+-        "--timeout", type=int, default=300, help="超时时间（秒）"
++        "--timeout", type=int, default=900, help="总超时时间（秒，默认 900=15min）"
+     )
+     parser.add_argument(
+         "--team-research",
+diff --git a/.gitignore b/.gitignore
+index 483963f..113b6dc 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,6 +2,7 @@
+ .DS_Store
+ .claude/
+ tmp/
++iterations
+ 
+ # Python
+ .env
+diff --git a/alignment/iteration_trajectory.md b/alignment/iteration_trajectory.md
+index d8660e9..f89ef3b 100644
+--- a/alignment/iteration_trajectory.md
++++ b/alignment/iteration_trajectory.md
+@@ -28,3 +28,66 @@
+ - 检查测试是否全部通过
+ 
+ ---
++
++## 迭代 #1 — 策略名 bug 修复 + Sortino 指标引入
++
++- **日期**: 2026-06-30 15:53 ~ 16:20 UTC
++- **类型**: Bug 修复 + KPI 补全
++- **变更摘要**: 修复 `main.py` 中策略名与 `@register_strategy` 注册表不匹配导致 3 个策略被静默跳过的 bug；新增 Sortino Ratio 计算（Constitution L1 首要 KPI）
++- **执行时长**: ~27 分钟
++- **状态**: passed
++- **CodeBuddy 更新数**: ~2252 行日志
++- **工具调用数**: ~100+ (Read/Bash/Edit/Grep)
++- **团队事件数**: 0
++- **权限请求数**: 0 (bypassPermissions)
++- **违规检测**: 0 条
++
++### 变更详情
++
++**Bug 修复 (P0)**:
++- `main.py::_run_reoptimize` 中策略名 `["dual_ma","rsi","macd","bollinger"]` 与注册表 `["dual_ma","rsi_mean_revert","macd_cross","bollinger_band"]` 不匹配，导致 3 个策略被静默跳过
++- 提取为模块级常量 `REOPTIMIZE_STRATEGIES` / `REOPTIMIZE_PARAM_GRIDS` 便于回归测试
++- `matrix_backtest.py::_run_group` 加 warning 替代静默 `return None`
++- `examples/phase5_e2e.py` 同款 bug 修复
++
++**Sortino 指标 (P1)**:
++- 新增 `_compute_sortino()` + `_portfolio_sortino_from_results()`
++- `SingleBacktestResult.sortino` / `GroupBacktestResult.portfolio_sortino` 字段
++- `strategy_weights.json` 每条目输出 `backtest_sortino`
++
++**测试新增 (P2)**:
++- 10 个新测试：Sortino 单元测试 + 回归测试 + WARNING 测试
++- 测试总数：467 → 478 passed (5 failed 是 IBKR live 集成测试，pre-existing)
++
++**文档更新**:
++- `designs/design_v2/CHANGELOG.md` — v2.2 变更记录
++- `07-backtest-module.md` / `12-strategy-matrix.md` — Sortino 字段 + 策略名校验
++
++### 验证结果
++```
++478 passed, 5 failed (IBKR live, pre-existing)
++=== ✅ 全部验证通过 ===
++```
++
++### Constitution 合规
++- ✅ 未突破 DD 20% 约束
++- ✅ 测试覆盖率提升（+11 测试）
++- ✅ 未引入黑箱策略
++- ✅ 未引入 RL
++- ✅ 文档与代码同步
++- ✅ 低风险变更（bug 修复 + 指标补全），符合自动部署条件
++
++### Experience Learned
++- CodeBuddy 能自主完成完整的迭代流程（分析→计划→实施→测试→归档）
++- 发现了一个隐藏 6 天的 bug（策略名不匹配导致 3/4 策略被跳过）
++- CodeBuddy 正确判断了 Sortino 优化目标切换是高风险变更，留待下一轮迭代
++- test_integration_live.py 缺少 skip 标记，导致全量 pytest 触发真实 Telegram 消息（记录在 decision_log.md）
++- 自定义脚本没走 orchestrator.py 的 log_iteration，需要下次用正式 orchestrator
++
++### 后续建议
++1. 权重优化目标 Sharpe→Sortino（CodeBuddy 建议单独迭代评估）
++2. rsi/macd/bollinger 参数网格扩展
++3. 修复 test_integration_live.py 的 skip 标记（decision_log.md 记录）
++4. 低波动组策略淘汰评估
++
++---
+diff --git a/alignment/orchestrator.py b/alignment/orchestrator.py
+index 2d29a42..9c915aa 100644
+--- a/alignment/orchestrator.py
++++ b/alignment/orchestrator.py
+@@ -58,6 +58,9 @@ class IterationResult:
+     tool_calls: list[dict] = field(default_factory=list)
+     team_events: list[dict] = field(default_factory=list)
+     permission_requests: list[dict] = field(default_factory=list)
++    # 空闲检测
++    agent_phase: str = "unknown"        # 当前 agentPhase（仅用于心跳日志，不参与退出决策）
++    last_update_time: float = 0.0       # 最后一次 session_update 的时间戳
+     violations: list[str] = field(default_factory=list)
+     test_result: dict | None = None
+     error: str | None = None
+@@ -164,8 +167,9 @@ def build_constitution_prompt(task: str, rules: ConstitutionRules) -> str:
+ class OrchestratorClient(Client):
+     """ACP 客户端 — 监控 CodeBuddy 的工作"""
+ 
+-    def __init__(self, result: IterationResult):
++    def __init__(self, result: IterationResult, heartbeat_cb=None):
+         self.result = result
++        self._heartbeat_cb = heartbeat_cb
+ 
+     async def request_permission(
+         self, options, session_id, tool_call, **kwargs
+@@ -193,13 +197,15 @@ class OrchestratorClient(Client):
+         return {"outcome": {"outcome": "cancelled"}}
+ 
+     async def session_update(self, session_id, update, **kwargs):
+-        """接收 CodeBuddy 的实时更新"""
++        """接收 CodeBuddy 的实时更新 — 追踪 agentPhase 用于心跳监控"""
++        now = time.time()
+         if hasattr(update, "model_dump"):
+             d = update.model_dump()
+         else:
+             d = update
+ 
+         self.result.updates_count += 1
++        self.result.last_update_time = now
+ 
+         # 提取文本
+         for chunk in _extract_text(d):
+@@ -210,9 +216,18 @@ class OrchestratorClient(Client):
+         tool_name = meta.get("codebuddy.ai/toolName")
+         if tool_name:
+             self.result.tool_calls.append(
+-                {"tool": tool_name, "timestamp": time.time()}
++                {"tool": tool_name, "timestamp": now}
+             )
+ 
++        # 追踪 agentPhase（心跳监控信号，不参与退出决策）
++        phase_info = meta.get("codebuddy.ai/agentPhase")
++        if phase_info and isinstance(phase_info, dict):
++            new_phase = phase_info.get("phase", "")
++            if new_phase and new_phase != self.result.agent_phase:
++                self.result.agent_phase = new_phase
++                if self._heartbeat_cb:
++                    self._heartbeat_cb(f"agentPhase → {new_phase}")
++
+         # 提取团队事件
+         for key in meta:
+             if "team" in key.lower() or "member" in key.lower():
+@@ -395,10 +410,16 @@ def log_iteration(result: IterationResult, rules: ConstitutionRules):
+ async def run_iteration(
+     task: str,
+     max_turns: int = 50,
+-    timeout_seconds: int = 300,
++    timeout_seconds: int = 900,
+     use_team: bool = False,
+ ) -> IterationResult:
+-    """执行一次完整的迭代循环"""
++    """执行一次完整的迭代循环
++
++    等待策略：time-based（确定性，简单可靠）:
++    - 等满 timeout_seconds，不提前退出
++    - 每 30 秒打印心跳（agentPhase + 距上次 session_update 多久）
++    - session_update 实时刷新 last_update_time（用于心跳显示，不改变退出逻辑）
++    """
+ 
+     iteration_id = str(uuid4())[:8]
+     result = IterationResult(
+@@ -411,10 +432,8 @@ async def run_iteration(
+     rules = load_constitution()
+     prompt = build_constitution_prompt(task, rules)
+ 
+-    # 如果需要团队调研，追加团队指令
+     if use_team:
+         prompt += """
+-
+ ## 并行调研指令
+ 请使用 TeamCreate 工具创建团队 'research-team'，
+ 派出两个成员并行工作：
+@@ -422,7 +441,15 @@ async def run_iteration(
+ 2. 'module-researcher-2' — 调研相关模块的测试覆盖情况
+ 完成后汇总结果再开始开发。"""
+ 
+-    client = OrchestratorClient(result)
++    def heartbeat_log(msg: str):
++        """心跳 — 输出到 stdout（nohup 日志可见），只用于监控，不参与退出决策"""
++        elapsed = time.time() - result.start_time
++        since_last = time.time() - result.last_update_time if result.last_update_time else 0
++        print(f"[{elapsed//60:.0f}m{elapsed%60:02.0f}s] {msg} | "
++              f"phase={result.agent_phase} idle_since_last_update={since_last:.0f}s "
++              f"updates={result.updates_count} tools={len(result.tool_calls)}")
++
++    client = OrchestratorClient(result, heartbeat_cb=heartbeat_log)
+ 
+     try:
+         async with spawn_agent_process(
+@@ -434,29 +461,34 @@ async def run_iteration(
+             cwd=str(MYTRADER_ROOT),
+         ) as (conn, proc):
+ 
+-            # 初始化
+             await conn.initialize(protocol_version=PROTOCOL_VERSION)
+ 
+-            # 创建会话
+             session = await conn.new_session(
+                 cwd=str(MYTRADER_ROOT),
+                 mcp_servers=[],
+             )
+ 
+-            # 发送任务
+-            await conn.prompt(
++            prompt_response = await conn.prompt(
+                 session_id=session.session_id,
+                 prompt=[text_block(prompt)],
+                 message_id=str(uuid4()),
+             )
++            heartbeat_log(f"prompt 已发送, stop_reason={prompt_response.stop_reason}")
+ 
+-            # 等待完成或超时
++            # time-based 等待（确定性，不提前退出）
+             elapsed = 0
++            check_interval = 5
++            heartbeat_interval = 30
++            last_heartbeat = time.time()
++
+             while elapsed < timeout_seconds:
+-                await asyncio.sleep(5)
+-                elapsed += 5
+-                # 如果 CodeBuddy 已经 idle（没有新更新），提前退出
+-                # (简化处理：等待固定时间)
++                await asyncio.sleep(check_interval)
++                elapsed += check_interval
++
++                # 心跳（仅日志，不改变退出逻辑）
++                if time.time() - last_heartbeat > heartbeat_interval:
++                    heartbeat_log("心跳")
++                    last_heartbeat = time.time()
+ 
+     except Exception as e:
+         result.error = str(e)
+@@ -466,14 +498,11 @@ async def run_iteration(
+ 
+     # 迭代后验证
+     if not result.error:
+-        # 检查 git diff 违规
+         violations = check_git_diff_violations()
+         result.violations.extend(violations)
+ 
+-        # 运行测试收集
+         result.test_result = run_tests()
+ 
+-        # 判定状态
+         if result.violations:
+             result.status = "failed"
+         elif result.test_result and result.test_result.get("error"):
+@@ -481,9 +510,7 @@ async def run_iteration(
+         else:
+             result.status = "passed"
+ 
+-    # 记录日志
+     log_iteration(result, rules)
+-
+     return result
+ 
+ 
+@@ -499,7 +526,7 @@ def main():
+     parser.add_argument("--task", required=True, help="迭代任务描述")
+     parser.add_argument("--max-turns", type=int, default=50, help="最大代理轮次")
+     parser.add_argument(
+-        "--timeout", type=int, default=300, help="超时时间（秒）"
++        "--timeout", type=int, default=900, help="总超时时间（秒，默认 900=15min）"
+     )
+     parser.add_argument(
+         "--team-research",
+diff --git a/mytrader/designs/design_v2/07-backtest-module.md b/mytrader/designs/design_v2/07-backtest-module.md
+index 4a1b873..573715f 100644
+--- a/mytrader/designs/design_v2/07-backtest-module.md
++++ b/mytrader/designs/design_v2/07-backtest-module.md
+@@ -160,6 +160,7 @@ pf = vbt.Portfolio.from_signals(
+ | **Total Return** | 总回报率 | > 基准 | `Total Return [%]` |
+ | **Benchmark Return** | 买入持有基准收益 | 参考对比 | `Benchmark Return [%]` |
+ | **Sharpe Ratio** | 风险调整后收益（年化） | > 1.0，> 2.0 优秀 | `Sharpe Ratio` |
++| **Sortino Ratio** ⭐ | 下行风险调整后收益（**Constitution L1 首要 KPI**） | > 1.5，> 2.5 优秀 | `Sortino Ratio`（矩阵回测中手算，见 §10.4） |
+ | **Max Drawdown** | 最大回撤 | < 20% | `Max Drawdown [%]` |
+ | **Calmar Ratio** | 年化收益 / 最大回撤 | > 1.0 | `Calmar Ratio` |
+ | **Win Rate** | 盈利交易占比 | 并不是越高越好，配合 R:R 看 | `Win Rate [%]` |
+@@ -167,6 +168,10 @@ pf = vbt.Portfolio.from_signals(
+ | **Total Trades** | 总交易次数 | 符合策略预期 | `Total Trades` |
+ 
+ > ⚠️ **注意**：vectorbt 1.0.0 的 `pf.stats()` **不包含** `Annualized Return [%]` 字段（旧文档中有，新版本已移除）。年化收益需自行从 Total Return 和 Period 计算，或使用 `Calmar Ratio × Max Drawdown` 反推。
++>
++> ⚠️ **Sortino 计算口径（迭代 #1 确认）**：
++> - 单标的层面：vectorbt 1.0.0 `pf.stats()` 含 `Sortino Ratio`，可直接读取
++> - 矩阵回测层面（**组组合 Sortino**）：**必须手算**，因为 Sortino 是比率不可直接平均。正确做法是等权合并组内日收益率序列，再算下行偏差。`matrix_backtest.py::_compute_sortino()` 实现此公式，与 `_compute_sharpe()` 同口径（target=0、年化因子 252、退化返回 0.0）。这样保证单标的/组合口径一致，且不依赖 vectorbt stats 键名（曾发生 `Annualized Return [%]` 被移除的破坏性变更）。
+ 
+ ```python
+ # vectorbt 1.0.0 输出所有指标
+@@ -375,6 +380,8 @@ def run_matrix_backtest(universe: UniverseManager,
+ | 设计点 | 做法 | 理由 |
+ |--------|------|------|
+ | **组内取平均** | 等权合并组内日收益率序列，计算组合 Sharpe（而非直接平均各标的 Sharpe 比率） | 避免单只过拟合；Sharpe 是比率，不能直接平均；需要组合视角 |
++| **组合 Sortino**（迭代 #1 新增） | 与组合 Sharpe 同口径：等权合并日收益率 → `_compute_sortino(combined)` | Constitution L1 首要 KPI；比率不可直接平均；与 Sharpe 同口径保证可比 |
++| **策略名校验**（迭代 #1 新增） | `_run_group` 进入策略循环前检查 `strategy not in STRATEGY_REGISTRY` → `logger.warning` + `continue` | 防止策略名拼写错误被静默跳过（迭代 #1 修复的 bug：`main.py` 误用 `"rsi"/"macd"/"bollinger"` 简称导致 3 个策略 6 天未跑） |
+ | **参数按组** | 同组共用参数，不对单只优化 | 防过拟合（详见 02-strategy-engine.md 6.3） |
+ | **历史分组对齐** | 矩阵回测使用 point-in-time 分组（按回测时间点重算波动率），而非当前静态分组 | 避免回测静态分组而实盘动态分组导致回测/实盘不一致 |
+ | **实盘 ensemble 对齐** | MatrixBacktest 的 ensemble 权重优化须在"单点离散值聚合"语义下验证 | 实盘只取 iloc[-1] 单点离散值加权，与序列级加权不等价，权重必须在相同语义下产出 |
+diff --git a/mytrader/designs/design_v2/12-strategy-matrix.md b/mytrader/designs/design_v2/12-strategy-matrix.md
+index 0edea4a..dd4bba9 100644
+--- a/mytrader/designs/design_v2/12-strategy-matrix.md
++++ b/mytrader/designs/design_v2/12-strategy-matrix.md
+@@ -49,15 +49,15 @@ Signal Ranker
+   "groups": {
+     "NDX_high_vol": [
+       {"strategy": "dual_ma", "params": {"fast": 5, "slow": 60}, "weight": 0.6,
+-       "backtest_sharpe": 1.42, "backtest_win_rate": 0.58},
+-      {"strategy": "macd", "params": {"fast": 12, "slow": 26, "signal": 9}, "weight": 0.4,
+-       "backtest_sharpe": 1.18, "backtest_win_rate": 0.55}
++       "backtest_sharpe": 1.42, "backtest_sortino": 1.85, "backtest_win_rate": 0.58},
++      {"strategy": "macd_cross", "params": {"fast": 12, "slow": 26, "signal_period": 9}, "weight": 0.4,
++       "backtest_sharpe": 1.18, "backtest_sortino": 1.54, "backtest_win_rate": 0.55}
+     ],
+     "SPX_low_vol": [
+-      {"strategy": "rsi", "params": {"period": 14, "oversold": 30, "overbought": 70}, "weight": 0.7,
+-       "backtest_sharpe": 1.05, "backtest_win_rate": 0.62},
+-      {"strategy": "bollinger", "params": {"period": 20, "std_dev": 2.0}, "weight": 0.3,
+-       "backtest_sharpe": 0.92, "backtest_win_rate": 0.60}
++      {"strategy": "rsi_mean_revert", "params": {"period": 14, "oversold": 30, "overbought": 70}, "weight": 0.7,
++       "backtest_sharpe": 1.05, "backtest_sortino": 1.32, "backtest_win_rate": 0.62},
++      {"strategy": "bollinger_band", "params": {"period": 20, "std_dev": 2.0}, "weight": 0.3,
++       "backtest_sharpe": 0.92, "backtest_sortino": 1.18, "backtest_win_rate": 0.60}
+     ]
+   }
+ }
+@@ -65,7 +65,9 @@ Signal Ranker
+ 
+ > 关键字段：
+ > - `weight`：该策略在组内的权重（组合本身是被回测过的，权重来自回测优化）
+-> - `backtest_sharpe` / `backtest_win_rate`：供 Signal Ranker 计算综合得分
++> - `backtest_sharpe` / `backtest_sortino` / `backtest_win_rate`：供 Signal Ranker 计算综合得分
++> - `backtest_sortino`（迭代 #1 新增）：Constitution L1 首要 KPI，组合 Sortino（等权合并组内日收益率序列后手算，详见 [07-backtest-module.md](./07-backtest-module.md) §10.4）
++> - ⚠️ **策略名必须与 `@register_strategy(name)` 装饰器完全一致**：`dual_ma` / `rsi_mean_revert` / `macd_cross` / `bollinger_band`（早期文档误用简称 `rsi`/`macd`/`bollinger`，已在迭代 #1 修正）
+ 
+ ---
+ 
+@@ -214,7 +216,7 @@ def run_symbol(symbol, lookback_days=90):
+ 
+ | 风险 | 级别 | 缓解措施 |
+ |------|------|---------|
+-| 权重文件与注册表不同步 | 中 | 加载时校验策略存在性 |
++| 权重文件与注册表不同步 | 中 | 加载时校验策略存在性；**MatrixBacktest `_run_group` 在策略循环入口检查 `strategy not in STRATEGY_REGISTRY` → `WARNING` 级日志 + `continue`**（迭代 #1 新增，防止策略名拼写错误被静默跳过） |
+ | 多策略信号冲突 | 中 | 交由 Signal Ranker 按权重综合 |
+ | 并发计算资源占用 | 低 | max_workers 限流 |
+ 
+diff --git a/mytrader/designs/design_v2/CHANGELOG.md b/mytrader/designs/design_v2/CHANGELOG.md
+index da0d2d1..3a60553 100644
+--- a/mytrader/designs/design_v2/CHANGELOG.md
++++ b/mytrader/designs/design_v2/CHANGELOG.md
+@@ -4,6 +4,49 @@
+ 
+ ---
+ 
++## v2.2 — 2026-06-30（迭代 #1：策略名 bug 修复 + Sortino 指标）
++
++### 背景
++
++`--reoptimize` 产出的 `strategy_weights.json` 中 6 个组**全部只剩 `dual_ma`**，
++其余 3 个策略（rsi / macd / bollinger）被静默跳过。根因：`main.py::_run_reoptimize`
++传入的策略名 `["dual_ma","rsi","macd","bollinger"]` 与 `@register_strategy` 注册表
++中的实际名 `["dual_ma","rsi_mean_revert","macd_cross","bollinger_band"]` 不匹配，
++`_backtest_one` 内部 `STRATEGY_REGISTRY.get(name)` 返回 `None` 后静默 `return None`，
++仅 `_run_group` 层留下"no valid results"的 debug 日志，bug 隐藏 6 天未被发现。
++
++同时发现 Constitution L1 首要 KPI（**Sortino Ratio**）在矩阵回测中**完全未计算**，
++`strategy_weights.json` 仅含 `backtest_sharpe`，无法对"在 DD≤20% 约束下优化 Sortino"
++这一 Constitution 目标进行度量。
++
++### 修改清单
++
++| 优先级 | 问题 | 涉及文件 | 变更内容 |
++|--------|------|----------|---------|
++| P0 | `main.py` 策略名与注册表不匹配 | `main.py` | 策略名改为 `dual_ma`/`rsi_mean_revert`/`macd_cross`/`bollinger_band`；提取为模块级常量 `REOPTIMIZE_STRATEGIES` / `REOPTIMIZE_PARAM_GRIDS` 便于回归测试 |
++| P0 | 未注册策略被静默跳过 | `matrix_backtest.py` | `_run_group` 策略循环入口加 `if strategy not in STRATEGY_REGISTRY: logger.warning(...) + continue`（替代 `_backtest_one` 内部静默 `return None`） |
++| P0 | `examples/phase5_e2e.py` 同款策略名错误 | `examples/phase5_e2e.py` | `"macd"` → `"macd_cross"` |
++| P1 | 矩阵回测缺 Sortino（Constitution 首要 KPI） | `matrix_backtest.py` | 新增 `_compute_sortino()` + `_portfolio_sortino_from_results()`；`SingleBacktestResult.sortino` / `GroupBacktestResult.portfolio_sortino` 字段；`strategy_weights.json` 每条目输出 `backtest_sortino` |
++| P1 | 测试 `test_run_weights_sum_to_one` 有同款 bug | `tests/test_matrix_backtest.py` | `"rsi"` → `"rsi_mean_revert"`（原测试因单策略权重自然=1.0 而碰巧通过） |
++| P1 | 缺回归测试防策略名再次脱节 | `tests/test_matrix_backtest.py` | 新增 `test_reoptimize_strategy_names_match_registry`：断言 `REOPTIMIZE_STRATEGIES ⊆ STRATEGY_REGISTRY.keys()` |
++| P2 | 缺 Sortino 单元测试 | `tests/test_matrix_backtest.py` | 新增 `test_compute_sortino_*`（5 个）+ `test_portfolio_sortino_from_results` + `test_output_file_contains_sortino` + `test_group_results_have_portfolio_sortino` |
++| P2 | 缺未注册策略 WARNING 测试 | `tests/test_matrix_backtest.py` | 新增 `test_unknown_strategy_logs_warning` |
++| P2 | 设计文档策略名/字段不同步 | `07-backtest-module.md`, `12-strategy-matrix.md` | §5 指标表加 Sortino 行 + 计算口径说明；§10.4 加"组合 Sortino"+"策略名校验"设计点；`12` §3 JSON 示例修策略名 + 加 `backtest_sortino`；§9 风险缓解加 MatrixBacktest WARNING 校验 |
++
++### 不变项
++
++- 权重优化仍基于 **Sharpe**（`_optimize_ensemble_weights`）—— 切换为 Sortino 优化属行为变更，留待下一轮迭代单独评估（见 `alignment/decision_log.md`）
++- 4 策略参数网格不变（rsi/macd/bollinger 仍是单点默认参数）—— 扩参属"策略参数微调"另一轮迭代
++- `BacktestRunner`（单标的回测）不受影响，未改动
++
++### 影响范围
++
++- ✅ 向后兼容：`strategy_weights.json` 新增 `backtest_sortino` 字段，旧字段保留；`SingleBacktestResult.sortino` / `GroupBacktestResult.portfolio_sortino` 带 default 值，位置式构造不受影响
++- ⚠️ 行为变更：`--reoptimize` 重新产出后，6 个组中至少 3 组最优策略不再是 `dual_ma`（预期）
++- 🔲 下一轮迭代候选：(1) 权重优化目标 Sharpe→Sortino；(2) rsi/macd/bollinger 参数网格扩展；(3) 低波动组（SPX_low_vol Sortino 待度量）策略淘汰评估
++
++---
++
+ ## v2.1 — 2026-06-23（Claude 审查后修正）
+ 
+ ### 背景
+diff --git a/mytrader/examples/phase5_e2e.py b/mytrader/examples/phase5_e2e.py
+index fe95ccd..2185843 100644
+--- a/mytrader/examples/phase5_e2e.py
++++ b/mytrader/examples/phase5_e2e.py
+@@ -73,7 +73,7 @@ def main() -> None:
+         default_strategies = [
+             {"strategy": "dual_ma",  "params": {"fast": 5, "slow": 60},
+              "weight": 0.6, "backtest_sharpe": 1.2, "backtest_win_rate": 0.55},
+-            {"strategy": "macd",     "params": {"fast": 12, "slow": 26, "signal_period": 9},
++            {"strategy": "macd_cross",  "params": {"fast": 12, "slow": 26, "signal_period": 9},
+              "weight": 0.4, "backtest_sharpe": 1.0, "backtest_win_rate": 0.52},
+         ]
+         for gid in groups:
+diff --git a/mytrader/main.py b/mytrader/main.py
+index d23b5a6..328acbe 100644
+--- a/mytrader/main.py
++++ b/mytrader/main.py
+@@ -24,6 +24,29 @@ import sys
+ from pathlib import Path
+ 
+ 
++# ---------------------------------------------------------------------------
++# Walk-Forward 重优化配置（迭代 #1 提为模块级常量，便于回归测试）
++# ⚠️ 策略名必须与 mytrader/strategy/strategies/*.py 中 @register_strategy(...)
++#    装饰器的名字完全一致。回归测试 test_reoptimize_strategy_names_match_registry
++#    会断言 REOPTIMIZE_STRATEGIES ⊆ STRATEGY_REGISTRY.keys()，防止策略名拼写
++#    错误导致矩阵回测静默跳过整类策略。
++# ---------------------------------------------------------------------------
++
++REOPTIMIZE_STRATEGIES: list[str] = [
++    "dual_ma",
++    "rsi_mean_revert",
++    "macd_cross",
++    "bollinger_band",
++]
++
++REOPTIMIZE_PARAM_GRIDS: dict[str, dict[str, list]] = {
++    "dual_ma":         {"fast": [5, 10], "slow": [20, 40, 60]},
++    "rsi_mean_revert": {"period": [14], "oversold": [30], "overbought": [70]},
++    "macd_cross":      {"fast": [12], "slow": [26], "signal_period": [9]},
++    "bollinger_band":  {"period": [20], "std_dev": [2.0]},
++}
++
++
+ def parse_args() -> argparse.Namespace:
+     parser = argparse.ArgumentParser(
+         prog="mytrader",
+@@ -310,13 +333,16 @@ def _run_reoptimize(config: "Any", logger: "Any") -> None:
+     universe.recompute_volatility_tiers(max_workers=4)
+ 
+     mb = MatrixBacktest(store=store, universe=universe, years=5, top_k=2)
+-    strategies = ["dual_ma", "rsi", "macd", "bollinger"]
+-    param_grids = {
+-        "dual_ma": {"fast": [5, 10], "slow": [20, 40, 60]},
+-        "rsi":     {"period": [14], "oversold": [30], "overbought": [70]},
+-        "macd":    {"fast": [12], "slow": [26], "signal_period": [9]},
+-        "bollinger": {"period": [20], "std_dev": [2.0]},
+-    }
++
++    # ⚠️ 策略名必须与 @register_strategy(...) 装饰器中的名字完全一致。
++    # 早期版本误用 "rsi"/"macd"/"bollinger" 简称，与注册表
++    # ("rsi_mean_revert"/"macd_cross"/"bollinger_band") 不匹配，
++    # 导致这 3 个策略在矩阵回测中被 _backtest_one 静默跳过，
++    # strategy_weights.json 退化为仅 dual_ma（迭代 #1 修复）。
++    # 模块级常量 REOPTIMIZE_STRATEGIES / REOPTIMIZE_PARAM_GRIDS 便于回归测试
++    # （test_reoptimize_strategy_names_match_registry 防止策略名再次与注册表脱节）。
++    strategies = REOPTIMIZE_STRATEGIES
++    param_grids = REOPTIMIZE_PARAM_GRIDS
+ 
+     output = Path("config/strategy_weights.json")
+     report = mb.run(strategies=strategies, param_grids=param_grids, output_file=output)
+diff --git a/mytrader/mytrader/backtest/matrix_backtest.py b/mytrader/mytrader/backtest/matrix_backtest.py
+index f3dad2d..71c8edc 100644
+--- a/mytrader/mytrader/backtest/matrix_backtest.py
++++ b/mytrader/mytrader/backtest/matrix_backtest.py
+@@ -44,7 +44,8 @@ class SingleBacktestResult:
+     max_drawdown_pct: float
+     win_rate_pct: float
+     total_trades: int
+-    daily_returns: pd.Series    # pf.returns() — 供组合 Sharpe 计算
++    daily_returns: pd.Series    # pf.returns() — 供组合 Sharpe / Sortino 计算
++    sortino: float = 0.0       # Constitution L1 首要 KPI（迭代 #1 新增）
+ 
+ 
+ @dataclass
+@@ -59,6 +60,7 @@ class GroupBacktestResult:
+     avg_max_drawdown_pct: float
+     avg_win_rate_pct: float
+     symbol_count: int
++    portfolio_sortino: float = 0.0   # 等权组合 Sortino（迭代 #1 新增）
+ 
+ 
+ @dataclass
+@@ -88,6 +90,42 @@ def _compute_sharpe(returns: pd.Series, periods_per_year: int = 252) -> float:
+     return float(mean / std * np.sqrt(periods_per_year))
+ 
+ 
++def _compute_sortino(
++    returns: pd.Series,
++    periods_per_year: int = 252,
++    target: float = 0.0,
++) -> float:
++    """从日收益率序列计算年化 Sortino Ratio（Constitution L1 首要 KPI）。
++
++    Sortino = (mean(returns) - target) / downside_deviation * sqrt(periods_per_year)
++    downside_deviation = sqrt( mean( min(0, returns - target)^2 ) )
++
++    与 Sharpe 的区别：仅对下行波动惩罚，上行波动不计入分母。
++    适合"收益>0 但偶尔大跌"的中长线策略评估。
++
++    退化处理（与 _compute_sharpe 一致）：
++        - 样本 < 5 → 0.0
++        - 下行波动 ≤ 0（无下行样本）→ 0.0（理论为 +inf，返回 0 保持保守 + 可算术聚合）
++
++    Args:
++        returns:          日收益率序列（如 pf.returns()）
++        periods_per_year: 年化因子（日线 = 252）
++        target:           MAR/目标收益率，默认 0（与 _compute_sharpe 无风险利率假设一致）
++
++    Returns:
++        年化 Sortino Ratio
++    """
++    returns = returns.dropna()
++    if len(returns) < 5:
++        return 0.0
++    excess = returns - target
++    downside = excess.where(excess < 0, 0.0)        # 仅保留负偏离，正偏离置 0
++    dd = np.sqrt((downside ** 2).mean())
++    if dd <= 0 or np.isnan(dd):
++        return 0.0
++    return float(returns.mean() / dd * np.sqrt(periods_per_year))
++
++
+ def _backtest_one(
+     df: pd.DataFrame,
+     strategy_name: str,
+@@ -142,6 +180,8 @@ def _backtest_one(
+ 
+         stats = pf.stats()
+ 
++        daily_returns = pf.returns()
++
+         return SingleBacktestResult(
+             symbol=str(df.index.name or ""),
+             strategy=strategy_name,
+@@ -151,7 +191,8 @@ def _backtest_one(
+             max_drawdown_pct=float(stats.get("Max Drawdown [%]", 0.0) or 0.0),
+             win_rate_pct=float(stats.get("Win Rate [%]", 0.0) or 0.0),
+             total_trades=int(stats.get("Total Trades", 0) or 0),
+-            daily_returns=pf.returns(),
++            daily_returns=daily_returns,
++            sortino=_compute_sortino(daily_returns),
+         )
+     except Exception as e:
+         logger.debug(f"[backtest_one] {strategy_name}({params}) failed: {e}")
+@@ -173,6 +214,18 @@ def _portfolio_sharpe_from_results(results: list[SingleBacktestResult]) -> float
+     return _compute_sharpe(combined)
+ 
+ 
++def _portfolio_sortino_from_results(results: list[SingleBacktestResult]) -> float:
++    """等权合并组内日收益率序列，计算组合 Sortino（与 _portfolio_sharpe_from_results 同语义）。
++
++    不能取各标的 Sortino 算术平均（与 Sharpe 同理：比率不可直接平均）。
++    """
++    valid = [r.daily_returns for r in results if not r.daily_returns.empty]
++    if not valid:
++        return 0.0
++    combined = pd.concat(valid, axis=1).mean(axis=1)
++    return _compute_sortino(combined)
++
++
+ def _optimize_ensemble_weights(
+     group_results: list[tuple[str, dict, list[SingleBacktestResult]]],
+     conflict_threshold: float = 0.3,
+@@ -334,6 +387,17 @@ class MatrixBacktest:
+         group_results: list[tuple[str, dict, list[SingleBacktestResult]]] = []
+ 
+         for strategy in strategies:
++            # ⚠️ 早期检测未注册策略名（迭代 #1 修复"策略名拼写错误被静默跳过"的 bug）
++            # 之前 _backtest_one 内部静默 return None，导致 main.py 误用 "rsi"/"macd"/"bollinger"
++            # 简称 6 天未被发现。改为 WARNING 级日志 + continue。
++            if strategy not in STRATEGY_REGISTRY:
++                logger.warning(
++                    f"[MatrixBacktest] {group_id}: strategy '{strategy}' not in "
++                    f"STRATEGY_REGISTRY — skipped. "
++                    f"Check spelling against @register_strategy decorators. "
++                    f"Known: {sorted(STRATEGY_REGISTRY.keys())}"
++                )
++                continue
+             grid = param_grids.get(strategy, {})
+             param_combos = list(
+                 dict(zip(grid.keys(), combo))
+@@ -342,6 +406,7 @@ class MatrixBacktest:
+ 
+             best_params = None
+             best_sharpe = float("-inf")
++            best_sortino = 0.0
+             best_results: list[SingleBacktestResult] = []
+ 
+             for params in param_combos:
+@@ -364,9 +429,11 @@ class MatrixBacktest:
+ 
+                 # ⚠️ 等权合并日收益率序列计算组合 Sharpe（不能取算术平均）
+                 ps = _portfolio_sharpe_from_results(results)
++                pso = _portfolio_sortino_from_results(results)
+ 
+                 if ps > best_sharpe:
+                     best_sharpe = ps
++                    best_sortino = pso
+                     best_params = params
+                     best_results = results
+ 
+@@ -387,6 +454,7 @@ class MatrixBacktest:
+                         np.mean([r.win_rate_pct for r in best_results])
+                     ),
+                     symbol_count=len(best_results),
++                    portfolio_sortino=best_sortino,
+                 ))
+ 
+         if not group_results:
+@@ -414,6 +482,7 @@ class MatrixBacktest:
+                 "params": params,
+                 "weight": round(weight, 4),
+                 "backtest_sharpe": round(gr.portfolio_sharpe if gr else 0.0, 4),
++                "backtest_sortino": round(gr.portfolio_sortino if gr else 0.0, 4),
+                 "backtest_win_rate": round(gr.avg_win_rate_pct / 100 if gr else 0.5, 4),
+             })
+ 
+diff --git a/mytrader/tests/test_matrix_backtest.py b/mytrader/tests/test_matrix_backtest.py
+index d83a5b9..6766e26 100644
+--- a/mytrader/tests/test_matrix_backtest.py
++++ b/mytrader/tests/test_matrix_backtest.py
+@@ -18,7 +18,9 @@ from mytrader.backtest.matrix_backtest import (
+     MatrixBacktest,
+     _backtest_one,
+     _compute_sharpe,
++    _compute_sortino,
+     _portfolio_sharpe_from_results,
++    _portfolio_sortino_from_results,
+     SingleBacktestResult,
+ )
+ 
+@@ -127,6 +129,73 @@ class TestHelpers:
+             f"差异应 >1e-6，否则说明实现有误"
+         )
+ 
++    # ── Sortino（迭代 #1 新增，Constitution L1 首要 KPI）─────────────────────
++
++    def test_compute_sortino_positive(self):
++        """正均值的收益序列 Sortino > 0。"""
++        returns = pd.Series([0.001, -0.0005, 0.002, -0.0003, 0.0015] * 60)
++        assert _compute_sortino(returns) > 0
++
++    def test_compute_sortino_empty(self):
++        """空序列返回 0。"""
++        assert _compute_sortino(pd.Series([], dtype=float)) == 0.0
++
++    def test_compute_sortino_no_downside_returns_zero(self):
++        """全正收益（无下行波动）→ 0.0（退化处理，与 _compute_sharpe 一致）。
++
++        理论上 Sortino 应为 +inf，但返回 0 保持可算术聚合 + 保守评估。
++        """
++        returns = pd.Series([0.001] * 100)   # 全正，无下行
++        assert _compute_sortino(returns) == 0.0
++
++    def test_compute_sortino_differs_from_sharpe_when_asymmetric(self):
++        """当上行/下行波动不对称时，Sortino ≠ Sharpe（这是引入 Sortino 的意义）。"""
++        # 大幅上行小波动 + 偶尔小幅下行：Sortino 应明显高于 Sharpe
++        np.random.seed(42)
++        upside = np.random.normal(0.003, 0.005, 200)   # 正均值的上行
++        downside_shocks = np.array([-0.01, -0.012, -0.008] * 3)  # 少量下行冲击
++        returns = pd.Series(np.concatenate([upside, downside_shocks]))
++
++        sharpe = _compute_sharpe(returns)
++        sortino = _compute_sortino(returns)
++        # Sortino 仅对下行惩罚 → 上行波动不计入分母 → Sortino > Sharpe
++        assert sortino > sharpe, (
++            f"非对称收益下 Sortino({sortino:.4f}) 应 > Sharpe({sharpe:.4f})，"
++            f"否则说明 Sortino 公式退化为 Sharpe"
++        )
++
++    def test_compute_sortino_known_value(self):
++        """已知值验算 Sortino 公式正确性。"""
++        # r = [0.01, 0.01, 0.01, -0.01]
++        # mean = 0.005; downside = [0,0,0,-0.01]; dd = sqrt(mean([0,0,0,0.0001])) = sqrt(0.000025) = 0.005
++        # Sortino = 0.005 / 0.005 * sqrt(252) = 15.8745...
++        returns = pd.Series([0.01, 0.01, 0.01, -0.01] * 25)   # 重复 25 次以满足 len>=5
++        expected = (0.005 / 0.005) * np.sqrt(252)
++        assert abs(_compute_sortino(returns) - expected) < 1e-6
++
++    def test_portfolio_sortino_from_results(self):
++        """等权组合 Sortino 不等于各标的 Sortino 算术平均（与 Sharpe 同理）。"""
++        n = 252
++        np.random.seed(0)
++        r1 = pd.Series(np.random.normal(0.001, 0.01, n))
++        r2 = pd.Series(np.random.normal(0.0005, 0.002, n))
++
++        s1 = _compute_sortino(r1)
++        s2 = _compute_sortino(r2)
++        arithmetic_avg = (s1 + s2) / 2
++
++        results = [
++            SingleBacktestResult("SYM1", "s1", {}, 0.0, 0, 0, 0, 0, r1),
++            SingleBacktestResult("SYM2", "s2", {}, 0.0, 0, 0, 0, 0, r2),
++        ]
++        portfolio_sortino = _portfolio_sortino_from_results(results)
++
++        diff = abs(portfolio_sortino - arithmetic_avg)
++        assert diff > 1e-6, (
++            f"组合 Sortino({portfolio_sortino:.4f}) 与算术平均({arithmetic_avg:.4f}) "
++            f"差异应 >1e-6，否则说明实现退化为算术平均"
++        )
++
+     def test_backtest_one_with_open(self):
+         """传入 open= 参数，回测正常运行。"""
+         df = _make_ohlcv(300)
+@@ -204,10 +273,10 @@ class TestMatrixBacktest:
+         """每个分组的策略权重之和 ≈ 1.0。"""
+         mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=2)
+         report = mb.run(
+-            strategies=["dual_ma", "rsi"],
++            strategies=["dual_ma", "rsi_mean_revert"],
+             param_grids={
+                 "dual_ma": {"fast": [5], "slow": [20]},
+-                "rsi": {"period": [14], "oversold": [30], "overbought": [70]},
++                "rsi_mean_revert": {"period": [14], "oversold": [30], "overbought": [70]},
+             },
+         )
+         for gid, weights in report.groups.items():
+@@ -274,3 +343,84 @@ class TestMatrixBacktest:
+         data = json.loads(output.read_text())
+         warning = data["_meta"].get("survivorship_bias_warning", "")
+         assert "成分" in warning or "survivorship" in warning.lower()
++
++    # ── 迭代 #1 新增：观测性 + 回归 + Sortino 输出 ──────────────────────────
++
++    def test_unknown_strategy_logs_warning(self, mock_store, mock_universe):
++        """未注册策略名在 _run_group 中输出 WARNING 日志（而非静默跳过）。
++
++        这是迭代 #1 修复的核心观测性问题：之前 _backtest_one 内部静默 return None，
++        导致 main.py 误用 "rsi"/"macd"/"bollinger" 简称 6 天未被发现。
++
++        注意：项目用 loguru 而非 stdlib logging，故用 loguru sink 捕获（caplog 无效）。
++        """
++        from loguru import logger
++
++        msgs: list[str] = []
++        # 临时 sink 捕获所有 WARNING+ 日志到列表
++        handler_id = logger.add(lambda m: msgs.append(str(m)), level="WARNING")
++        try:
++            mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=2)
++            mb.run(
++                strategies=["dual_ma", "totally_bogus_name"],
++                param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
++            )
++        finally:
++            logger.remove(handler_id)
++
++        # 应有 WARNING 提及 bogus 策略名
++        assert any("totally_bogus_name" in m for m in msgs), (
++            f"未注册策略应触发 WARNING，实际捕获: {msgs}"
++        )
++
++    def test_reoptimize_strategy_names_match_registry(self):
++        """回归测试：main.REOPTIMIZE_STRATEGIES 中每个策略名必须在注册表中。
++
++        防止迭代 #1 的 bug 重现：策略名拼写与 @register_strategy 装饰器不匹配，
++        导致矩阵回测静默跳过整类策略、strategy_weights.json 退化为仅 dual_ma。
++        """
++        from main import REOPTIMIZE_STRATEGIES, REOPTIMIZE_PARAM_GRIDS
++        from mytrader.strategy.registry import STRATEGY_REGISTRY
++
++        assert len(REOPTIMIZE_STRATEGIES) >= 4, (
++            f"预期至少 4 个策略，实际 {len(REOPTIMIZE_STRATEGIES)}：{REOPTIMIZE_STRATEGIES}"
++        )
++        for name in REOPTIMIZE_STRATEGIES:
++            assert name in STRATEGY_REGISTRY, (
++                f"REOPTIMIZE_STRATEGIES 中的 '{name}' 未在 STRATEGY_REGISTRY 注册。"
++                f"已注册: {sorted(STRATEGY_REGISTRY.keys())}"
++            )
++            assert name in REOPTIMIZE_PARAM_GRIDS, (
++                f"REOPTIMIZE_PARAM_GRIDS 缺少 '{name}' 的参数网格"
++            )
++
++    def test_output_file_contains_sortino(self, mock_store, mock_universe, tmp_path):
++        """strategy_weights.json 每个权重条目含 backtest_sortino 字段（Constitution L1 首要 KPI）。"""
++        output = tmp_path / "weights_with_sortino.json"
++        mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=1)
++        mb.run(
++            strategies=["dual_ma"],
++            param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
++            output_file=output,
++        )
++        data = json.loads(output.read_text())
++        for gid, weights in data["groups"].items():
++            for w in weights:
++                assert "backtest_sortino" in w, (
++                    f"{gid}: 权重条目缺少 backtest_sortino 字段，实际 keys={list(w.keys())}"
++                )
++                assert isinstance(w["backtest_sortino"], (int, float)), (
++                    f"{gid}: backtest_sortino 应为数值，实际 {type(w['backtest_sortino'])}"
++                )
++
++    def test_group_results_have_portfolio_sortino(self, mock_store, mock_universe):
++        """GroupBacktestResult.portfolio_sortino 是浮点数（迭代 #1 新增字段）。"""
++        mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=1)
++        report = mb.run(
++            strategies=["dual_ma"],
++            param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
++        )
++        for gr in report.group_results:
++            assert isinstance(gr.portfolio_sortino, float), (
++                f"portfolio_sortino 应为 float，实际 {type(gr.portfolio_sortino)}"
++            )

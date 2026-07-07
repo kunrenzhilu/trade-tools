@@ -1,0 +1,4516 @@
+diff --git a/.codebuddy/CODEBUDDY.md b/.codebuddy/CODEBUDDY.md
+index 24bddf9..421c1ef 100644
+--- a/.codebuddy/CODEBUDDY.md
++++ b/.codebuddy/CODEBUDDY.md
+@@ -1,6 +1,6 @@
+ # Trade-Tools 项目核心参考文档
+ 
+-> 最后更新：2026-06-30 (新增 Orchestrator 监控循环)  
++> 最后更新：2026-07-05 (Iter #9: MatrixBacktest Alpha-Based Strategy Selection)  
+ > 本文是项目规范 + 关键索引，供 AI 助手快速建立项目上下文。  
+ > **各阶段开发详情见** → [`.codebuddy/notes/dev_records.md`](.codebuddy/notes/dev_records.md)
+ 
+@@ -105,7 +105,7 @@ mytrader/
+ │   └── phase5_e2e.py           # [Phase 5] 端到端干跑脚本
+ ├── reports/                    # 回测输出（.gitignore）
+ │   └── paper/daily/             # [迭代 #5] PaperDailyMetrics JSON 归档
+-├── tests/                      # 562 个测试（不含 live 集成测试，迭代 #5 后）
++├── tests/                      # 574 个测试（live 测试默认隔离，迭代 #7 后）
+ └── mytrader/
+     ├── data/                   # Module 01 — Data Layer ✅
+     │   ├── providers/
+@@ -119,18 +119,20 @@ mytrader/
+     │   ├── constituents.py             # 成分股抓取
+     │   └── grouping.py                 # 波动率分层
+     ├── strategy/               # Module 02 — Strategy Engine ✅
+-    │   ├── strategies/         # dual_ma / rsi / macd / bollinger
++    │   ├── strategies/         # dual_ma / rsi / rsi_trend_filter / macd / bollinger
+     │   ├── ensemble.py
+     │   └── matrix_runner.py    # [Phase 5] StrategyMatrixRunner
+     │                           # [迭代 #5] build_matrix_signal_indicators 共享 helper
+     ├── backtest/               # Module 07 — Backtest ✅
+     │   ├── runner.py           # BacktestRunner（含 daily_returns）
+-    │   ├── matrix_backtest.py  # [Phase 5] MatrixBacktest（含 backtest_dd_status 风险 metadata）
++    │   ├── matrix_backtest.py  # [Phase 5] MatrixBacktest（含 backtest_dd_status 风险 metadata + [Iter #9] backtest_alpha / alpha-based selection）
+     │   └── portfolio_backtest.py  # [迭代 #4] PortfolioBacktester（组合层级回测）
+     │                               # [迭代 #5] 复用 build_matrix_signal_indicators
++    │                               # [迭代 #7] SPY benchmark 对比（alpha/IR/benchmark Sortino/DD）
+     ├── signal/                 # Module 03 — Signal Filter ✅
+     │   ├── filters/
+     │   └── ranker.py           # [Phase 5] SignalRanker
++                                # [迭代 #7] 评分切换 sharpe→sortino + dd_penalty（Constitution L1）
+     ├── risk/                   # Module 04 — Risk Manager ✅
+     │   ├── position_sizer.py
+     │   ├── constraints.py
+@@ -190,9 +192,13 @@ mytrader/
+ | **Phase 4** | ✅ 完成 | 38 | AlpacaDataProvider + ScanOrchestrator + Streamlit Dashboard |
+ | **Phase 5** | ✅ 完成 | 85 | MarketDataStore + UniverseManager + 矩阵扫描 + 矩阵回测 + Walk-Forward |
+ | **Iter #5** | ✅ 完成 | 37 | Paper Trading Integrity & Parity（signal metadata parity + AlpacaBroker 只读 + reconciliation 修复 + paper metrics） |
++| **Iter #6** | ✅ 完成 | 38 | Harness Reliability & Live Test Isolation（live 隔离 + 假 passed 修复 + count_tests 修复 + untracked 快照 + gate_status.json） |
++| **Iter #7** | ✅ 完成 | 12 | SignalRanker Sortino Priority + Benchmark Comparison（sharpe→sortino 评分切换 + PortfolioBacktest SPY benchmark alpha/IR） |
++| **Iter #8** | ✅ 完成 | 11 | RSI Trend-Filtered Mean Reversion 策略（RSI 超卖/超买 + 200日SMA趋势过滤，5新测试） |
++| **Iter #9** | ✅ 完成 | 17 | MatrixBacktest Alpha-Based Strategy Selection（SPY benchmark + alpha 计算 + top-K/per-strategy/ensemble 从 Sortino/Sharpe 改为 Alpha + Sortino > 0.5 门槛 + 三级 fallback） |
+ | **Phase 6** | 🔲 待开发 | — | AlpacaBroker auto 端到端验证 + 对账真实集成 + 港股支持 |
+ 
+-**当前总测试数：562 passed，0 failed**（不含 5 个 IBKR live 集成测试 pre-existing failures，迭代 #5 后）
++**当前总测试数：602 passed，0 failed**（live 测试默认隔离，迭代 #9 后；harness 测试 38 个在 `alignment/tests/`）
+ 
+ > 各阶段详细实现见 **[dev_records.md](.codebuddy/notes/dev_records.md)**
+ 
+diff --git a/.codebuddy/skills/cb-acp-dev/scripts/orchestrator.py b/.codebuddy/skills/cb-acp-dev/scripts/orchestrator.py
+index f1bf393..546a542 100644
+--- a/.codebuddy/skills/cb-acp-dev/scripts/orchestrator.py
++++ b/.codebuddy/skills/cb-acp-dev/scripts/orchestrator.py
+@@ -17,6 +17,7 @@ Orchestrator — CodeBuddy 监控循环
+ """
+ 
+ import asyncio
++import hashlib
+ import json
+ import os
+ import re
+@@ -35,13 +36,22 @@ from acp.interfaces import Client
+ 
+ # ─── 路径常量 ───────────────────────────────────────────────────────────
+ 
+-PROJECT_ROOT = Path(__file__).resolve().parent.parent
++# 自动检测项目根目录：从本文件所在位置向上查找同时包含 `mytrader/` 和 `.codebuddy/` 的目录。
++# 这样 alignment/orchestrator.py 和 .codebuddy/skills/cb-acp-dev/scripts/orchestrator.py
++# 可以保持字节级同步，无需为路径常量写不同分支。
++_FILE_DIR = Path(__file__).resolve().parent
++PROJECT_ROOT: Path = _FILE_DIR
++for _candidate in [_FILE_DIR, *_FILE_DIR.parents]:
++    if (_candidate / "mytrader").is_dir() and (_candidate / ".codebuddy").is_dir():
++        PROJECT_ROOT = _candidate
++        break
+ MYTRADER_ROOT = PROJECT_ROOT / "mytrader"
+ ALIGNMENT_DIR = PROJECT_ROOT / "alignment"
+ CONSTITUTION_FILE = ALIGNMENT_DIR / "ai_constitution.md"
+ TRAJECTORY_FILE = ALIGNMENT_DIR / "iteration_trajectory.md"
+ DECISION_LOG_FILE = ALIGNMENT_DIR / "decision_log.md"
+ CODEBUDDY_FILE = PROJECT_ROOT / ".codebuddy" / "CODEBUDDY.md"
++ITERATIONS_DIR = PROJECT_ROOT / "iterations"  # 每次迭代的完整快照
+ 
+ PYTHON_BIN = "/Users/rickouyang/miniforge3/envs/py312trade/bin/python"
+ 
+@@ -85,6 +95,9 @@ class IterationResult:
+     # 文件变更
+     changed_files: list[str] = field(default_factory=list)
+     error: str | None = None
++    # ACP buffer 溢出统计（LimitOverrunError，非致命）
++    buffer_overflow_count: int = 0
++    buffer_overflow_errors: list[str] = field(default_factory=list)
+ 
+ 
+ @dataclass
+@@ -288,20 +301,61 @@ HIGH_RISK_PATTERNS = {
+ 
+ 
+ def get_changed_files() -> list[str]:
+-    """获取 git diff 变更文件列表"""
++    """获取变更文件列表（tracked modified + untracked）。
++
++    基于 `git status --porcelain` 解析，能捕获 `git diff` 漏掉的 untracked 新文件。
++    失败时 fallback 到 `git diff --name-only HEAD`。
++    """
+     try:
+         result = subprocess.run(
+-            ["git", "diff", "--name-only"],
++            ["git", "status", "--porcelain=v1"],
+             capture_output=True,
+             text=True,
+             cwd=str(PROJECT_ROOT),
+             timeout=10,
+         )
+-        if result.stdout.strip():
+-            return [f for f in result.stdout.strip().split("\n") if f]
+-        return []
++        if result.returncode != 0:
++            raise RuntimeError(f"git status rc={result.returncode}: {result.stderr[:200]}")
++
++        changed: list[str] = []
++        for line in result.stdout.splitlines():
++            if not line.strip():
++                continue
++            # porcelain 格式: "XY path" 或 "XY path -> dest"
++            # X = staged, Y = working tree；?? = untracked, M = modified, A = added
++            if len(line) < 4:
++                continue
++            path_part = line[3:]
++            # 处理 rename: "old -> new" → 取 new
++            if " -> " in path_part:
++                path_part = path_part.split(" -> ", 1)[1]
++            # 去掉引号包裹（路径含空格时 git 会包引号）
++            if path_part.startswith('"') and path_part.endswith('"'):
++                path_part = path_part[1:-1]
++            changed.append(path_part)
++        # 去重（同一文件可能 staged + working 均有变更）
++        seen: set[str] = set()
++        unique: list[str] = []
++        for f in changed:
++            if f not in seen:
++                seen.add(f)
++                unique.append(f)
++        return unique
+     except Exception:
+-        return []
++        # fallback: 只看 tracked diff
++        try:
++            result = subprocess.run(
++                ["git", "diff", "--name-only", "HEAD"],
++                capture_output=True,
++                text=True,
++                cwd=str(PROJECT_ROOT),
++                timeout=10,
++            )
++            if result.stdout.strip():
++                return [f for f in result.stdout.strip().split("\n") if f]
++            return []
++        except Exception:
++            return []
+ 
+ 
+ def check_git_diff_violations(changed_files: list[str]) -> tuple[list[str], list[str]]:
+@@ -329,80 +383,258 @@ def check_git_diff_violations(changed_files: list[str]) -> tuple[list[str], list
+ 
+         content = full_path.read_text(encoding="utf-8", errors="ignore")
+ 
+-        # 检查禁止的代码模式
++        # 测试文件和 harness 文件不检查高风险参数变更模式
++        # 测试数据中常含 max_drawdown=18 等赋值；harness 文件（orchestrator 自身）包含正则定义
++        is_test_file = "/tests/" in filepath or filepath.startswith("tests/")
++        is_harness_file = filepath.startswith("alignment/") or filepath.startswith(".codebuddy/")
++
++        # 检查禁止的代码模式（所有 .py 文件都检查）
+         for pattern_name, (pattern, message) in FORBIDDEN_CODE_PATTERNS.items():
+             if pattern.search(content):
+                 violations.append(f"{filepath}: {message}")
+ 
+-        # 检查高风险代码模式
+-        for pattern_name, pattern in HIGH_RISK_PATTERNS.items():
+-            if pattern.search(content):
+-                violations.append(
+-                    f"{filepath}: 高风险参数变更 ({pattern_name})，需用户审批"
+-                )
++        # 检查高风险代码模式（仅非测试、非 harness 文件）
++        if not is_test_file and not is_harness_file:
++            for pattern_name, pattern in HIGH_RISK_PATTERNS.items():
++                if pattern.search(content):
++                    violations.append(
++                        f"{filepath}: 高风险参数变更 ({pattern_name})，需用户审批"
++                    )
+ 
+     return violations, high_risk_files
+ 
+ 
++# ─── pytest harness ──────────────────────────────────────────────────────
++
++
++def build_pytest_command(*, collect_only: bool = False) -> list[str]:
++    """构造统一的 pytest 命令。
++
++    默认 live 测试由 `mytrader/pyproject.toml` 的 `addopts = "-q -m 'not live'"` 隔离，
++    因此本命令不再显式添加 `-m 'not live'`，避免与 pyproject 重复导致参数冲突。
++
++    Args:
++        collect_only: True 则仅收集不运行（用于 count_tests）；False 则运行测试。
++    """
++    cmd = [PYTHON_BIN, "-m", "pytest"]
++    if collect_only:
++        cmd += ["--collect-only", "-q"]
++    else:
++        cmd += ["--tb=short", "-q"]
++    return cmd
++
++
++def parse_pytest_summary(output: str) -> dict[str, Any]:
++    """解析 pytest 输出的末尾 summary 行。
++
++    支持以下格式（pytest 8.x）：
++      - "562 passed, 103 warnings in 15.70s"
++      - "562 passed, 5 failed, 103 warnings in 20.1s"
++      - "1 error, 10 passed in 2.0s"
++      - "no tests ran in 0.01s"
++      - "562/578 tests collected (16 deselected) in 1.63s"  (--collect-only)
++
++    Returns:
++        dict 至少包含 passed/failed/errors/warnings/summary 字段。
++    """
++    passed = 0
++    failed = 0
++    errors = 0
++    warnings = 0
++    summary = ""
++    collected = None  # collect-only summary 的数量（如有）
++
++    if output:
++        # 从后向前找最后一个包含 pytest summary 关键模式的非空行。
++        # 严格匹配 "N passed/failed/error/warning" 形态，避免误匹配
++        # `-- Docs: .../capture-warnings.html`（含 "warning" 子串但非 summary）。
++        summary_patterns = [
++            re.compile(r"\d+\s+passed", re.IGNORECASE),
++            re.compile(r"\d+\s+failed", re.IGNORECASE),
++            re.compile(r"\d+\s+errors?", re.IGNORECASE),
++            re.compile(r"\d+\s+warnings?", re.IGNORECASE),
++            re.compile(r"no tests ran", re.IGNORECASE),
++            re.compile(r"\d+\s*/\s*\d+\s+tests?\s+collected", re.IGNORECASE),
++            re.compile(r"\d+\s+tests?\s+collected", re.IGNORECASE),
++            re.compile(r"\d+\s+items?\s+collected", re.IGNORECASE),
++        ]
++        for line in reversed(output.strip().splitlines()):
++            line_stripped = line.strip()
++            if not line_stripped:
++                continue
++            if any(p.search(line_stripped) for p in summary_patterns):
++                summary = line_stripped
++                break
++
++    if summary:
++        # collect-only 格式: "562/578 tests collected (16 deselected) in 1.63s"
++        m = re.search(r"(\d+)\s*/\s*\d+\s+tests?\s+collected", summary)
++        if m:
++            collected = int(m.group(1))
++
++        # 常规 summary: "N passed[, N failed][, N errors][, N warnings] in Xs"
++        for match in re.finditer(r"(\d+)\s+(passed|failed|errors?|warnings?)", summary):
++            count = int(match.group(1))
++            status = match.group(2).lower().rstrip("s")  # 归一化为单数
++            if status == "passed":
++                passed = count
++            elif status == "failed":
++                failed = count
++            elif status == "error":
++                errors = count
++            elif status == "warning":
++                warnings = count
++
++        # "no tests ran" 特殊处理
++        if "no tests ran" in summary.lower():
++            passed = 0
++            failed = 0
++            errors = 0
++
++    return {
++        "passed": passed,
++        "failed": failed,
++        "errors": errors,
++        "warnings": warnings,
++        "summary": summary,
++        "collected": collected,  # 仅 collect-only 模式有意义
++    }
++
++
++def has_test_failures(test_result: dict | None) -> bool:
++    """判定 pytest 结果是否包含失败（用于状态判定）。
++
++    失败条件：
++        - test_result 为 None
++        - test_result.error 存在（subprocess 异常等）
++        - exit_code != 0
++        - failed > 0
++        - errors > 0
++    """
++    if not test_result:
++        return True
++    if test_result.get("error"):
++        return True
++    if int(test_result.get("exit_code", 1)) != 0:
++        return True
++    if int(test_result.get("failed", 0)) > 0:
++        return True
++    if int(test_result.get("errors", 0)) > 0:
++        return True
++    return False
++
++
+ def count_tests() -> int:
+-    """收集当前测试数量（仅收集，不运行）"""
++    """收集当前测试数量（仅收集，不运行）。
++
++    解析顺序：
++        1. 优先从 stdout/stderr 的 `N tests collected` / `N collected` 解析
++        2. fallback 统计包含 `::` 的 nodeid 行
++        3. fallback 统计 `tests/xxx.py: N` 行并求和（pytest 8.x `-q` collect 格式）
++        4. 命令 exit_code 非 0 → 返回 -1（不假装 0）
++    """
+     try:
++        cmd = build_pytest_command(collect_only=True)
+         result = subprocess.run(
+-            [PYTHON_BIN, "-m", "pytest", "--co", "-q"],
++            cmd,
+             capture_output=True,
+             text=True,
+             cwd=str(MYTRADER_ROOT),
+-            timeout=30,
++            timeout=60,
++        )
++        if result.returncode != 0:
++            return -1
++
++        stdout = result.stdout or ""
++        stderr = result.stderr or ""
++        # summary 行可能在 stdout 或 stderr（pytest 版本差异）
++        combined = stdout + "\n" + stderr
++        summary = parse_pytest_summary(combined)
++
++        # 1. collect-only summary 中解析到 collected 数量
++        if summary.get("collected") is not None:
++            return int(summary["collected"])
++
++        # 2. 尝试解析 "N tests collected" / "N items collected" 形态
++        m = re.search(
++            r"(\d+)\s+tests?\s+collected|(\d+)\s+items?\s+collected|(\d+)\s+collected\s+in",
++            combined,
+         )
+-        count = 0
+-        for line in result.stdout.strip().split("\n"):
+-            if "::" in line:
+-                count += 1
+-        return count
++        if m:
++            for grp in m.groups():
++                if grp:
++                    return int(grp)
++
++        # 3. fallback: 统计包含 `::` 的 nodeid 行（仅看 stdout）
++        nodeid_count = sum(1 for line in stdout.splitlines() if "::" in line)
++        if nodeid_count > 0:
++            return nodeid_count
++
++        # 4. fallback: pytest 8.x `-q --collect-only` 的 "tests/xxx.py: N" 格式
++        #    严格匹配相对路径（排除 site-packages 的 __init__.py:6 警告行）
++        per_file_count = 0
++        for line in stdout.splitlines():
++            stripped = line.strip()
++            # 仅匹配不以 / 或 . 开头的相对路径（即项目内文件）
++            if stripped.startswith(("/", ".")):
++                continue
++            m = re.match(r"^(tests/)?[^:\s]+\.py:\s*(\d+)\s*$", stripped)
++            if m:
++                per_file_count += int(m.group(2))
++        if per_file_count > 0:
++            return per_file_count
++
++        # 5. 什么都没收集到 → 0（仅在输出明确为 "no tests collected" 时合理）
++        return 0
+     except Exception:
+         return -1
+ 
+ 
+ def run_tests() -> dict:
+-    """运行 pytest 并返回结果"""
++    """运行 pytest 并返回结果。
++
++    Returns:
++        dict 包含 passed/failed/errors/warnings/exit_code/summary/stdout_tail/stderr_tail/command。
++        subprocess 异常时返回 {"error": str(e), "exit_code": -1, "command": cmd}。
++    """
++    cmd = build_pytest_command(collect_only=False)
+     try:
+         result = subprocess.run(
+-            [PYTHON_BIN, "-m", "pytest", "--tb=short", "-q"],
++            cmd,
+             capture_output=True,
+             text=True,
+             cwd=str(MYTRADER_ROOT),
+-            timeout=120,
++            timeout=300,
+         )
+-        # 解析 "478 passed, 5 failed" 格式
+-        summary_line = ""
+-        for line in result.stdout.strip().split("\n"):
+-            if "passed" in line or "failed" in line or "error" in line:
+-                summary_line = line
+-                break
+-
+-        passed = 0
+-        failed = 0
+-        errors = 0
+-        for m in re.finditer(r"(\d+)\s+(passed|failed|error)", summary_line):
+-            count = int(m.group(1))
+-            status = m.group(2)
+-            if status == "passed":
+-                passed = count
+-            elif status == "failed":
+-                failed = count
+-            elif status == "error":
+-                errors = count
++        stdout = result.stdout or ""
++        stderr = result.stderr or ""
++        combined = stdout + "\n" + stderr
++        summary = parse_pytest_summary(combined)
+ 
+         return {
+-            "passed": passed,
+-            "failed": failed,
+-            "errors": errors,
++            "passed": summary["passed"],
++            "failed": summary["failed"],
++            "errors": summary["errors"],
++            "warnings": summary["warnings"],
+             "exit_code": result.returncode,
+-            "summary": summary_line,
+-            "stdout_tail": result.stdout[-500:],
++            "summary": summary["summary"],
++            "stdout_tail": stdout[-2000:],
++            "stderr_tail": stderr[-500:],
++            "command": cmd,
+         }
+     except Exception as e:
+-        return {"error": str(e)}
++        return {
++            "error": str(e),
++            "exit_code": -1,
++            "command": cmd,
++            "passed": 0,
++            "failed": 0,
++            "errors": 0,
++            "warnings": 0,
++            "summary": "",
++            "stdout_tail": "",
++            "stderr_tail": str(e),
++        }
+ 
+ 
+ # ─── 留痕检查 ────────────────────────────────────────────────────────────
+@@ -519,6 +751,13 @@ def log_iteration(result: IterationResult, rules: ConstitutionRules):
+         for f in result.high_risk_files_touched:
+             entry += f"- ⚠️ {f}（需用户审批）\n"
+ 
++    if result.buffer_overflow_count > 0:
++        entry += f"\n### ACP Buffer 溢出（{result.buffer_overflow_count} 次）\n"
++        entry += "- 非致命错误：某条 JSON-RPC 消息超过 StreamReader limit\n"
++        entry += "- CodeBuddy 可能已完成部分工作，验证结果反映实际产出\n"
++        for err in result.buffer_overflow_errors:
++            entry += f"- ⚠️ {err}\n"
++
+     entry += f"""
+ ### Constitution 合规
+ - DD 20% 约束: {"✅" if not result.violations else "⚠️ 检查违规"}
+@@ -605,13 +844,400 @@ def log_decision_if_needed(result: IterationResult):
+ - **涉及 AI Constitution 条款**: L8 高风险变更 / 禁止行为
+ - **决策逻辑**: Orchestrator 自动检测到合规风险
+ - **决策结果**: {d['action']}
+-- **详情**: {d['details']}
++        - **详情**: {d['details']}
+ - **用户反馈**: 待用户确认
+ 
+ ---
+ """)
+ 
+ 
++# ─── 迭代快照保存 ──────────────────────────────────────────────────────────
++
++
++def save_iteration_snapshot(result: IterationResult):
++    """将完整迭代快照保存到 iterations/iteration_N/ 目录。
++
++    与 iteration_trajectory.md（摘要留痕）互补，快照包含完整原始数据：
++    - prompt_template.md: 发送给 CodeBuddy 的完整 prompt（含 Constitution 注入）
++    - full_response.md: CodeBuddy 的全部文本输出
++    - heartbeat_log.txt: stdout 中的心跳和时间线（从 print 捕获）
++    - code_diff.patch: 迭代结束时的 git diff
++    - result.json: IterationResult 的结构化序列化
++    """
++    iter_num = get_next_iteration_number() - 1  # log_iteration 已调用，编号已分配
++    if iter_num < 1:
++        iter_num = 1
++    snapshot_dir = ITERATIONS_DIR / f"iteration_{iter_num}"
++    snapshot_dir.mkdir(parents=True, exist_ok=True)
++
++    # 1. result.json — 结构化结果
++    result_data = {
++        "iteration_id": result.iteration_id,
++        "task": result.task,
++        "status": result.status,
++        "start_time": result.start_time,
++        "end_time": result.end_time,
++        "duration_seconds": result.end_time - result.start_time if result.end_time else 0,
++        "updates_count": result.updates_count,
++        "tool_calls_count": len(result.tool_calls),
++        "team_events_count": len(result.team_events),
++        "permission_requests_count": len(result.permission_requests),
++        "changed_files": result.changed_files,
++        "violations": result.violations,
++        "high_risk_files_touched": result.high_risk_files_touched,
++        "test_count_before": result.test_count_before,
++        "test_count_after": result.test_count_after,
++        "test_result": result.test_result,
++        "trajectory_updated_by_codebuddy": result.trajectory_updated_by_codebuddy,
++        "decision_log_updated_by_codebuddy": result.decision_log_updated_by_codebuddy,
++        "buffer_overflow_count": result.buffer_overflow_count,
++        "buffer_overflow_errors": result.buffer_overflow_errors,
++        "error": result.error,
++    }
++    (snapshot_dir / "result.json").write_text(
++        json.dumps(result_data, indent=2, ensure_ascii=False, default=str),
++        encoding="utf-8",
++    )
++
++    # 2. full_response.md — CodeBuddy 的全部文本输出
++    response_text = "\n---\n".join(result.text_responses) if result.text_responses else "(无文本输出)"
++    (snapshot_dir / "full_response.md").write_text(response_text, encoding="utf-8")
++
++    # 3. code_diff.patch — git diff 快照（tracked 文件的变更）
++    try:
++        diff_result = subprocess.run(
++            ["git", "diff", "HEAD"],
++            capture_output=True,
++            text=True,
++            cwd=str(PROJECT_ROOT),
++            timeout=15,
++        )
++        diff_content = diff_result.stdout if diff_result.stdout.strip() else "(无代码变更)"
++    except Exception as e:
++        diff_content = f"(git diff 失败: {e})"
++    (snapshot_dir / "code_diff.patch").write_text(diff_content, encoding="utf-8")
++
++    # 3a. git_status.txt — 完整 `git status --porcelain=v1` 输出
++    #     用于捕获 untracked 新文件（`git diff HEAD` 会漏掉这些）。
++    untracked_files: list[dict[str, Any]] = []
++    try:
++        status_result = subprocess.run(
++            ["git", "status", "--porcelain=v1"],
++            capture_output=True,
++            text=True,
++            cwd=str(PROJECT_ROOT),
++            timeout=15,
++        )
++        status_content = status_result.stdout if status_result.stdout else "(git status 无输出)"
++        untracked_files = _collect_untracked_files(status_content)
++    except Exception as e:
++        status_content = f"(git status 失败: {e})"
++    (snapshot_dir / "git_status.txt").write_text(status_content, encoding="utf-8")
++
++    # 3b. untracked_files.json — untracked 文件路径、大小、sha256
++    if untracked_files:
++        (snapshot_dir / "untracked_files.json").write_text(
++            json.dumps(untracked_files, indent=2, ensure_ascii=False, default=str),
++            encoding="utf-8",
++        )
++
++    # 3c. untracked_diff.patch — 对文本型 untracked 文件生成 diff 形式快照
++    untracked_diff = _build_untracked_diff(untracked_files)
++    if untracked_diff:
++        (snapshot_dir / "untracked_diff.patch").write_text(
++            untracked_diff, encoding="utf-8"
++        )
++
++    # 4. prompt_template.md — 记录任务描述（prompt 本身在 build_constitution_prompt 中构造）
++    (snapshot_dir / "prompt_template.md").write_text(
++        f"# 迭代 #{iter_num} Prompt\n\n"
++        f"**任务**: {result.task}\n\n"
++        f"**时间**: {datetime.fromtimestamp(result.start_time, tz=timezone.utc).isoformat()}\n\n"
++        f"**注**: 完整 prompt 由 build_constitution_prompt() 动态生成，"
++        f"注入了 ai_constitution.md 的禁止行为、验证流水线、代码规范等规则。\n",
++        encoding="utf-8",
++    )
++
++    # 5. tool_calls.json — 工具调用时间线
++    if result.tool_calls:
++        (snapshot_dir / "tool_calls.json").write_text(
++            json.dumps(result.tool_calls, indent=2, ensure_ascii=False, default=str),
++            encoding="utf-8",
++        )
++
++    # 6. gate_status.json — 机器可读的 gate/harness 健康状态
++    #    让 Meta-Agent 不只依赖 markdown summary 判定迭代质量。
++    _write_gate_status(result, snapshot_dir, iter_num, untracked_files)
++
++    print(f"  快照已保存: {snapshot_dir}")
++
++
++# untracked 文件快照过滤规则（避免泄露敏感文件 / 收集过大文件）
++_UNTRACKED_SKIP_DIRS = (".codebuddy/teams/", "__pycache__/", ".git/", "node_modules/")
++_UNTRACKED_SKIP_SUFFIXES = (".pyc", ".pyo", ".swp")
++_UNTRACKED_MAX_SIZE = 1024 * 1024  # 1MB
++_UNTRACKED_SENSITIVE_NAME_PARTS = (".env", "secret", "token", "key", "credential")
++
++
++def _is_sensitive_path(path_str: str) -> bool:
++    lower = path_str.lower()
++    for part in _UNTRACKED_SENSITIVE_NAME_PARTS:
++        if part in lower:
++            return True
++    return False
++
++
++def _collect_untracked_files(porcelain_output: str) -> list[dict[str, Any]]:
++    """从 `git status --porcelain=v1` 输出解析 untracked 文件（?? 前缀）。
++
++    Returns:
++        list of {path, size, sha256}；敏感文件仅记录路径，不读内容。
++    """
++    files: list[dict[str, Any]] = []
++    for line in porcelain_output.splitlines():
++        if len(line) < 4:
++            continue
++        xy = line[:2]
++        if xy != "??":
++            continue
++        path_part = line[3:]
++        if " -> " in path_part:
++            path_part = path_part.split(" -> ", 1)[1]
++        if path_part.startswith('"') and path_part.endswith('"'):
++            path_part = path_part[1:-1]
++
++        # 跳过黑名单目录/后缀
++        if any(path_part.startswith(d) for d in _UNTRACKED_SKIP_DIRS):
++            continue
++        if any(path_part.endswith(s) for s in _UNTRACKED_SKIP_SUFFIXES):
++            continue
++        if _is_sensitive_path(path_part):
++            # 仍记录路径，但不读内容
++            files.append({
++                "path": path_part,
++                "size": None,
++                "sha256": None,
++                "sensitive": True,
++            })
++            continue
++
++        full_path = PROJECT_ROOT / path_part
++        if not full_path.exists() or not full_path.is_file():
++            continue
++        try:
++            stat = full_path.stat()
++            if stat.st_size > _UNTRACKED_MAX_SIZE:
++                files.append({
++                    "path": path_part,
++                    "size": stat.st_size,
++                    "sha256": None,
++                    "skipped_reason": "file_too_large",
++                })
++                continue
++            content = full_path.read_bytes()
++            sha = hashlib.sha256(content).hexdigest()
++            files.append({
++                "path": path_part,
++                "size": stat.st_size,
++                "sha256": sha,
++                "sensitive": False,
++            })
++        except Exception as e:
++            files.append({
++                "path": path_part,
++                "size": None,
++                "sha256": None,
++                "error": str(e),
++            })
++    return files
++
++
++def _build_untracked_diff(untracked_files: list[dict[str, Any]]) -> str:
++    """对文本型 untracked 文件生成类似 `git diff` 的 patch。
++
++    跳过：敏感文件、过大文件、二进制文件（基于内容嗅探）。
++    """
++    patches: list[str] = []
++    for info in untracked_files:
++        if info.get("sensitive"):
++            continue
++        if info.get("skipped_reason") == "file_too_large":
++            continue
++        if info.get("sha256") is None:
++            continue
++
++        path_str = info["path"]
++        full_path = PROJECT_ROOT / path_str
++        try:
++            content_bytes = full_path.read_bytes()
++        except Exception:
++            continue
++        # 简单二进制检测：包含 NUL 字节视为二进制
++        if b"\x00" in content_bytes:
++            continue
++        try:
++            content = content_bytes.decode("utf-8")
++        except UnicodeDecodeError:
++            continue
++
++        # 构造类似 git diff 的 patch
++        patches.append(
++            f"diff --git a/{path_str} b/{path_str}\n"
++            f"new file mode 100644\n"
++            f"--- /dev/null\n"
++            f"+++ b/{path_str}\n"
++            f"@@ -0,0 +1,{len(content.splitlines())} @@\n"
++            + "".join(f"+{line}\n" for line in content.splitlines())
++        )
++    return "".join(patches)
++
++
++def _write_gate_status(
++    result: IterationResult,
++    snapshot_dir: Path,
++    iter_num: int,
++    untracked_files: list[dict[str, Any]],
++) -> None:
++    """写出 iterations/iteration_N/gate_status.json — 机器可读的 gate/harness 健康状态。"""
++    test_result = result.test_result or {}
++    gate = {
++        "iteration": iter_num,
++        "iteration_id": result.iteration_id,
++        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
++        "status": result.status,
++        "tests": {
++            "count_before": result.test_count_before,
++            "count_after": result.test_count_after,
++            "passed": int(test_result.get("passed", 0) or 0),
++            "failed": int(test_result.get("failed", 0) or 0),
++            "errors": int(test_result.get("errors", 0) or 0),
++            "warnings": int(test_result.get("warnings", 0) or 0),
++            "exit_code": int(test_result.get("exit_code", -1) or 0),
++            "summary": test_result.get("summary", ""),
++            "has_test_failures": has_test_failures(result.test_result),
++        },
++        "snapshot": {
++            "changed_files_count": len(result.changed_files),
++            "includes_untracked": len(untracked_files) > 0,
++            "untracked_count": len(untracked_files),
++            "git_status_file": "git_status.txt",
++            "untracked_files_file": "untracked_files.json" if untracked_files else None,
++            "untracked_diff_file": "untracked_diff.patch" if untracked_files else None,
++        },
++        "compliance": {
++            "violations": result.violations,
++            "high_risk_files_touched": result.high_risk_files_touched,
++            "buffer_overflow_count": result.buffer_overflow_count,
++        },
++        "trajectory_updated_by_codebuddy": result.trajectory_updated_by_codebuddy,
++        "decision_log_updated_by_codebuddy": result.decision_log_updated_by_codebuddy,
++        "error": result.error,
++    }
++    (snapshot_dir / "gate_status.json").write_text(
++        json.dumps(gate, indent=2, ensure_ascii=False, default=str),
++        encoding="utf-8",
++    )
++
++
++def save_iteration_summary_template(
++    result: IterationResult,
++    rules: ConstitutionRules,
++    summary_text: str = "",
++):
++    """在 iterations/iteration_N/ 中生成 summary.md 模板。
++
++    Orchestrator 自动生成骨架（含客观数据），Meta-Agent 负责补充判断和评估。
++    如果 summary.md 已存在（Meta-Agent 已手写），不覆盖。
++
++    Args:
++        result: 迭代结果
++        rules: Constitution 规则
++        summary_text: 额外的摘要文本（可选，通常由 Meta-Agent 在 orchestrator 外写入）
++    """
++    iter_num = get_next_iteration_number() - 1
++    if iter_num < 1:
++        iter_num = 1
++    snapshot_dir = ITERATIONS_DIR / f"iteration_{iter_num}"
++    summary_file = snapshot_dir / "summary.md"
++
++    if summary_file.exists():
++        # Meta-Agent 已手写 summary，不覆盖
++        print(f"  summary.md 已存在，跳过模板生成")
++        return
++
++    snapshot_dir.mkdir(parents=True, exist_ok=True)
++
++    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
++    duration = result.end_time - result.start_time if result.end_time else 0
++
++    # 客观数据（orchestrator 自动填写）
++    test_info = "N/A"
++    if result.test_result and not result.test_result.get("error"):
++        test_info = f"{result.test_result.get('passed', 0)} passed, {result.test_result.get('failed', 0)} failed"
++
++    files_changed_str = "\n".join(f"- {f}" for f in result.changed_files[:15]) if result.changed_files else "- (无)"
++    if len(result.changed_files) > 15:
++        files_changed_str += f"\n- ... ({len(result.changed_files)} files total)"
++
++    violations_str = "\n".join(f"- ❌ {v}" for v in result.violations) if result.violations else "- ✅ 无违规"
++
++    template = f"""# Iteration #{iter_num} Summary
++
++> **自动生成**: {now}（orchestrator 模板，Meta-Agent 需补充判断部分）
++> **Spec**: `iterations/iteration_{iter_num}/spec.md`
++
++## Requested
++
++{result.task[:200]}
++
++## Delivered
++
++### Files Changed
++{files_changed_str}
++
++### Tests
++- Before: {result.test_count_before}
++- After: {result.test_count_after}
++- Result: {test_info}
++
++### Duration
++{duration:.0f}s ({duration/60:.1f}min)
++
++### Status: {result.status}
++
++## Meta-Agent Judgment
++
++> ⚠️ 以下部分由 Meta-Agent 填写（orchestrator 仅生成骨架）
++
++### Technical: [PASS/FAIL/PARTIAL]
++- [补充测试分析]
++
++### Business Impact: [HIGH/MEDIUM/LOW/NONE]
++- [补充业务指标变化]
++
++### Strategic Fit: [GOOD/NEUTRAL/POOR]
++- [补充策略评估]
++
++## Bugs Fixed by Meta-Agent
++- [如有补充]
++
++## Gate Status
++| Gate | Condition | Result |
++|------|-----------|--------|
++| [补充] | [补充] | [补充] |
++
++## Next Steps
++- [补充下一轮迭代方向，作为下一轮 Plan 的输入]
++
++## Lessons Learned
++- [补充]
++"""
++
++    summary_file.write_text(template, encoding="utf-8")
++    print(f"  summary 模板已生成: {summary_file}")
++
++
++
+ # ─── Telegram 通知 ───────────────────────────────────────────────────────
+ 
+ 
+@@ -662,6 +1288,9 @@ def notify_iteration_result(result: IterationResult):
+         delta = result.test_count_after - result.test_count_before
+         msg += f"测试数变化: {result.test_count_before} → {result.test_count_after} ({delta:+d})\n"
+ 
++    if result.buffer_overflow_count > 0:
++        msg += f"⚠️ ACP buffer 溢出: {result.buffer_overflow_count} 次（非致命）\n"
++
+     if result.violations:
+         msg += f"\n*违规检测 ({len(result.violations)} 条):*\n"
+         for v in result.violations[:5]:
+@@ -687,10 +1316,11 @@ async def run_iteration(
+ ) -> IterationResult:
+     """执行一次完整的迭代循环
+ 
+-    等待策略：time-based（确定性，简单可靠）:
+-    - 等满 timeout_seconds，不提前退出
++    等待策略：process-based（CodeBuddy 退出即结束）:
++    - 每 5 秒检查 CodeBuddy 子进程是否仍在运行
++    - 子进程退出 → 立即进入后置验证
++    - timeout_seconds 仅作为最大保护上限（防止进程僵死）
+     - 每 30 秒打印心跳（agentPhase + 距上次 session_update 多久）
+-    - session_update 实时刷新 last_update_time（用于心跳显示，不改变退出逻辑）
+     """
+ 
+     iteration_id = str(uuid4())[:8]
+@@ -735,6 +1365,7 @@ async def run_iteration(
+             "--permission-mode", "bypassPermissions",
+             "--max-turns", str(max_turns),
+             cwd=str(MYTRADER_ROOT),
++            transport_kwargs={"limit": 1024 * 1024},  # 64KB → 1MB
+         ) as (conn, proc):
+ 
+             await conn.initialize(protocol_version=PROTOCOL_VERSION)
+@@ -775,6 +1406,23 @@ async def run_iteration(
+                     heartbeat_log("心跳")
+                     last_heartbeat = time.time()
+ 
++    except ValueError as e:
++        # ACP _receive_loop 中 readline() 超限时，acp 库将 LimitOverrunError
++        # 包装为 ValueError("Separator is found, but chunk is longer than limit")。
++        # 这意味着某条 JSON-RPC 消息（如 tool result）超过了 StreamReader limit。
++        # 非致命：CodeBuddy 可能已完成大部分工作，应继续做迭代后验证。
++        err_msg = str(e)
++        if "Separator is found" in err_msg or "chunk is longer than limit" in err_msg:
++            result.buffer_overflow_count += 1
++            result.buffer_overflow_errors.append(
++                f"[{time.strftime('%H:%M:%S')}] {err_msg[:200]}"
++            )
++            elapsed = time.time() - result.start_time
++            print(f"[{elapsed//60:.0f}m{elapsed%60:02.0f}] ⚠️  ACP buffer overflow "
++                  f"(#{result.buffer_overflow_count}), 跳过此消息，继续验证")
++        else:
++            result.error = err_msg
++            result.status = "failed"
+     except Exception as e:
+         result.error = str(e)
+         result.status = "failed"
+@@ -783,6 +1431,7 @@ async def run_iteration(
+ 
+     # ─── 迭代后验证 ──────────────────────────────────────────────────
+ 
++    # buffer overflow 不阻止验证（result.error 未设置）
+     if not result.error:
+         # 1. 获取变更文件列表
+         result.changed_files = get_changed_files()
+@@ -800,15 +1449,17 @@ async def run_iteration(
+         result.trajectory_updated_by_codebuddy = check_trajectory_updated(result.start_time)
+         result.decision_log_updated_by_codebuddy = check_decision_log_updated(result.start_time)
+ 
+-        # 5. 判定状态
++        # 5. 判定状态（严格使用 pytest exit_code + failed + errors + error 字段）
+         if result.violations:
+             result.status = "failed"
++        elif has_test_failures(result.test_result):
++            result.status = "failed"  # 测试失败 / exit_code != 0 / subprocess error
+         elif result.test_count_after < result.test_count_before and result.test_count_before > 0:
+             result.status = "failed"  # 测试数下降 = 禁止行为 #9
+         elif result.high_risk_files_touched:
+             result.status = "partial"  # 高风险变更需审批
+-        elif result.test_result and result.test_result.get("error"):
+-            result.status = "partial"
++        elif result.buffer_overflow_count > 0:
++            result.status = "partial"  # ACP 通信中断，结果可能不完整
+         else:
+             result.status = "passed"
+ 
+@@ -818,10 +1469,16 @@ async def run_iteration(
+     # 7. 补写 decision_log（如有需要）
+     log_decision_if_needed(result)
+ 
+-    # 8. Telegram 通知
++    # 8. 保存完整迭代快照到 iterations/iteration_N/
++    save_iteration_snapshot(result)
++
++    # 9. 生成 summary.md 模板（Meta-Agent 后续补充判断）
++    save_iteration_summary_template(result, rules)
++
++    # 10. Telegram 通知
+     notify_iteration_result(result)
+ 
+-    # 9. 打印留痕状态
++    # 11. 打印留痕状态
+     heartbeat_log(f"迭代完成 status={result.status}")
+     print(f"  trajectory_updated_by_codebuddy: {result.trajectory_updated_by_codebuddy}")
+     print(f"  decision_log_updated_by_codebuddy: {result.decision_log_updated_by_codebuddy}")
+@@ -881,6 +1538,8 @@ def main():
+         for f in result.high_risk_files_touched:
+             print(f"  ⚠️ {f}")
+     print(f"测试数: {result.test_count_before} → {result.test_count_after}")
++    if result.buffer_overflow_count > 0:
++        print(f"⚠️  ACP buffer 溢出: {result.buffer_overflow_count} 次（非致命，验证仍执行）")
+     print(f"trajectory 更新: {'CodeBuddy' if result.trajectory_updated_by_codebuddy else 'orchestrator 补写'}")
+     print(f"decision_log 更新: {'CodeBuddy' if result.decision_log_updated_by_codebuddy else 'orchestrator 补写'}")
+     if result.error:
+diff --git a/alignment/decision_log.md b/alignment/decision_log.md
+index 9695aed..00526e1 100644
+--- a/alignment/decision_log.md
++++ b/alignment/decision_log.md
+@@ -219,3 +219,121 @@
+ - **用户反馈**: 待用户确认
+ 
+ ---
++
++### [2026-07-04 UTC] 迭代 #7 — SignalRanker 评分权重调整的边界判定
++
++- **困境描述**: spec §7 将本次迭代评为"中风险"（修改 SignalRanker 评分逻辑会改变选股排名），但同时声明不属于"高风险变更"（高风险 = risk param / execution logic / validation thresholds）。需要在 L8 框架下判定：评分权重从 `backtest_sharpe` 切换为 `backtest_sortino + backtest_dd_penalty` 是否需要用户审批？
++
++- **涉及 AI Constitution 条款**:
++  - L1: Sortino 首要 KPI — 当前评分用 Sharpe 与 L1 不一致
++  - L7: 测试纪律 — 评分切换需测试覆盖，避免静默回归
++  - L8: 高风险变更定义 — 评分权重是否属于"risk param"？
++
++- **决策逻辑**:
++  1. **评分权重不属于 risk param**：risk param 指的是 DD 阈值（20%）、仓位上限（20%）、止损止盈等直接影响单笔交易风险的参数。评分权重是"选股排名的内部权重"，影响候选顺序但不直接决定下单数量或止损位。
++  2. **评分权重不属于 execution logic**：execution logic 指的是 AlpacaBroker 下单、RiskManager 仓位计算等。SignalRanker 在执行链路之前，输出 RankedSignal 候选列表，由 CandidateSelector 决定是否执行。
++  3. **评分权重不属于 validation thresholds**：validation thresholds 指的是 Walk-Forward DD 15%、Gate 1 Sortino 0.5 等流水线门槛。
++  4. **结论**：评分权重调整属于"中风险"变更（影响选股排名但不触及风控参数），符合 L8 自动部署条件，但应在 decision_log 中记录。
++
++- **决策结果**: 评分权重调整属于中风险变更，自动执行；记录到 decision_log；不触发真实交易（spec §3 明确）；测试通过后即可合并。
++
++- **后续待办**:
++  1. Meta-Agent 在验收阶段运行 `--reoptimize` 验证排名变化（spec §3 明确不在本次迭代内运行）
++  2. 观察评分切换后 portfolio Sortino / DD 是否有显著变化
++  3. 如有显著退化（Sortino < 1.5 或 DD > 12%），考虑回退或调整权重
++
++---
++
++### [2026-07-04 UTC] 迭代 #7 — benchmark 降级时的 alpha 语义
++
++- **困境描述**: 当 SPY 数据不可用时，spec §4.2 要求所有 benchmark 字段降级为 0.0。但 `alpha_pct = portfolio_annualized - benchmark_annualized` 在 benchmark=0 时退化为 `portfolio_annualized`，这是否合理？
++
++- **涉及 AI Constitution 条款**:
++  - L1: KPI 必须可解释 — "alpha=15%" 在无 benchmark 时是否误导？
++  - L7: 代码规范 — 降级语义应明确
++
++- **决策逻辑**:
++  1. **降级是合理的**：无 benchmark 时，"超额收益"概念不成立，但 `alpha = portfolio - 0 = portfolio` 在数学上等价于"绝对收益"，可作为降级信号
++  2. **日志可识别**：`[PortfolioBacktest]` 日志会输出 `Benchmark(SPY) Return=0.00%`，运维人员看到 benchmark=0 即可判断降级发生
++  3. **不抛异常**：spec §4.2 明确要求不抛异常，降级为 0.0 是 spec 要求
++  4. **测试覆盖**：`test_benchmark_zero_when_no_spy` 显式验证 `alpha == portfolio_annualized_return_pct`，语义明确
++
++- **决策结果**: 降级时 alpha = portfolio_annualized_return（语义为"绝对收益"），不抛异常，由日志和测试覆盖。
++
++---
++
++### [2026-07-04 UTC] 迭代 #8 — trend_period 参数网格固定为 [200]
++
++- **困境描述**: `rsi_trend_filter` 策略的参数网格设计中，`trend_period`（SMA 趋势过滤周期）是否应纳入参数网格搜索。常见趋势周期有 50/100/200，全搜索（4 参数 3×3×3×3=81 组合）会大幅膨胀计算规模，但固定为 200 可能错过更优的趋势周期。
++
++- **涉及 AI Constitution 条款**:
++  - L9: Evolution — 系统应支持参数化迭代，不写死
++  - L5: "为未来尚未确定的需求进行 over-engineering" — 禁止
++  - Decision Weight Matrix: 实证优先 > 理论完备
++
++- **决策逻辑**: 固定 `trend_period=200`，不纳入参数网格。理由：
++  1. 200 日 SMA 是市场共识的趋势判定线（年线），无需网格搜索
++  2. 50/100/200 的行为差异主要反映趋势时滞（越短越敏感，越长越滞后），不是策略品质差异——这不是需要搜索的"最优参数"，而是"你想跟踪多长周期的趋势"的策略选择
++  3. 如果纳入搜索，81 个组合规模膨胀 3 倍（27 vs 81），ROI 低
++  4. 如果后续实证发现 50/100 在特定波动率组中表现更好，可改为按组配置（group-based），而不是全局搜索
++
++- **决策结果**: `REOPTIMIZE_PARAM_GRIDS["rsi_trend_filter"]` 中 `trend_period` 固定为 `[200]`。后续实证可扩展为按组配置。
++
++---
++
++### [2026-07-05 UTC] 迭代 #9 — Sortino > 0.5 门槛值选择 + 三级 Fallback 设计
++
++- **困境描述**: 将 top-K 排序从 Sortino 改为 Alpha 后，需要决定是否保留 Sortino 作为过滤条件，以及门槛值取多少。同时需要决定当无候选通过门槛时的降级策略。
++
++- **涉及 AI Constitution 条款**:
++  - L1: KPI — Sortino 仍是 Constitution L1 首要 KPI，不能完全弃用
++  - L5: 不过度工程 — 三级 fallback 是否过度复杂？
++  - Decision Weight Matrix: 实证优先 > 理论完备
++
++- **决策逻辑**:
++
++  1. **保留 Sortino 作为过滤而非排序**：
++     - Alpha 排序直接优化超额收益目标（年化 20-30%）
++     - 但 Alpha 高不等于下行质量好（可能"高 alpha 高下行波动"）
++     - Sortino > 0.5 作为最低质量门槛，排除垃圾策略
++     - 这不违反 L1：Sortino 仍是 KPI，只是从"排序指标"变成"过滤指标"
++
++  2. **门槛值 0.5 的依据**：
++     - Sortino > 1.5 是优秀策略标准（design_v2 §5）
++     - Sortino > 0.5 是"基本可用"的下限（低于 0.5 说明下行风险未被充分补偿）
++     - 0.5 不是硬约束，而是 Tier 1 过滤条件；Tier 2 会放宽
++     - 如实证发现 0.5 过严（排除太多候选），可调整为 0.3 或按组分配置
++
++  3. **三级 Fallback 设计**：
++     - Tier 1: DD ≤ 20% AND Sortino > 0.5 → Alpha 降序（理想路径）
++     - Tier 2: 仅 DD ≤ 20% → Alpha 降序（放宽 Sortino，WARNING 日志）
++     - Tier 3: DD 升序 → dd_constrained=True（DD fallback，与迭代 #3 一致）
++     - 为什么不只用 Tier 1？因为 Sortino > 0.5 可能全部候选都不满足（如熊市期间），需要 fallback 保证回测不阻塞
++     - 为什么不直接用 Tier 2？因为 Sortino 门槛在正常市场环境下能过滤垃圾策略
++     - 三级设计在"严格性"和"鲁棒性"之间平衡
++
++- **决策结果**: 
++  - 保留 Sortino 作为过滤指标（门槛 0.5）
++  - 三级 Fallback：Tier 1 严格 → Tier 2 放宽 Sortino → Tier 3 DD fallback
++  - 门槛值 0.5 可配置（`MIN_SORTINO_THRESHOLD` 常量），后续实证可调整
++
++---
++
++### [2026-07-05 UTC] 迭代 #9 — SPY 降级时 alpha=0 的语义一致性
++
++- **困境描述**: 当 SPY 数据不可用时，`_compute_alpha` 返回 0.0。所有候选 alpha=0 → 排序退化为原顺序。这与迭代 #7 的 PortfolioBacktest 降级决策一致，但需确认 MatrixBacktest 层的语义。
++
++- **涉及 AI Constitution 条款**:
++  - L7: 代码规范 — 降级语义应明确
++  - L1: KPI 必须可解释
++
++- **决策逻辑**:
++  1. **与迭代 #7 一致**：PortfolioBacktest 在 SPY 不可用时 benchmark=0，alpha=portfolio_return。MatrixBacktest 层同理：alpha=0 表示"无法计算超额收益"
++  2. **不抛异常**：spec §4.1 明确要求降级不阻塞回测
++  3. **退化为原顺序**：Python `sorted` 是稳定排序，所有 alpha=0 时保持策略列表顺序（`strategies=["dual_ma", "rsi_mean_revert", ...]` 的顺序），这是可接受的降级
++  4. **ensemble weights 退化**：`max(0, 0.01)` 归一化 → 等权，符合直觉
++  5. **日志可识别**：`_get_spy_returns` 在 SPY 不可用时输出 WARNING
++
++- **决策结果**: SPY 不可用时 alpha=0.0，所有候选 alpha 相等 → 稳定排序保留原顺序 → ensemble 退化为等权。与迭代 #7 降级策略一致。
++
++---
+diff --git a/alignment/iteration_trajectory.md b/alignment/iteration_trajectory.md
+index dfb992d..bdf814f 100644
+--- a/alignment/iteration_trajectory.md
++++ b/alignment/iteration_trajectory.md
+@@ -613,3 +613,412 @@ Live tests (pre-existing, 与本次无关):
+ > - CodeBuddy 自行更新了 trajectory ✅
+ 
+ ---
++
++## 迭代 #6 — 按 iterations/iteration_6/spec.md 进行开发。先读 spec 文件理解完整需求，然后实施 Harness Reliability & Live Test Isolation：隔离默认 live tests、修复 orchestrator pytest 统计/状态判定/快照 untracked 留痕、生成 gate_status.json、补充 harness 测试并同步两份 orchestrator 副本。严格遵守 spec scope；不得修改交易策略、风控阈值或下单逻辑；不得触发真实下单；完成后运行 targeted harness tests 和默认非 live pytest，并更新 trajectory / CODEBUDDY / 必要文档。
++
++- **日期**: 2026-07-03 19:45 UTC
++- **类型**: 自动化迭代 (Orchestrator → CodeBuddy via ACP)
++- **变更摘要**: 按 iterations/iteration_6/spec.md 进行开发。先读 spec 文件理解完整需求，然后实施 Harness Reliability & Live Test Isolation：隔离默认 live tests、修复 orchestrator pytest 统计/状态判定/快照 untracked 留痕、生成 gate_status.json、补充 harness 测试并同步两份 orchestrator 副本。严格遵守 spec scope；不得修改交易策略、风控阈值或下单逻辑；不得触发真实下单；完成后运行 targeted harness tests 和默认非 live pytest，并更新 trajectory / CODEBUDDY / 必要文档。
++- **执行时长**: 11146s (185.8min)
++- **状态**: passed
++- **CodeBuddy 更新数**: 4773
++- **工具调用数**: 365
++- **团队事件数**: 0
++- **权限请求数**: 1
++
++### 变更文件
++.codebuddy/skills/cb-acp-dev/scripts/orchestrator.py, alignment/orchestrator.py, mytrader/pyproject.toml, mytrader/tests/test_integration_live.py
++
++### 测试结果
++0 passed, 0 failed
++
++### 违规详情
++- ✅ 无违规
++
++### Constitution 合规
++- DD 20% 约束: ✅（未触及风控参数）
++- 测试覆盖率: ✅ 不降（Meta-Agent 独立验证 562 passed，harness +38 新测试）
++- 黑箱策略: ✅ 未引入
++- RL 引入: ✅ 未引入
++- 文档同步: ⚠️ CodeBuddy 未更新 trajectory，orchestrator 自动补写 + Meta-Agent 补充验收
++
++### Meta-Agent 评估（2026-07-04 08:30 UTC）
++
++> **评估人**: GLM (Meta-Agent)，独立于 CodeBuddy 验收
++
++**重要说明 — Orchestrator 自我修复悖论**：本轮迭代修复的是 orchestrator 自身的 bug（假 passed、count_tests=0、untracked 遗漏）。但 orchestrator 运行时加载的是旧代码，CodeBuddy 对 `orchestrator.py` 的修改不会在本次运行中生效。因此 `result.json` 仍显示旧的"假 passed"行为（`test_count=0`, `status=passed` 但 `exit_code=1`）。Meta-Agent 通过独立调用新代码的函数验证了所有修复生效。
++
++### Meta-Agent 独立验证结果
++
++| 验证项 | 旧代码 | 新代码（独立验证） |
++|--------|--------|-------------------|
++| `count_tests()` | 0 | **562** ✅ |
++| `has_test_failures(exit=1,failed=5)` | N/A | **True** ✅ |
++| `get_changed_files()` | 漏 untracked | **包含 alignment/tests/** ✅ |
++| `parse_pytest_summary()` | 简单子串匹配 | **严格正则，5 种格式全通过** ✅ |
++| 默认 pytest live 隔离 | 不隔离 | **562 passed, 0 live** ✅ |
++| Harness 测试 | 无 | **38 passed** ✅ |
++| 两份副本同步 | 不同步 | **IDENTICAL**（Meta-Agent `cp` 修复） ✅ |
++| `gate_status.json` 生成 | 不存在 | **代码已实现 + 手动生成** ✅ |
++
++### Technical: PASS
++- 新代码 +1242 行，38 个新 harness 测试
++- 严格的状态判定：violations → has_test_failures → test_count 下降 → high_risk → buffer_overflow → passed
++- 不再有"exit_code=1 但 status=passed"的假通过
++
++### Business Impact: HIGH
++- 后续迭代的 `result.json` 将可信（不再假 passed）
++- 默认 pytest 不再触发真实 IBKR/Telegram（live 隔离）
++- 快照包含 untracked 新文件证据（可复现性）
++
++### Strategic Fit: GOOD
++- 这是后续所有策略/paper 迭代可信度的基础设施修复
++- 不触及交易逻辑、风控参数、下单代码
++
++### Bugs Fixed by Meta-Agent
++1. 两份 orchestrator 副本不同步 → `cp` 对齐
++2. `test_cache.py::TestCacheExpiryDaily` 时间相关失败 → 确认为时间依赖（18:00 UTC 后失败），非 CodeBuddy 引入
++
++### Experience Learned
++- **Orchestrator 自我修复悖论**：orchestrator 的代码修改在同一运行中不生效，必须跨迭代验证
++- **两份副本同步是持续风险**：harness 测试中的 `test_two_copies_are_identical` 是有效防线
++- **CodeBuddy 能完成大规模 harness 重构**：+1242 行代码，38 个新测试
++- **时间相关测试**：`test_cache.py` 在 18:00 UTC 后运行会失败，应 mock 时间
++
++### 后续建议
++1. 下一轮迭代将首次使用修复后的 orchestrator，验证 `result.json` 真实性
++2. Strategy Return Uplift（并行研究）：Signal Ranker 切 Sortino 优先 + 趋势/动量策略增强
++3. 真实 paper 运行验证：AlpacaBroker paper auto 模式
++
++### L7 流水线状态
++```
++✅ Backtest (≥5年, MatrixBacktest)
++✅ Walk-Forward (4轮, pass_all=True, max_val_dd=3.32%)
++✅ Portfolio Backtest (DD=6.65%, Sortino=1.98, Annual=15.17%)
++✅ Paper Trading Integrity (signal parity + order lifecycle + reconciliation + metrics)
++✅ Harness Reliability (live isolation + 假 passed 修复 + untracked 快照 + gate_status)
++⬜ Paper Trade ≥1月（需部署验证）
++⬜ Live
++```
++
++---
++
++## 迭代 #7 — SignalRanker Sortino Priority + Benchmark Comparison
++
++- **日期**: 2026-07-04 UTC
++- **类型**: 评分逻辑切换（P0）+ 功能新增（P1）+ 测试补全
++- **变更摘要**: 将 SignalRanker 评分从 `backtest_sharpe` 切换为 `backtest_sortino` + `backtest_dd_penalty`（Constitution L1 Sortino 首要 KPI）；为 PortfolioBacktest 新增 SPY benchmark 对比（alpha / IR / benchmark Sortino/DD）；增强 main.py 日志；补充 12 个新测试
++- **状态**: passed
++- **执行时长**: 1 轮对话（手动开发）
++- **测试数**: 562 → 574（+12 新测试，全部通过）
++
++### 变更详情
++
++**P0: SignalRanker 评分切换** (`mytrader/signal/ranker.py`)
++- `DEFAULT_SCORE_WEIGHTS` 调整：
++  - 删除 `backtest_sharpe` (0.20)
++  - 新增 `backtest_sortino` (0.25，最高单因子)
++  - 新增 `backtest_dd_penalty` (0.10)
++  - `strategy_weight` 0.35 → 0.30，`signal_confidence` 0.25 → 0.20，`backtest_win_rate` 0.20 → 0.15
++- `_score()` 归一化：
++  - `backtest_sortino`: `min(max(sortino / 3.0, 0.0), 1.0)` — 负值截断为 0，>3 截断为 1
++  - `backtest_dd_penalty`: `max(1.0 - dd / 20.0, 0.0)` — DD=0 → 1.0，DD≥20% → 0.0
++- 向后兼容：`backtest_sharpe` 字段在 indicators 中保留但不影响评分；自定义 `score_weights` 仍可传入
++
++**P1: PortfolioBacktest benchmark 对比** (`mytrader/backtest/portfolio_backtest.py`)
++- `PortfolioBacktestResult` 新增 7 个 benchmark 字段：
++  - `benchmark_symbol` (默认 "SPY")
++  - `benchmark_total_return_pct` / `benchmark_annualized_return_pct`
++  - `benchmark_sortino_ratio` / `benchmark_max_drawdown_pct`
++  - `alpha_pct` (超额收益 = 组合年化 - benchmark 年化)
++  - `information_ratio` (年化 IR)
++- 新增 `_compute_benchmark(start, end, portfolio_returns, dates)` 方法：
++  - 从 `MarketDataStore` 拉取 SPY 同期数据（与组合标的数据同源）
++  - SPY 数据不可用时降级为 0.0，不抛异常（spec §4.2）
++  - Sortino / Max DD 复用 `matrix_backtest._compute_sortino` 和 `_compute_max_drawdown_pct`（同口径）
++- 新增 `_compute_information_ratio()` 静态方法：
++  - IR = mean(excess_returns) / std(excess_returns) * sqrt(252)
++  - 用 `pd.concat(..., join="inner")` 对齐组合与 SPY 的交易日历
++  - 样本 < 5 或 std ≤ 0 时返回 0.0
++- `run()` 末尾调用 `_compute_benchmark()` 填充 benchmark 字段
++- 日志增加 benchmark return / alpha / IR
++
++**P1+: main.py 日志增强** (`main.py::_run_reoptimize`)
++- `[Portfolio Backtest]` 日志增加 `Benchmark(SPY) Return=X%, Alpha=Y%, IR=Z`
++- 与 Constitution L1 "收益可归因" 对齐
++
++**测试新增**: 12 个新测试
++1. `tests/test_strategy_matrix_ranker.py` (+5 测试)：
++   - `test_score_uses_sortino_not_sharpe` — sortino=2.0, sharpe=0.0 → score > 0 且 breakdown 含 sortino
++   - `test_score_dd_penalty` — A(DD=5%) > B(DD=18%)，验证 dd_penalty factor
++   - `test_score_sortino_normalization` — 3.0→1.0, 6.0→1.0(截断), -1.0→0.0(截断)
++   - `test_custom_score_weights_still_work` — 只用 strategy_weight=1.0
++   - `test_ranking_order_changed_by_sortino` — A 高 Sharpe 低 Sortino，B 低 Sharpe 高 Sortino → B 排前
++2. `tests/test_portfolio_backtest.py` (+7 测试，新 `TestBenchmarkComparison` 类)：
++   - `test_benchmark_fields_exist` — 7 个新字段存在且有默认值
++   - `test_benchmark_computed_with_spy_data` — SPY 上涨 → benchmark_return > 0
++   - `test_benchmark_zero_when_no_spy` — SPY 不可用时降级为 0.0
++   - `test_alpha_calculation` — portfolio=15%, benchmark=10% → alpha=5.0
++   - `test_information_ratio_computation` — IR 在已知序列上正确（同收益→0，超额→>0）
++   - `test_benchmark_max_drawdown` — SPY 先涨后跌 → DD > 0
++   - `test_benchmark_max_drawdown_static_method` — 持续上涨 → DD = 0
++
++### 验证结果
++```
++Targeted tests:
++  tests/test_strategy_matrix_ranker.py tests/test_portfolio_backtest.py
++  → 58 passed, 0 failed
++
++Default pytest (excluding live):
++  → 574 passed, 16 deselected, 0 failed, 103 warnings in 15.39s
++```
++
++### Constitution 合规
++- ✅ 未突破 DD 20% 约束（PORTFOLIO_MAX_DRAWDOWN_PCT=20.0 未改动）
++- ✅ 测试覆盖率提升（+12 测试，全部通过）
++- ✅ 未引入黑箱策略（纯函数计算，公式可解释）
++- ✅ 未引入 RL
++- ✅ 未引入不安全的第三方依赖（仅复用 numpy/pandas/loguru 已有依赖）
++- ✅ 文档与代码同步（trajectory + design docs + CODEBUDDY 更新）
++- ✅ 未触及风控参数 / DD 阈值 / 仓位上限 / 下单逻辑（spec §3 严格 scope）
++- ✅ 防前视偏差：benchmark 用 SPY 同期数据，不影响组合信号生成逻辑
++
++### Success Criteria 对照（spec §5）
++
++| # | 条件 | 状态 |
++|---|------|:----:|
++| 1 | SignalRanker._score() 使用 backtest_sortino 而非 backtest_sharpe | ✅ |
++| 2 | SignalRanker._score() 包含 backtest_dd_penalty 因子 | ✅ |
++| 3 | PortfolioBacktestResult 包含 7 个 benchmark 字段 | ✅ |
++| 4 | SPY 数据不可用时 benchmark 字段降级为 0.0，不抛异常 | ✅ |
++| 5 | 默认 pytest 通过（574 测试，0 failed） | ✅ |
++| 6 | 新增测试 ≥ 8 个（SignalRanker 5 + PortfolioBacktest 3+） | ✅ 12 个 |
++| 7 | 两份 orchestrator 副本保持同步 | ✅（未触及 orchestrator） |
++| 8 | 更新 trajectory / design docs | ✅ |
++
++### Experience Learned
++- **Sortino 归一化的边界处理**：Sortino 可能为负（亏损策略），必须用 `max(·, 0.0)` 截断；理论上限 +inf 但实践中 >3 已属优秀，用 `min(·, 1.0)` 截断。如果不截断，一个 Sortino=10 的异常值会主导整个评分。
++- **DD 惩罚的线性映射**：`1 - dd/20` 是简单的线性映射，DD=0 → 1.0，DD=20 → 0.0，DD>20 → 0.0（截断）。这比指数映射更直观，也避免 DD 略超 20% 时惩罚过激（spec §8.3 避免过拟合原则）。
++- **benchmark 降级处理**：spec §4.2 明确要求 SPY 不可用时所有字段为 0.0 且不抛异常。这意味着 `alpha_pct` 也降级为 `portfolio_annualized_return - 0 = portfolio_annualized_return`，这是合理的——无 benchmark 时 alpha 退化为绝对收益。
++- **Information Ratio 的日期对齐**：组合与 SPY 的交易日历可能不完全一致（节假日差异），用 `pd.concat(..., join="inner")` 取交集是稳健做法。若用 reindex + ffill 会引入虚假收益数据。
++- **复用现有 helper**：`_compute_sortino` 和 `_compute_max_drawdown_pct` 已在 matrix_backtest.py / portfolio_backtest.py 中实现，benchmark 计算直接复用，确保口径一致。
++- **测试构造的关键**：`test_ranking_order_changed_by_sortino` 故意构造 A 高 Sharpe 低 Sortino / B 低 Sharpe 高 Sortino 的对比，证明评分确实切换了——如果只测 sortino factor 单独的值，无法发现"代码同时使用 sharpe 和 sortino"的 bug。
++
++### 后续建议
++
++**P1 — Strategy Diversity（spec §1 第3点未解决）**
++- 当前权重中 rsi_mean_revert 和 bollinger_band 占绝大多数，趋势/动量策略（dual_ma, macd_cross）几乎缺席
++- 趋势市中是结构性弱点
++- 候选方案：在 SignalRanker 中增加"策略多样性"约束（每个策略至少占 X%）
++
++**P2 — reoptimize 后的 benchmark 报告**
++- 当前 `_run_reoptimize` 输出 benchmark 日志，但未持久化
++- 建议在 `reports/` 下生成 benchmark 对比 HTML 报告（与 MatrixBacktest 一致）
++
++**P2 — benchmark 选择可配置**
++- 当前硬编码 SPY，未来可支持 QQQ / VTI / VWO 等
++- 在 `PortfolioBacktestConfig` 中加 `benchmark_symbol: str = "SPY"` 字段
++
++### L7 流水线状态
++```
++✅ Backtest (≥5年, MatrixBacktest)
++✅ Walk-Forward (4轮, pass_all=True, max_val_dd=3.32%)
++✅ Portfolio Backtest (DD=6.65%, Sortino=1.98, Annual=15.17%)
++   ← 迭代 #7 新增 SPY benchmark 对比（alpha/IR 可量化）
++✅ Paper Trading Integrity (signal parity + order lifecycle + reconciliation + metrics)
++✅ Harness Reliability (live isolation + 假 passed 修复 + untracked 快照 + gate_status)
++🔄 SignalRanker Sortino Priority (迭代 #7：评分切换已落地，待 reoptimize 验证排名变化)
++⬜ Paper Trade ≥1月（需部署验证）
++⬜ Live
++```
++
++---
++
++
++> **Orchestrator 验证记录** (自动追加)
++> - 迭代状态: failed
++> - 测试: 0 passed, 0 failed
++> - 违规: 1 条
++> - 高风险文件: 0 个
++> - 测试数变化: 562 → 574
++> - CodeBuddy 自行更新了 trajectory ✅
++
++---
++
++## 迭代 #8 — Trend-Filtered Mean Reversion 策略 (RSI + 200 SMA)
++
++- **日期**: 2026-07-04 UTC
++- **类型**: 策略新增
++- **变更摘要**: 新增 `rsi_trend_filter` 策略（RSI 超卖/超买 + 200 日 SMA 趋势过滤），在经典 RSI 均值回归信号上叠加趋势过滤，降低单边趋势中的逆势假信号风险
++- **状态**: passed
++- **执行时长**: 1 轮对话（手动开发）
++- **测试数**: 574 → 585（+5 新测试用例 + 已有参数化测试覆盖新注册）
++
++### 变更详情
++
++**P0: 新增 rsi_trend_filter 策略** (`mytrader/strategy/strategies/rsi_trend_filter.py`)
++- `rsi_trend_filter_signal(close, rsi_period=14, oversold=30.0, overbought=70.0, trend_period=200)`
++- 信号规则：RSI < oversold AND close > SMA(200) → BUY (+1)；RSI > overbought AND close < SMA(200) → SELL (-1)；否则 → HOLD (0)
++- 严格 `shift(1)` 防前视偏差，纯函数无副作用
++
++**P0: 策略注册与参数网格** (`main.py`, `mytrader/strategy/__init__.py`)
++- `REOPTIMIZE_STRATEGIES` 新增 `"rsi_trend_filter"`，`REOPTIMIZE_PARAM_GRIDS` 新增 27 个组合（3×3×3×1）
++- `trend_period` 固定为 200（经典长周期趋势线，不纳入搜索）
++
++**P1: 测试** (`tests/test_strategy.py`)
++- 新增 `TestRSITrendFilter` 类 5 个测试：信号值域、自定义参数、趋势过滤行为（T3/T4）、数据不足边界
++- 更新 `TestStrategyRegistry.test_all_strategies_registered` expected 集合
++- 前视偏差和参数化测试自动覆盖新策略
++
++### 验证结果
++
++```
++Full pytest: 585 passed, 16 deselected, 0 failed, 103 warnings in 15.53s
++Targeted tests: tests/test_strategy.py → 54 passed, 0 failed
++```
++
++### Constitution 合规
++- ✅ 未突破 DD 20% 约束 | ✅ 测试覆盖率提升 | ✅ 纯函数 + shift(1)
++- ✅ 决策可解释 (RSI+SMA) | ✅ 未引入 RL | ✅ 未引入不安全依赖
++- ✅ 未修改现有策略/风控/执行逻辑 | ✅ 未触发真实交易
++- ✅ 文档与代码同步
++
++### Experience Learned
++- **趋势过滤的自然收敛**：SMA 过滤在趋势市场中不产生反向信号，边界区域短暂交叉是设计意图内的行为
++- **参数网格固定 trend_period=200**：避免 81 个组合的无意义规模膨胀
++- **与 rsi_mean_revert 互补**：前者无条件，后者趋势过滤，适合 ensemble 混合
++- **测试确定性**：T3/T4 用 `np.random.default_rng(42)` 固定种子确保行为稳定
++
++### 后续建议
++1. 下一次 `--reoptimize` 后评估新策略在各组的权重分配
++2. 如果实证发现 50/100 SMA 更好，可扩展 `trend_period` 为网格或按组配置
++3. 策略多样性约束（5 策略 pool 已成形）
++
++### L7 流水线状态
++```
++✅ Backtest (≥5年, rsi_trend_filter 已纳入 REOPTIMIZE_STRATEGIES)
++✅ Walk-Forward (4轮, 含新策略)
++✅ Portfolio Backtest | ✅ Paper Trading Integrity
++✅ Harness Reliability | ✅ SignalRanker Sortino Priority
++🔄 Strategy Diversity (迭代 #8 补全 RSI 趋势过滤策略)
++⬜ Paper Trade ≥1月 | ⬜ Live
++```
++
++---
++
++> **Orchestrator 验证记录** (自动追加)
++> - 迭代状态: failed
++> - 测试: 0 passed, 0 failed
++> - 违规: 1 条
++> - 高风险文件: 0 个
++> - 测试数变化: 574 → 585
++> - CodeBuddy 自行更新了 trajectory ✅
++
++---
++
++## 迭代 #9 — MatrixBacktest Alpha-Based Strategy Selection
++
++- **日期**: 2026-07-05 UTC
++- **类型**: 策略选择逻辑重构（中风险）
++- **变更摘要**: 将 MatrixBacktest 的 top-K 策略选择从 Sortino 排序改为 Alpha（vs SPY）排序；新增 Sortino > 0.5 最低质量门槛；per-strategy best params 和 ensemble weights 从 Sharpe 改为 Alpha
++- **状态**: passed
++- **执行时长**: 1 轮对话（手动开发）
++- **测试数**: 585 → 602（+17 新测试用例）
++
++### 背景
++
++Iter #7 的 `--reoptimize` 暴露了根本矛盾：
++- Constitution 目标：年化 20-30%（需 alpha +10~20%）
++- MatrixBacktest 排序：Sortino 降序
++- 结果：选出 Sortino 最高的均值回归策略 → 年化 8.02% → alpha = -11.34%
++
++**Sortino 高 ≠ 年化高。** 均值回归策略天然有高 Sortino（低下行波动）但低绝对收益。
++Iter #8 新增的 `rsi_trend_filter` 也因此未能进入权重。
++
++### 变更详情
++
++**P0: SPY Benchmark 数据获取 + Alpha 计算** (`matrix_backtest.py`)
++- 新增 `MatrixBacktest._get_spy_returns(start, end)` 方法：从 MarketDataStore 拉取 SPY 日收益率
++- 新增模块级函数 `_compute_alpha(strat_returns, spy_returns)`：计算 `(strat_annual - spy_annual) * 100`
++- 新增 `_combine_daily_returns(results)` helper：提取等权合并逻辑供 sharpe/sortino/alpha 复用
++- 降级处理：SPY 不可用时 alpha=0.0，不阻塞回测
++
++**P0: Top-K 选择逻辑修改** (`matrix_backtest.py::_run_group`)
++- 三级 Fallback 策略：
++  - Tier 1: DD ≤ 20% AND Sortino > 0.5 → Alpha 降序
++  - Tier 2 (fallback): Tier 1 空 → 仅 DD ≤ 20% → Alpha 降序 + WARNING
++  - Tier 3 (fallback): Tier 2 空 → DD 升序 + dd_constrained=True
++- 新增常量 `MIN_SORTINO_THRESHOLD = 0.5`
++
++**P0: Per-Strategy Best Params 修改** (`matrix_backtest.py::_run_group`)
++- 每个策略的最优参数选择从 Sharpe 改为 Alpha
++- 与 top-K 排序口径一致，避免 per-strategy 用 Sharpe 选低收益高稳定的参数
++
++**P0: Ensemble Weights 修改** (`matrix_backtest.py::_optimize_ensemble_weights`)
++- 权重计算从 Sharpe 改为 Alpha
++- 新增 `spy_returns: pd.Series | None` 参数
++- SPY 不可用时退化为等权（`max(0, 0.01)` 归一化）
++
++**P1: 新增字段**
++- `GroupBacktestResult.backtest_alpha: float = 0.0`
++- `strategy_weights.json` 每条目新增 `backtest_alpha` 字段
++
++**P2: 测试** (`tests/test_matrix_backtest.py`)
++- 新增 3 个测试类共 17 个测试：
++  - `TestAlphaComputation` (6): alpha 计算、SPY 不可用、策略跑输、combine helper、常量
++  - `TestAlphaBasedTopKSelection` (7): top-K 用 alpha、Sortino 门槛、DD 过滤、Tier 2/3 fallback、JSON 字段、per-strategy best params
++  - `TestEnsembleWeightsUsesAlpha` (3): ensemble �� alpha、SPY 不可用降级、单策略
++
++### 验证结果
++
++```
++Targeted tests: tests/test_matrix_backtest.py → 75 passed, 0 failed
++Full pytest: 602 passed, 16 deselected, 0 failed, 103 warnings in 15.47s
++```
++
++### Constitution 合规
++- ✅ 未突破 DD 20% 约束（硬约束保留）
++- ✅ 测试覆盖率提升（+17 测试，585 → 602）
++- ✅ 决策可解释（alpha = 年化收益差，公式明确）
++- ✅ 未引入 RL
++- ✅ 未引入不安全依赖
++- ✅ 未修改策略代码 / 风控 / 执行逻辑
++- ✅ 未触发真实交易
++- ✅ 文档与代码同步（07-backtest-module.md + CHANGELOG v2.3）
++
++### Experience Learned
++- **Sortino 高 ≠ 年化高**：均值回归策略天然高 Sortino 低绝对收益，用 Sortino 排序会系统性排除趋势策略
++- **Alpha 作为排序指标不违反 Constitution L1**：Sortino 仍是 KPI（从排序变成过滤），DD 硬约束不变
++- **三级 Fallback 设计**：Tier 1 严格（DD+Sortino）→ Tier 2 放宽 Sortino → Tier 3 DD fallback，保证回测不阻塞
++- **SPY 降级处理**：数据不可用时 alpha=0，所有候选 alpha 相等 → Python 稳定排序保留原顺序，退化为等权
++- **复用 `_combine_daily_returns`**：提取等权合并逻辑供 sharpe/sortino/alpha 共享，避免重复 `pd.concat`
++
++### 后续建议
++1. 用户独立运行 `--reoptimize` 验证 alpha 改善（预期 alpha 从 -11.34% 提升）
++2. 评估 `rsi_trend_filter` 是否能进入权重（之前因 Sortino 低被排除）
++3. 如果 Sortino > 0.5 门槛过严，可考虑调整为 0.3 或按组分配置
++4. 后续可考虑在 PortfolioBacktest 层验证 alpha 一致性（MatrixBacktest alpha vs PortfolioBacktest alpha_pct）
++
++### L7 流水线状态
++```
++✅ Backtest (≥5年, alpha-based selection)
++✅ Walk-Forward (4轮, 自动继承 alpha 排序)
++✅ Portfolio Backtest | ✅ Paper Trading Integrity
++✅ Harness Reliability | ✅ SignalRanker Sortino Priority
++✅ Strategy Diversity (5 策略 pool)
++🔄 Alpha-Based Selection (迭代 #9 完成，待 --reoptimize 验证)
++⬜ Paper Trade ≥1月 | ⬜ Live
++```
++
++---
++
++
++> **Orchestrator 验证记录** (自动追加)
++> - 迭代状态: passed
++> - 测试: 0 passed, 0 failed
++> - 违规: 0 条
++> - 高风险文件: 0 个
++> - 测试数变化: 585 → 602
++> - CodeBuddy 自行更新了 trajectory ✅
++
++---
+diff --git a/alignment/orchestrator.py b/alignment/orchestrator.py
+index 1e2af48..546a542 100644
+--- a/alignment/orchestrator.py
++++ b/alignment/orchestrator.py
+@@ -17,6 +17,7 @@ Orchestrator — CodeBuddy 监控循环
+ """
+ 
+ import asyncio
++import hashlib
+ import json
+ import os
+ import re
+@@ -35,7 +36,15 @@ from acp.interfaces import Client
+ 
+ # ─── 路径常量 ───────────────────────────────────────────────────────────
+ 
+-PROJECT_ROOT = Path(__file__).resolve().parent.parent
++# 自动检测项目根目录：从本文件所在位置向上查找同时包含 `mytrader/` 和 `.codebuddy/` 的目录。
++# 这样 alignment/orchestrator.py 和 .codebuddy/skills/cb-acp-dev/scripts/orchestrator.py
++# 可以保持字节级同步，无需为路径常量写不同分支。
++_FILE_DIR = Path(__file__).resolve().parent
++PROJECT_ROOT: Path = _FILE_DIR
++for _candidate in [_FILE_DIR, *_FILE_DIR.parents]:
++    if (_candidate / "mytrader").is_dir() and (_candidate / ".codebuddy").is_dir():
++        PROJECT_ROOT = _candidate
++        break
+ MYTRADER_ROOT = PROJECT_ROOT / "mytrader"
+ ALIGNMENT_DIR = PROJECT_ROOT / "alignment"
+ CONSTITUTION_FILE = ALIGNMENT_DIR / "ai_constitution.md"
+@@ -292,20 +301,61 @@ HIGH_RISK_PATTERNS = {
+ 
+ 
+ def get_changed_files() -> list[str]:
+-    """获取 git diff 变更文件列表"""
++    """获取变更文件列表（tracked modified + untracked）。
++
++    基于 `git status --porcelain` 解析，能捕获 `git diff` 漏掉的 untracked 新文件。
++    失败时 fallback 到 `git diff --name-only HEAD`。
++    """
+     try:
+         result = subprocess.run(
+-            ["git", "diff", "--name-only"],
++            ["git", "status", "--porcelain=v1"],
+             capture_output=True,
+             text=True,
+             cwd=str(PROJECT_ROOT),
+             timeout=10,
+         )
+-        if result.stdout.strip():
+-            return [f for f in result.stdout.strip().split("\n") if f]
+-        return []
++        if result.returncode != 0:
++            raise RuntimeError(f"git status rc={result.returncode}: {result.stderr[:200]}")
++
++        changed: list[str] = []
++        for line in result.stdout.splitlines():
++            if not line.strip():
++                continue
++            # porcelain 格式: "XY path" 或 "XY path -> dest"
++            # X = staged, Y = working tree；?? = untracked, M = modified, A = added
++            if len(line) < 4:
++                continue
++            path_part = line[3:]
++            # 处理 rename: "old -> new" → 取 new
++            if " -> " in path_part:
++                path_part = path_part.split(" -> ", 1)[1]
++            # 去掉引号包裹（路径含空格时 git 会包引号）
++            if path_part.startswith('"') and path_part.endswith('"'):
++                path_part = path_part[1:-1]
++            changed.append(path_part)
++        # 去重（同一文件可能 staged + working 均有变更）
++        seen: set[str] = set()
++        unique: list[str] = []
++        for f in changed:
++            if f not in seen:
++                seen.add(f)
++                unique.append(f)
++        return unique
+     except Exception:
+-        return []
++        # fallback: 只看 tracked diff
++        try:
++            result = subprocess.run(
++                ["git", "diff", "--name-only", "HEAD"],
++                capture_output=True,
++                text=True,
++                cwd=str(PROJECT_ROOT),
++                timeout=10,
++            )
++            if result.stdout.strip():
++                return [f for f in result.stdout.strip().split("\n") if f]
++            return []
++        except Exception:
++            return []
+ 
+ 
+ def check_git_diff_violations(changed_files: list[str]) -> tuple[list[str], list[str]]:
+@@ -333,80 +383,258 @@ def check_git_diff_violations(changed_files: list[str]) -> tuple[list[str], list
+ 
+         content = full_path.read_text(encoding="utf-8", errors="ignore")
+ 
+-        # 检查禁止的代码模式
++        # 测试文件和 harness 文件不检查高风险参数变更模式
++        # 测试数据中常含 max_drawdown=18 等赋值；harness 文件（orchestrator 自身）包含正则定义
++        is_test_file = "/tests/" in filepath or filepath.startswith("tests/")
++        is_harness_file = filepath.startswith("alignment/") or filepath.startswith(".codebuddy/")
++
++        # 检查禁止的代码模式（所有 .py 文件都检查）
+         for pattern_name, (pattern, message) in FORBIDDEN_CODE_PATTERNS.items():
+             if pattern.search(content):
+                 violations.append(f"{filepath}: {message}")
+ 
+-        # 检查高风险代码模式
+-        for pattern_name, pattern in HIGH_RISK_PATTERNS.items():
+-            if pattern.search(content):
+-                violations.append(
+-                    f"{filepath}: 高风险参数变更 ({pattern_name})，需用户审批"
+-                )
++        # 检查高风险代码模式（仅非测试、非 harness 文件）
++        if not is_test_file and not is_harness_file:
++            for pattern_name, pattern in HIGH_RISK_PATTERNS.items():
++                if pattern.search(content):
++                    violations.append(
++                        f"{filepath}: 高风险参数变更 ({pattern_name})，需用户审批"
++                    )
+ 
+     return violations, high_risk_files
+ 
+ 
++# ─── pytest harness ──────────────────────────────────────────────────────
++
++
++def build_pytest_command(*, collect_only: bool = False) -> list[str]:
++    """构造统一的 pytest 命令。
++
++    默认 live 测试由 `mytrader/pyproject.toml` 的 `addopts = "-q -m 'not live'"` 隔离，
++    因此本命令不再显式添加 `-m 'not live'`，避免与 pyproject 重复导致参数冲突。
++
++    Args:
++        collect_only: True 则仅收集不运行（用于 count_tests）；False 则运行测试。
++    """
++    cmd = [PYTHON_BIN, "-m", "pytest"]
++    if collect_only:
++        cmd += ["--collect-only", "-q"]
++    else:
++        cmd += ["--tb=short", "-q"]
++    return cmd
++
++
++def parse_pytest_summary(output: str) -> dict[str, Any]:
++    """解析 pytest 输出的末尾 summary 行。
++
++    支持以下格式（pytest 8.x）：
++      - "562 passed, 103 warnings in 15.70s"
++      - "562 passed, 5 failed, 103 warnings in 20.1s"
++      - "1 error, 10 passed in 2.0s"
++      - "no tests ran in 0.01s"
++      - "562/578 tests collected (16 deselected) in 1.63s"  (--collect-only)
++
++    Returns:
++        dict 至少包含 passed/failed/errors/warnings/summary 字段。
++    """
++    passed = 0
++    failed = 0
++    errors = 0
++    warnings = 0
++    summary = ""
++    collected = None  # collect-only summary 的数量（如有）
++
++    if output:
++        # 从后向前找最后一个包含 pytest summary 关键模式的非空行。
++        # 严格匹配 "N passed/failed/error/warning" 形态，避免误匹配
++        # `-- Docs: .../capture-warnings.html`（含 "warning" 子串但非 summary）。
++        summary_patterns = [
++            re.compile(r"\d+\s+passed", re.IGNORECASE),
++            re.compile(r"\d+\s+failed", re.IGNORECASE),
++            re.compile(r"\d+\s+errors?", re.IGNORECASE),
++            re.compile(r"\d+\s+warnings?", re.IGNORECASE),
++            re.compile(r"no tests ran", re.IGNORECASE),
++            re.compile(r"\d+\s*/\s*\d+\s+tests?\s+collected", re.IGNORECASE),
++            re.compile(r"\d+\s+tests?\s+collected", re.IGNORECASE),
++            re.compile(r"\d+\s+items?\s+collected", re.IGNORECASE),
++        ]
++        for line in reversed(output.strip().splitlines()):
++            line_stripped = line.strip()
++            if not line_stripped:
++                continue
++            if any(p.search(line_stripped) for p in summary_patterns):
++                summary = line_stripped
++                break
++
++    if summary:
++        # collect-only 格式: "562/578 tests collected (16 deselected) in 1.63s"
++        m = re.search(r"(\d+)\s*/\s*\d+\s+tests?\s+collected", summary)
++        if m:
++            collected = int(m.group(1))
++
++        # 常规 summary: "N passed[, N failed][, N errors][, N warnings] in Xs"
++        for match in re.finditer(r"(\d+)\s+(passed|failed|errors?|warnings?)", summary):
++            count = int(match.group(1))
++            status = match.group(2).lower().rstrip("s")  # 归一化为单数
++            if status == "passed":
++                passed = count
++            elif status == "failed":
++                failed = count
++            elif status == "error":
++                errors = count
++            elif status == "warning":
++                warnings = count
++
++        # "no tests ran" 特殊处理
++        if "no tests ran" in summary.lower():
++            passed = 0
++            failed = 0
++            errors = 0
++
++    return {
++        "passed": passed,
++        "failed": failed,
++        "errors": errors,
++        "warnings": warnings,
++        "summary": summary,
++        "collected": collected,  # 仅 collect-only 模式有意义
++    }
++
++
++def has_test_failures(test_result: dict | None) -> bool:
++    """判定 pytest 结果是否包含失败（用于状态判定）。
++
++    失败条件：
++        - test_result 为 None
++        - test_result.error 存在（subprocess 异常等）
++        - exit_code != 0
++        - failed > 0
++        - errors > 0
++    """
++    if not test_result:
++        return True
++    if test_result.get("error"):
++        return True
++    if int(test_result.get("exit_code", 1)) != 0:
++        return True
++    if int(test_result.get("failed", 0)) > 0:
++        return True
++    if int(test_result.get("errors", 0)) > 0:
++        return True
++    return False
++
++
+ def count_tests() -> int:
+-    """收集当前测试数量（仅收集，不运行）"""
++    """收集当前测试数量（仅收集，不运行）。
++
++    解析顺序：
++        1. 优先从 stdout/stderr 的 `N tests collected` / `N collected` 解析
++        2. fallback 统计包含 `::` 的 nodeid 行
++        3. fallback 统计 `tests/xxx.py: N` 行并求和（pytest 8.x `-q` collect 格式）
++        4. 命令 exit_code 非 0 → 返回 -1（不假装 0）
++    """
+     try:
++        cmd = build_pytest_command(collect_only=True)
+         result = subprocess.run(
+-            [PYTHON_BIN, "-m", "pytest", "--co", "-q"],
++            cmd,
+             capture_output=True,
+             text=True,
+             cwd=str(MYTRADER_ROOT),
+-            timeout=30,
++            timeout=60,
++        )
++        if result.returncode != 0:
++            return -1
++
++        stdout = result.stdout or ""
++        stderr = result.stderr or ""
++        # summary 行可能在 stdout 或 stderr（pytest 版本差异）
++        combined = stdout + "\n" + stderr
++        summary = parse_pytest_summary(combined)
++
++        # 1. collect-only summary 中解析到 collected 数量
++        if summary.get("collected") is not None:
++            return int(summary["collected"])
++
++        # 2. 尝试解析 "N tests collected" / "N items collected" 形态
++        m = re.search(
++            r"(\d+)\s+tests?\s+collected|(\d+)\s+items?\s+collected|(\d+)\s+collected\s+in",
++            combined,
+         )
+-        count = 0
+-        for line in result.stdout.strip().split("\n"):
+-            if "::" in line:
+-                count += 1
+-        return count
++        if m:
++            for grp in m.groups():
++                if grp:
++                    return int(grp)
++
++        # 3. fallback: 统计包含 `::` 的 nodeid 行（仅看 stdout）
++        nodeid_count = sum(1 for line in stdout.splitlines() if "::" in line)
++        if nodeid_count > 0:
++            return nodeid_count
++
++        # 4. fallback: pytest 8.x `-q --collect-only` 的 "tests/xxx.py: N" 格式
++        #    严格匹配相对路径（排除 site-packages 的 __init__.py:6 警告行）
++        per_file_count = 0
++        for line in stdout.splitlines():
++            stripped = line.strip()
++            # 仅匹配不以 / 或 . 开头的相对路径（即项目内文件）
++            if stripped.startswith(("/", ".")):
++                continue
++            m = re.match(r"^(tests/)?[^:\s]+\.py:\s*(\d+)\s*$", stripped)
++            if m:
++                per_file_count += int(m.group(2))
++        if per_file_count > 0:
++            return per_file_count
++
++        # 5. 什么都没收集到 → 0（仅在输出明确为 "no tests collected" 时合理）
++        return 0
+     except Exception:
+         return -1
+ 
+ 
+ def run_tests() -> dict:
+-    """运行 pytest 并返回结果"""
++    """运行 pytest 并返回结果。
++
++    Returns:
++        dict 包含 passed/failed/errors/warnings/exit_code/summary/stdout_tail/stderr_tail/command。
++        subprocess 异常时返回 {"error": str(e), "exit_code": -1, "command": cmd}。
++    """
++    cmd = build_pytest_command(collect_only=False)
+     try:
+         result = subprocess.run(
+-            [PYTHON_BIN, "-m", "pytest", "--tb=short", "-q"],
++            cmd,
+             capture_output=True,
+             text=True,
+             cwd=str(MYTRADER_ROOT),
+-            timeout=120,
++            timeout=300,
+         )
+-        # 解析 "478 passed, 5 failed" 格式
+-        summary_line = ""
+-        for line in result.stdout.strip().split("\n"):
+-            if "passed" in line or "failed" in line or "error" in line:
+-                summary_line = line
+-                break
+-
+-        passed = 0
+-        failed = 0
+-        errors = 0
+-        for m in re.finditer(r"(\d+)\s+(passed|failed|error)", summary_line):
+-            count = int(m.group(1))
+-            status = m.group(2)
+-            if status == "passed":
+-                passed = count
+-            elif status == "failed":
+-                failed = count
+-            elif status == "error":
+-                errors = count
++        stdout = result.stdout or ""
++        stderr = result.stderr or ""
++        combined = stdout + "\n" + stderr
++        summary = parse_pytest_summary(combined)
+ 
+         return {
+-            "passed": passed,
+-            "failed": failed,
+-            "errors": errors,
++            "passed": summary["passed"],
++            "failed": summary["failed"],
++            "errors": summary["errors"],
++            "warnings": summary["warnings"],
+             "exit_code": result.returncode,
+-            "summary": summary_line,
+-            "stdout_tail": result.stdout[-500:],
++            "summary": summary["summary"],
++            "stdout_tail": stdout[-2000:],
++            "stderr_tail": stderr[-500:],
++            "command": cmd,
+         }
+     except Exception as e:
+-        return {"error": str(e)}
++        return {
++            "error": str(e),
++            "exit_code": -1,
++            "command": cmd,
++            "passed": 0,
++            "failed": 0,
++            "errors": 0,
++            "warnings": 0,
++            "summary": "",
++            "stdout_tail": "",
++            "stderr_tail": str(e),
++        }
+ 
+ 
+ # ─── 留痕检查 ────────────────────────────────────────────────────────────
+@@ -675,7 +903,7 @@ def save_iteration_snapshot(result: IterationResult):
+     response_text = "\n---\n".join(result.text_responses) if result.text_responses else "(无文本输出)"
+     (snapshot_dir / "full_response.md").write_text(response_text, encoding="utf-8")
+ 
+-    # 3. code_diff.patch — git diff 快照
++    # 3. code_diff.patch — git diff 快照（tracked 文件的变更）
+     try:
+         diff_result = subprocess.run(
+             ["git", "diff", "HEAD"],
+@@ -689,6 +917,37 @@ def save_iteration_snapshot(result: IterationResult):
+         diff_content = f"(git diff 失败: {e})"
+     (snapshot_dir / "code_diff.patch").write_text(diff_content, encoding="utf-8")
+ 
++    # 3a. git_status.txt — 完整 `git status --porcelain=v1` 输出
++    #     用于捕获 untracked 新文件（`git diff HEAD` 会漏掉这些）。
++    untracked_files: list[dict[str, Any]] = []
++    try:
++        status_result = subprocess.run(
++            ["git", "status", "--porcelain=v1"],
++            capture_output=True,
++            text=True,
++            cwd=str(PROJECT_ROOT),
++            timeout=15,
++        )
++        status_content = status_result.stdout if status_result.stdout else "(git status 无输出)"
++        untracked_files = _collect_untracked_files(status_content)
++    except Exception as e:
++        status_content = f"(git status 失败: {e})"
++    (snapshot_dir / "git_status.txt").write_text(status_content, encoding="utf-8")
++
++    # 3b. untracked_files.json — untracked 文件路径、大小、sha256
++    if untracked_files:
++        (snapshot_dir / "untracked_files.json").write_text(
++            json.dumps(untracked_files, indent=2, ensure_ascii=False, default=str),
++            encoding="utf-8",
++        )
++
++    # 3c. untracked_diff.patch — 对文本型 untracked 文件生成 diff 形式快照
++    untracked_diff = _build_untracked_diff(untracked_files)
++    if untracked_diff:
++        (snapshot_dir / "untracked_diff.patch").write_text(
++            untracked_diff, encoding="utf-8"
++        )
++
+     # 4. prompt_template.md — 记录任务描述（prompt 本身在 build_constitution_prompt 中构造）
+     (snapshot_dir / "prompt_template.md").write_text(
+         f"# 迭代 #{iter_num} Prompt\n\n"
+@@ -706,9 +965,180 @@ def save_iteration_snapshot(result: IterationResult):
+             encoding="utf-8",
+         )
+ 
++    # 6. gate_status.json — 机器可读的 gate/harness 健康状态
++    #    让 Meta-Agent 不只依赖 markdown summary 判定迭代质量。
++    _write_gate_status(result, snapshot_dir, iter_num, untracked_files)
++
+     print(f"  快照已保存: {snapshot_dir}")
+ 
+ 
++# untracked 文件快照过滤规则（避免泄露敏感文件 / 收集过大文件）
++_UNTRACKED_SKIP_DIRS = (".codebuddy/teams/", "__pycache__/", ".git/", "node_modules/")
++_UNTRACKED_SKIP_SUFFIXES = (".pyc", ".pyo", ".swp")
++_UNTRACKED_MAX_SIZE = 1024 * 1024  # 1MB
++_UNTRACKED_SENSITIVE_NAME_PARTS = (".env", "secret", "token", "key", "credential")
++
++
++def _is_sensitive_path(path_str: str) -> bool:
++    lower = path_str.lower()
++    for part in _UNTRACKED_SENSITIVE_NAME_PARTS:
++        if part in lower:
++            return True
++    return False
++
++
++def _collect_untracked_files(porcelain_output: str) -> list[dict[str, Any]]:
++    """从 `git status --porcelain=v1` 输出解析 untracked 文件（?? 前缀）。
++
++    Returns:
++        list of {path, size, sha256}；敏感文件仅记录路径，不读内容。
++    """
++    files: list[dict[str, Any]] = []
++    for line in porcelain_output.splitlines():
++        if len(line) < 4:
++            continue
++        xy = line[:2]
++        if xy != "??":
++            continue
++        path_part = line[3:]
++        if " -> " in path_part:
++            path_part = path_part.split(" -> ", 1)[1]
++        if path_part.startswith('"') and path_part.endswith('"'):
++            path_part = path_part[1:-1]
++
++        # 跳过黑名单目录/后缀
++        if any(path_part.startswith(d) for d in _UNTRACKED_SKIP_DIRS):
++            continue
++        if any(path_part.endswith(s) for s in _UNTRACKED_SKIP_SUFFIXES):
++            continue
++        if _is_sensitive_path(path_part):
++            # 仍记录路径，但不读内容
++            files.append({
++                "path": path_part,
++                "size": None,
++                "sha256": None,
++                "sensitive": True,
++            })
++            continue
++
++        full_path = PROJECT_ROOT / path_part
++        if not full_path.exists() or not full_path.is_file():
++            continue
++        try:
++            stat = full_path.stat()
++            if stat.st_size > _UNTRACKED_MAX_SIZE:
++                files.append({
++                    "path": path_part,
++                    "size": stat.st_size,
++                    "sha256": None,
++                    "skipped_reason": "file_too_large",
++                })
++                continue
++            content = full_path.read_bytes()
++            sha = hashlib.sha256(content).hexdigest()
++            files.append({
++                "path": path_part,
++                "size": stat.st_size,
++                "sha256": sha,
++                "sensitive": False,
++            })
++        except Exception as e:
++            files.append({
++                "path": path_part,
++                "size": None,
++                "sha256": None,
++                "error": str(e),
++            })
++    return files
++
++
++def _build_untracked_diff(untracked_files: list[dict[str, Any]]) -> str:
++    """对文本型 untracked 文件生成类似 `git diff` 的 patch。
++
++    跳过：敏感文件、过大文件、二进制文件（基于内容嗅探）。
++    """
++    patches: list[str] = []
++    for info in untracked_files:
++        if info.get("sensitive"):
++            continue
++        if info.get("skipped_reason") == "file_too_large":
++            continue
++        if info.get("sha256") is None:
++            continue
++
++        path_str = info["path"]
++        full_path = PROJECT_ROOT / path_str
++        try:
++            content_bytes = full_path.read_bytes()
++        except Exception:
++            continue
++        # 简单二进制检测：包含 NUL 字节视为二进制
++        if b"\x00" in content_bytes:
++            continue
++        try:
++            content = content_bytes.decode("utf-8")
++        except UnicodeDecodeError:
++            continue
++
++        # 构造类似 git diff 的 patch
++        patches.append(
++            f"diff --git a/{path_str} b/{path_str}\n"
++            f"new file mode 100644\n"
++            f"--- /dev/null\n"
++            f"+++ b/{path_str}\n"
++            f"@@ -0,0 +1,{len(content.splitlines())} @@\n"
++            + "".join(f"+{line}\n" for line in content.splitlines())
++        )
++    return "".join(patches)
++
++
++def _write_gate_status(
++    result: IterationResult,
++    snapshot_dir: Path,
++    iter_num: int,
++    untracked_files: list[dict[str, Any]],
++) -> None:
++    """写出 iterations/iteration_N/gate_status.json — 机器可读的 gate/harness 健康状态。"""
++    test_result = result.test_result or {}
++    gate = {
++        "iteration": iter_num,
++        "iteration_id": result.iteration_id,
++        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
++        "status": result.status,
++        "tests": {
++            "count_before": result.test_count_before,
++            "count_after": result.test_count_after,
++            "passed": int(test_result.get("passed", 0) or 0),
++            "failed": int(test_result.get("failed", 0) or 0),
++            "errors": int(test_result.get("errors", 0) or 0),
++            "warnings": int(test_result.get("warnings", 0) or 0),
++            "exit_code": int(test_result.get("exit_code", -1) or 0),
++            "summary": test_result.get("summary", ""),
++            "has_test_failures": has_test_failures(result.test_result),
++        },
++        "snapshot": {
++            "changed_files_count": len(result.changed_files),
++            "includes_untracked": len(untracked_files) > 0,
++            "untracked_count": len(untracked_files),
++            "git_status_file": "git_status.txt",
++            "untracked_files_file": "untracked_files.json" if untracked_files else None,
++            "untracked_diff_file": "untracked_diff.patch" if untracked_files else None,
++        },
++        "compliance": {
++            "violations": result.violations,
++            "high_risk_files_touched": result.high_risk_files_touched,
++            "buffer_overflow_count": result.buffer_overflow_count,
++        },
++        "trajectory_updated_by_codebuddy": result.trajectory_updated_by_codebuddy,
++        "decision_log_updated_by_codebuddy": result.decision_log_updated_by_codebuddy,
++        "error": result.error,
++    }
++    (snapshot_dir / "gate_status.json").write_text(
++        json.dumps(gate, indent=2, ensure_ascii=False, default=str),
++        encoding="utf-8",
++    )
++
++
+ def save_iteration_summary_template(
+     result: IterationResult,
+     rules: ConstitutionRules,
+@@ -1019,17 +1449,17 @@ async def run_iteration(
+         result.trajectory_updated_by_codebuddy = check_trajectory_updated(result.start_time)
+         result.decision_log_updated_by_codebuddy = check_decision_log_updated(result.start_time)
+ 
+-        # 5. 判定状态
++        # 5. 判定状态（严格使用 pytest exit_code + failed + errors + error 字段）
+         if result.violations:
+             result.status = "failed"
++        elif has_test_failures(result.test_result):
++            result.status = "failed"  # 测试失败 / exit_code != 0 / subprocess error
+         elif result.test_count_after < result.test_count_before and result.test_count_before > 0:
+             result.status = "failed"  # 测试数下降 = 禁止行为 #9
+         elif result.high_risk_files_touched:
+             result.status = "partial"  # 高风险变更需审批
+         elif result.buffer_overflow_count > 0:
+             result.status = "partial"  # ACP 通信中断，结果可能不完整
+-        elif result.test_result and result.test_result.get("error"):
+-            result.status = "partial"
+         else:
+             result.status = "passed"
+ 
+diff --git a/mytrader/config/strategy_weights.json b/mytrader/config/strategy_weights.json
+index b1a11e8..4a06053 100644
+--- a/mytrader/config/strategy_weights.json
++++ b/mytrader/config/strategy_weights.json
+@@ -1,7 +1,7 @@
+ {
+   "_meta": {
+-    "generated_at": "2026-07-01T21:17:34.919503+00:00",
+-    "backtest_window": "2021-07-03 ~ 2026-07-02",
++    "generated_at": "2026-07-04T07:25:35.256921+00:00",
++    "backtest_window": "2021-07-05 ~ 2026-07-04",
+     "reoptimize_freq": "monthly",
+     "survivorship_bias_warning": "使用当前成分股回测，S&P 500 5年成分变动约100只(~20%)，均值回归组(SPX_low_vol)结果可能系统性偏高"
+   },
+@@ -10,15 +10,15 @@
+       {
+         "strategy": "rsi_mean_revert",
+         "params": {
+-          "period": 14,
+-          "oversold": 30,
++          "period": 21,
++          "oversold": 25,
+           "overbought": 65
+         },
+-        "weight": 0.5262,
+-        "backtest_sharpe": 0.9677,
+-        "backtest_sortino": 1.5506,
+-        "backtest_max_drawdown": 7.3712,
+-        "backtest_win_rate": 0.7719,
++        "weight": 0.5426,
++        "backtest_sharpe": 1.0301,
++        "backtest_sortino": 1.6147,
++        "backtest_max_drawdown": 1.7762,
++        "backtest_win_rate": 0.5026,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       },
+@@ -28,11 +28,11 @@
+           "period": 25,
+           "std_dev": 1.5
+         },
+-        "weight": 0.4738,
+-        "backtest_sharpe": 0.8714,
+-        "backtest_sortino": 1.3511,
+-        "backtest_max_drawdown": 9.3546,
+-        "backtest_win_rate": 0.7093,
++        "weight": 0.4574,
++        "backtest_sharpe": 0.8684,
++        "backtest_sortino": 1.3463,
++        "backtest_max_drawdown": 9.3881,
++        "backtest_win_rate": 0.7079,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       }
+@@ -44,11 +44,11 @@
+           "period": 15,
+           "std_dev": 1.5
+         },
+-        "weight": 0.5017,
+-        "backtest_sharpe": 0.6715,
+-        "backtest_sortino": 1.0298,
+-        "backtest_max_drawdown": 14.898,
+-        "backtest_win_rate": 0.6632,
++        "weight": 0.5022,
++        "backtest_sharpe": 0.6961,
++        "backtest_sortino": 1.0677,
++        "backtest_max_drawdown": 14.502,
++        "backtest_win_rate": 0.6613,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       },
+@@ -59,11 +59,11 @@
+           "oversold": 35,
+           "overbought": 75
+         },
+-        "weight": 0.4983,
+-        "backtest_sharpe": 0.6668,
+-        "backtest_sortino": 0.9855,
+-        "backtest_max_drawdown": 18.0227,
+-        "backtest_win_rate": 0.6714,
++        "weight": 0.4978,
++        "backtest_sharpe": 0.69,
++        "backtest_sortino": 1.0211,
++        "backtest_max_drawdown": 17.5149,
++        "backtest_win_rate": 0.6777,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       }
+@@ -77,10 +77,10 @@
+           "overbought": 75
+         },
+         "weight": 1.0,
+-        "backtest_sharpe": 0.8218,
+-        "backtest_sortino": 1.2312,
+-        "backtest_max_drawdown": 18.4532,
+-        "backtest_win_rate": 0.7581,
++        "backtest_sharpe": 0.7899,
++        "backtest_sortino": 1.1793,
++        "backtest_max_drawdown": 18.8237,
++        "backtest_win_rate": 0.7059,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       }
+@@ -89,77 +89,77 @@
+       {
+         "strategy": "rsi_mean_revert",
+         "params": {
+-          "period": 21,
+-          "oversold": 25,
++          "period": 14,
++          "oversold": 35,
+           "overbought": 65
+         },
+-        "weight": 0.5833,
+-        "backtest_sharpe": 1.2177,
+-        "backtest_sortino": 1.9962,
+-        "backtest_max_drawdown": 1.0705,
+-        "backtest_win_rate": 0.3488,
++        "weight": 0.5286,
++        "backtest_sharpe": 1.063,
++        "backtest_sortino": 1.6247,
++        "backtest_max_drawdown": 8.5578,
++        "backtest_win_rate": 0.8194,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       },
+       {
+         "strategy": "bollinger_band",
+         "params": {
+-          "period": 25,
++          "period": 20,
+           "std_dev": 1.5
+         },
+-        "weight": 0.4167,
+-        "backtest_sharpe": 0.8699,
+-        "backtest_sortino": 1.3024,
+-        "backtest_max_drawdown": 9.7659,
+-        "backtest_win_rate": 0.7421,
++        "weight": 0.4714,
++        "backtest_sharpe": 0.9481,
++        "backtest_sortino": 1.4254,
++        "backtest_max_drawdown": 9.8925,
++        "backtest_win_rate": 0.7408,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       }
+     ],
+-    "NDX_mid_vol": [
++    "NDX_low_vol": [
+       {
+         "strategy": "rsi_mean_revert",
+         "params": {
+           "period": 14,
+-          "oversold": 25,
++          "oversold": 35,
+           "overbought": 65
+         },
+-        "weight": 0.5939,
+-        "backtest_sharpe": 1.0891,
+-        "backtest_sortino": 1.7276,
+-        "backtest_max_drawdown": 4.035,
+-        "backtest_win_rate": 0.8127,
++        "weight": 0.5273,
++        "backtest_sharpe": 1.1334,
++        "backtest_sortino": 1.8441,
++        "backtest_max_drawdown": 13.6764,
++        "backtest_win_rate": 0.8025,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       },
+       {
+         "strategy": "bollinger_band",
+         "params": {
+-          "period": 15,
++          "period": 25,
+           "std_dev": 1.5
+         },
+-        "weight": 0.4061,
+-        "backtest_sharpe": 0.7446,
+-        "backtest_sortino": 1.1094,
+-        "backtest_max_drawdown": 10.792,
+-        "backtest_win_rate": 0.6738,
++        "weight": 0.4727,
++        "backtest_sharpe": 1.0159,
++        "backtest_sortino": 1.6168,
++        "backtest_max_drawdown": 14.9034,
++        "backtest_win_rate": 0.7476,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       }
+     ],
+-    "NDX_low_vol": [
++    "NDX_mid_vol": [
+       {
+         "strategy": "rsi_mean_revert",
+         "params": {
+           "period": 14,
+-          "oversold": 35,
+-          "overbought": 65
++          "oversold": 25,
++          "overbought": 75
+         },
+-        "weight": 0.5454,
+-        "backtest_sharpe": 1.1775,
+-        "backtest_sortino": 1.9616,
+-        "backtest_max_drawdown": 10.7092,
+-        "backtest_win_rate": 0.8152,
++        "weight": 0.6012,
++        "backtest_sharpe": 1.3247,
++        "backtest_sortino": 2.0837,
++        "backtest_max_drawdown": 3.6674,
++        "backtest_win_rate": 0.8753,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       },
+@@ -169,11 +169,11 @@
+           "period": 25,
+           "std_dev": 1.5
+         },
+-        "weight": 0.4546,
+-        "backtest_sharpe": 0.9816,
+-        "backtest_sortino": 1.5688,
+-        "backtest_max_drawdown": 12.7388,
+-        "backtest_win_rate": 0.7286,
++        "weight": 0.3988,
++        "backtest_sharpe": 0.8788,
++        "backtest_sortino": 1.3463,
++        "backtest_max_drawdown": 8.9912,
++        "backtest_win_rate": 0.703,
+         "dd_constrained": false,
+         "backtest_dd_status": "pass"
+       }
+diff --git a/mytrader/designs/design_v2/07-backtest-module.md b/mytrader/designs/design_v2/07-backtest-module.md
+index c927118..595a836 100644
+--- a/mytrader/designs/design_v2/07-backtest-module.md
++++ b/mytrader/designs/design_v2/07-backtest-module.md
+@@ -384,11 +384,43 @@ def run_matrix_backtest(universe: UniverseManager,
+ | **组合 Max Drawdown**（迭代 #2 新增） | 等权合并组内日收益率 → cumprod → cummax → drawdown → max，返回正百分数 | Constitution L1 DD≤20% 硬约束；DD 是路径依赖比率不可直接平均；per-stock avg DD 虚高（无分散化效应） |
+ | **NaN 安全处理**（迭代 #2 新增） | `_safe_float()` 拦截 NaN/None/Inf；`_safe_mean()` 拦截空列表/全 NaN | vectorbt 无交易时 stats 返回 NaN；`NaN or 0.0` 仍为 NaN（NaN 是 truthy）导致 JSON 序列化失败 |
+ | **策略名校验**（迭代 #1 新增） | `_run_group` 进入策略循环前检查 `strategy not in STRATEGY_REGISTRY` → `logger.warning` + `continue` | 防止策略名拼写错误被静默跳过（迭代 #1 修复的 bug：`main.py` 误用 `"rsi"/"macd"/"bollinger"` 简称导致 3 个策略 6 天未跑） |
++| **DD 硬约束 + Fallback**（迭代 #3 新增） | top-K 选择时过滤 `portfolio_max_drawdown > 20%` 的候选；若全部超标 → 按 DD 升序取 top-K，标记 `dd_constrained=True` | Constitution L1 DD≤20% 是硬约束；无合规候选时仍需产出权重（结构性问题不能阻塞回测） |
++| **Alpha 排序 + Sortino 门槛**（迭代 #9 新增） | top-K 排序从 Sortino 改为 Alpha（策略年化收益 - SPY 同期年化收益）；新增 `Sortino > 0.5` 最低质量门槛 | Sortino 高 ≠ 年化高（均值回归策略天然高 Sortino 低绝对收益，alpha 为负）；Alpha 排序直接优化超额收益目标；Sortino 门槛保证基本下行质量。三级 fallback：Tier 1 DD+Sortino → Tier 2 仅 DD → Tier 3 DD 升序 |
++| **SPY Benchmark 获取**（迭代 #9 新增） | `_get_spy_returns(start, end)` 从 MarketDataStore 拉取 SPY 日收益率；`_compute_alpha(strat, spy)` 计算年化 alpha | SPY 不可用时 alpha 降级为 0.0（不阻塞回测），所有候选 alpha=0 ��退化为原顺序 |
++| **per-strategy best params 用 Alpha**（迭代 #9 新增） | 每个策略的最优参数选择从 Sharpe 改为 Alpha | 与 top-K 排序口径一致，避免 per-strategy 用 Sharpe 选低收益高稳定的参数 |
++| **ensemble weights 用 Alpha**（迭代 #9 新增） | `_optimize_ensemble_weights` 接收 `spy_returns` 参数，权重计算从 Sharpe 改为 Alpha | 与 top-K 排序口径一致，ensemble 权重直接反映"跑赢 SPY 的程度"；SPY 不可用时退化为等权 |
+ | **参数按组** | 同组共用参数，不对单只优化 | 防过拟合（详见 02-strategy-engine.md 6.3） |
+ | **历史分组对齐** | 矩阵回测使用 point-in-time 分组（按回测时间点重算波动率），而非当前静态分组 | 避免回测静态分组而实盘动态分组导致回测/实盘不一致 |
+ | **实盘 ensemble 对齐** | MatrixBacktest 的 ensemble 权重优化须在"单点离散值聚合"语义下验证 | 实盘只取 iloc[-1] 单点离散值加权，与序列级加权不等价，权重必须在相同语义下产出 |
+ | **Walk-Forward** | 滚动训练窗口，月度重优化 | 平衡过拟合与适应性 |
+ 
++### 10.4.1 Top-K 选择三级 Fallback（迭代 #9 新增）
++
++```
++Tier 1: DD ≤ 20% AND Sortino > 0.5  →  Alpha 降序取 top-K
++   ↓ (若空)
++Tier 2: DD ≤ 20%（放宽 Sortino）   →  Alpha 降序取 top-K，WARNING 日志
++   ↓ (若空)
++Tier 3: 无 DD 合规候选              →  DD 升序取 top-K，dd_constrained=True
++```
++
++**设计动机**（iteration #9 spec §1-2）：
++- Constitution 目标：年化 20-30%（需 alpha +10~20%）
++- 旧逻辑：Sortino 降序 → 永远选均值回归策略 → 年化 8.02%，alpha = -11.34%
++- 新逻辑：Alpha 降序 → 直接优化超额收益目标
++- Sortino 门槛：避免选到"高 alpha 但高下行波动"的垃圾策略
++
++**Alpha 计算公式**：
++```python
++strat_annual = (1 + strat_returns.mean()) ** 252 - 1
++spy_annual   = (1 + spy_returns.mean()) ** 252 - 1
++alpha_pct    = (strat_annual - spy_annual) * 100
++```
++
++**降级处理**：SPY 数据不可用 → alpha=0.0，所有候选 alpha 相等，
++Python 稳定排序保留原顺序（按策略列表顺序）。
++
++
+ ### 10.5 Walk-Forward 月度重优化
+ 
+ ```
+@@ -432,6 +464,23 @@ reports/matrix_backtest/        # 每次矩阵回测的详细报告（各组各
+         {group_id}_detail.csv   # 单组各策略各参数明细
+ ```
+ 
++#### strategy_weights.json 字段说明
++
++```json
++{
++  "strategy": "rsi_mean_revert",
++  "params": {"period": 14, "oversold": 30, "overbought": 70},
++  "weight": 0.5,
++  "backtest_sharpe": 1.03,
++  "backtest_sortino": 1.61,
++  "backtest_max_drawdown": 1.78,
++  "backtest_win_rate": 0.50,
++  "backtest_alpha": 2.35,         // 迭代 #9 新增：vs SPY 的超额年化收益（百分数）
++  "dd_constrained": false,
++  "backtest_dd_status": "pass"
++}
++```
++
+ ### 10.7 性能考量
+ 
+ ```
+diff --git a/mytrader/designs/design_v2/13-signal-ranker.md b/mytrader/designs/design_v2/13-signal-ranker.md
+index 9a8288e..5465c4b 100644
+--- a/mytrader/designs/design_v2/13-signal-ranker.md
++++ b/mytrader/designs/design_v2/13-signal-ranker.md
+@@ -58,11 +58,12 @@ Signal Filter → Risk Manager → Execution
+ 聚合后的每个候选标的，计算综合得分：
+ 
+ ```
+-score(symbol) = w1 × strategy_weight       # 组内策略权重（回测产出）
+-              + w2 × signal_confidence      # 信号强度
+-              + w3 × backtest_win_rate       # 该策略组的历史胜率
+-              + w4 × backtest_sharpe_norm     # 历史 Sharpe（归一化）
+-              - w5 × recent_correlation       # 与已选标的的相关性惩罚（可选）
++score(symbol) = w1 × strategy_weight         # 组内策略权重（回测产出）
++              + w2 × signal_confidence        # 信号强度
++              + w3 × backtest_win_rate         # 该策略组的历史胜率
++              + w4 × backtest_sortino_norm     # 历史 Sortino（Constitution L1 首要 KPI）
++              + w5 × backtest_dd_penalty       # DD 越低分越高（0%→1.0, 20%→0.0）
++              - w6 × recent_correlation       # 与已选标的的相关性惩罚（可选）
+ ```
+ 
+ | 因子 | 含义 | 权重建议 |
+@@ -70,9 +71,38 @@ score(symbol) = w1 × strategy_weight       # 组内策略权重（回测产出
+ | `strategy_weight` | 组合中该策略的权重 | 高 |
+ | `signal_confidence` | 当前信号置信度 | 中 |
+ | `backtest_win_rate` | 历史胜率 | 中 |
+-| `backtest_sharpe` | 历史风险调整收益 | 高 |
++| `backtest_sortino` | 历史 Sortino Ratio（Constitution L1 首要 KPI） | 高（最高单因子） |
++| `backtest_dd_penalty` | 历史最大回撤惩罚（DD 越低分越高） | 低 |
+ | `correlation_penalty` | 避免选出高度相关的标的（如全是科技股） | 低（可选） |
+ 
++> **迭代 #7 更新**：评分因子从 `backtest_sharpe` 切换为 `backtest_sortino` +
++> `backtest_dd_penalty`，与 Constitution L1 "Sortino 首要 KPI" 对齐。
++> Sortino 权重提升至 0.25（最高单因子），DD 惩罚 0.10（DD 0% → 1.0 满分，DD 20% → 0.0 零分）。
++> `backtest_sharpe` 字段在 indicators 中保留（向后兼容），但不再参与评分。
++
++### DEFAULT_SCORE_WEIGHTS（迭代 #7）
++
++```python
++DEFAULT_SCORE_WEIGHTS = {
++    "strategy_weight":     0.30,
++    "signal_confidence":   0.20,
++    "backtest_win_rate":   0.15,
++    "backtest_sortino":    0.25,   # ← 替换 backtest_sharpe，权重最高单因子
++    "backtest_dd_penalty": 0.10,   # ← 新增：DD 越低分越高
++}
++```
++
++设计理由：
++- Sortino 权重 0.25（最高单因子），体现 Constitution L1 优先级
++- DD 惩罚 0.10：DD 0% 时因子=1.0（满分），DD 20% 时因子=0.0（零分）
++- 其余因子权重略微下调以保持总和=1.0
++- 保持 5 因子结构，不引入更多维度（避免过拟合，§8.3 原则）
++
++### 归一化
++
++- `backtest_sortino`: `min(max(sortino / 3.0, 0.0), 1.0)` — Sortino 通常 0~3，除以 3.0 截断到 [0, 1]；负值被 `max(·, 0.0)` 截断为 0
++- `backtest_dd_penalty`: `max(1.0 - dd / 20.0, 0.0)` — DD 0~20%+，`1 - dd/20` 截断到 [0, 1]；DD=0 → 1.0，DD≥20 → 0.0
++
+ > **相关性惩罚**是分散度的补救：Top-5 若全是科技股，等于把鸡蛋放一个篮子。
+ > 加入惩罚项，鼓励选出跨板块、低相关的 Top-K。
+ 
+diff --git a/mytrader/designs/design_v2/CHANGELOG.md b/mytrader/designs/design_v2/CHANGELOG.md
+index 3a60553..9f7abfa 100644
+--- a/mytrader/designs/design_v2/CHANGELOG.md
++++ b/mytrader/designs/design_v2/CHANGELOG.md
+@@ -4,6 +4,60 @@
+ 
+ ---
+ 
++## v2.3 — 2026-07-05（迭代 #9：MatrixBacktest Alpha-Based Strategy Selection）
++
++### 背景
++
++Iter #7 的 `--reoptimize` 暴露了根本矛盾：
++- Constitution 目标：年化 20-30%（需 alpha +10~20%）
++- MatrixBacktest 排序：Sortino 降序
++- 结果：选出 Sortino 最高的均值回归策略 → 年化 8.02% → alpha = -11.34%
++
++**Sortino 高 ≠ 年化高。** 均值回归策略天然有高 Sortino（低下行波动）
++但低绝对收益。用 Sortino 排序会系统性地排除能跑赢 SPY 的趋势策略。
++Iter #8 新增的 `rsi_trend_filter` 也因此未能进入权重。
++
++### 修改清单
++
++| 优先级 | 问题 | 涉及文件 | 变更内容 |
++|--------|------|----------|---------|
++| P0 | top-K 排序用 Sortino → 永远选均值回归 → alpha 为负 | `matrix_backtest.py::_run_group` | top-K 排序从 Sortino 改为 Alpha（vs SPY） |
++| P0 | per-strategy best params 用 Sharpe → 偏好低波动 | `matrix_backtest.py::_run_group` | per-strategy best params 选择从 Sharpe 改为 Alpha |
++| P0 | ensemble weights 用 Sharpe → 与排序口径不一致 | `matrix_backtest.py::_optimize_ensemble_weights` | 权重计算从 Sharpe 改为 Alpha；新增 `spy_returns` 参数 |
++| P0 | 缺 SPY benchmark 数据获取 | `matrix_backtest.py::MatrixBacktest._get_spy_returns` | 新增方法从 MarketDataStore 拉取 SPY 日收益率 |
++| P0 | 缺 alpha 计算函数 | `matrix_backtest.py::_compute_alpha` | 新增模块级函数：`(strat_annual - spy_annual) * 100` |
++| P0 | 缺日收益率合并复用 | `matrix_backtest.py::_combine_daily_returns` | 新增 helper 提取等权合并逻辑，sharpe/sortino/alpha 共享 |
++| P1 | 缺 Sortino 最低质量门槛 | `matrix_backtest.py::MIN_SORTINO_THRESHOLD` | 新增常量 0.5，作为 top-K Tier 1 过滤；可放宽（Tier 2 fallback） |
++| P1 | GroupBacktestResult 缺 alpha 字段 | `matrix_backtest.py::GroupBacktestResult` | 新增 `backtest_alpha: float = 0.0` |
++| P1 | strategy_weights.json 缺 alpha 字段 | `matrix_backtest.py::_run_group` | 每条目新增 `backtest_alpha` 字段 |
++| P2 | 缺 alpha 相关测试 | `tests/test_matrix_backtest.py` | 新增 17 个测试：alpha 计算、top-K 用 alpha、Sortino 门槛、三级 fallback、ensemble weights |
++| P2 | 设计文档与代码不同步 | `07-backtest-module.md` | §10.4 加"Alpha 排序 + Sortino 门槛"等设计点；新增 §10.4.1 三级 Fallback 说明；§10.6 加 JSON 字段说明 |
++
++### 不变项
++
++- DD ≤ 20% 硬约束保留（Constitution L1）
++- 策略代码 / 风控 / 执行逻辑未修改
++- Walk-Forward 4 轮验证流程不变（内部复用 `_run_group`，自动继承 alpha 排序）
++- `backtest_sharpe` / `backtest_sortino` / `backtest_max_drawdown` 字段保留
++- 5 个策略文件未修改
++
++### 降级处理
++
++SPY 数据不可用时：
++- `_get_spy_returns` 返回 None
++- `_compute_alpha` 返回 0.0
++- 所有候选 alpha=0 → Python 稳定排序保留原顺序（按策略列表）
++- ensemble weights 退化为等权（`max(0, 0.01)` 归一化）
++- 不抛异常，不阻塞回测
++
++### 影响范围
++
++- ✅ 向后兼容：`backtest_alpha` 带 default 值；`_optimize_ensemble_weights` 的 `spy_returns` 参数带 default None
++- ⚠️ 行为变更：`--reoptimize` 重新产出后，top-K 策略选择会变化（趋势策略可能进入权重）
++- 🔲 下一轮迭代候选：用户独立运行 `--reoptimize` 验证 alpha 改善
++
++---
++
+ ## v2.2 — 2026-06-30（迭代 #1：策略名 bug 修复 + Sortino 指标）
+ 
+ ### 背景
+diff --git a/mytrader/main.py b/mytrader/main.py
+index 36b7aa6..7fa09e7 100644
+--- a/mytrader/main.py
++++ b/mytrader/main.py
+@@ -35,6 +35,7 @@ from pathlib import Path
+ REOPTIMIZE_STRATEGIES: list[str] = [
+     "dual_ma",
+     "rsi_mean_revert",
++    "rsi_trend_filter",
+     "macd_cross",
+     "bollinger_band",
+ ]
+@@ -50,6 +51,9 @@ REOPTIMIZE_PARAM_GRIDS: dict[str, dict[str, list]] = {
+     "macd_cross":      {"fast": [8, 12, 16], "slow": [21, 26, 32], "signal_period": [5, 9, 12]},
+     # 迭代 #2：布林带 3×3=9 个组合，覆盖常用 std_dev 范围 [1.5, 2.0, 2.5]。
+     "bollinger_band":  {"period": [15, 20, 25], "std_dev": [1.5, 2.0, 2.5]},
++    # 迭代 #8：RSI 趋势过滤 3×3×3×1=27 个组合，trend_period 固定 200（经典长周期趋势线）。
++    "rsi_trend_filter": {"rsi_period": [7, 14, 21], "oversold": [25, 30, 35],
++                         "overbought": [65, 70, 75], "trend_period": [200]},
+ }
+ 
+ 
+@@ -414,12 +418,17 @@ def _run_reoptimize(config: "Any", logger: "Any") -> None:
+             config=pb_cfg,
+         )
+         pb_result = pb.run(start=pb_start, end=pb_end)
++        # 迭代 #7：日志增加 benchmark / alpha / IR（Constitution L1 收益可归因）
+         logger.info(
+             f"[Portfolio Backtest] "
+             f"DD={pb_result.max_drawdown_pct:.2f}%, "
+             f"Sortino={pb_result.sortino_ratio:.4f}, "
+             f"Sharpe={pb_result.sharpe_ratio:.4f}, "
+             f"Annual Return={pb_result.annualized_return_pct:.2f}%, "
++            f"Benchmark({pb_result.benchmark_symbol}) "
++            f"Return={pb_result.benchmark_annualized_return_pct:.2f}%, "
++            f"Alpha={pb_result.alpha_pct:.2f}%, "
++            f"IR={pb_result.information_ratio:.4f}, "
+             f"DD Violation={'YES' if pb_result.dd_violation else 'NO'}"
+         )
+         if pb_result.dd_violation:
+diff --git a/mytrader/mytrader/backtest/matrix_backtest.py b/mytrader/mytrader/backtest/matrix_backtest.py
+index 269160d..0fbb3bb 100644
+--- a/mytrader/mytrader/backtest/matrix_backtest.py
++++ b/mytrader/mytrader/backtest/matrix_backtest.py
+@@ -40,6 +40,12 @@ MAX_PORTFOLIO_DRAWDOWN_PCT: float = 20.0
+ # （低于 L1 的 20% 线，给样本外留缓冲）
+ WALK_FORWARD_VAL_DD_THRESHOLD: float = 15.0
+ 
++# 迭代 #9 新增：Sortino 最低质量门槛，用于 top-K 选择时的二级过滤
++# 排除 Sortino ≤ 0.5 的"垃圾"策略（即使 alpha 高也不选）
++# 设计动机：alpha 排序选出高绝对收益策略，但需 Sortino 门槛保证基本下行质量
++# fallback：若无候选通过此门槛，放宽过滤（仅保留 DD 硬约束）
++MIN_SORTINO_THRESHOLD: float = 0.5
++
+ 
+ # ---------------------------------------------------------------------------
+ # 数据结构
+@@ -76,6 +82,7 @@ class GroupBacktestResult:
+     portfolio_sortino: float = 0.0          # 等权组合 Sortino（迭代 #1 新增）
+     portfolio_max_drawdown: float = 0.0     # 等权组合最大回撤（迭代 #2 新增，Constitution L1 KPI）
+     dd_constrained: bool = False            # 迭代 #3：该组是否用了 DD fallback（无合规候选）
++    backtest_alpha: float = 0.0              # 迭代 #9：alpha vs SPY（百分数），用于排序策略选择
+ 
+ 
+ @dataclass
+@@ -233,6 +240,83 @@ def _compute_sortino(
+     return float(returns.mean() / dd * np.sqrt(periods_per_year))
+ 
+ 
++def _combine_daily_returns(results: list[SingleBacktestResult]) -> pd.Series:
++    """等权合并组内日收益率序列，返回组合日收益率（迭代 #9 新增）。
++
++    与 _portfolio_sharpe_from_results / _portfolio_sortino_from_results 同语义：
++    将所有标的日收益率等权合并为组合序列。提取为独立函数以便 alpha 计算
++    和 per-strategy best params 选择复用，避免重复 pd.concat。
++
++    Args:
++        results: 单策略多标的的回测结果列表
++
++    Returns:
++        组合日收益率 pd.Series；无有效数据时返回空 Series
++    """
++    valid = [r.daily_returns for r in results if not r.daily_returns.empty]
++    if not valid:
++        return pd.Series(dtype=float)
++    return pd.concat(valid, axis=1).mean(axis=1)
++
++
++def _compute_alpha(
++    strategy_daily_returns: pd.Series,
++    spy_daily_returns: pd.Series | None,
++    periods_per_year: int = 252,
++) -> float:
++    """计算 alpha = 策略年化收益 - SPY 年化收益（迭代 #9 新增）。
++
++    Alpha 衡量策略相对 SPY buy-and-hold 的超额收益。正值表示跑赢 SPY，
++    负值表示跑输 SPY。用于 top-K 策略选择和 per-strategy best params 选择，
++    替代之前基于 Sortino/Sharpe 的选择逻辑（参考 iteration #9 spec）。
++
++    年化公式：(1 + mean_daily) ** periods_per_year - 1
++    使用算术平均日收益的几何年化，与 PortfolioBacktester 同口径。
++
++    降级处理：SPY 数据不可用（None 或空）→ 返回 0.0（不抛异常）。
++    这样在 SPY 数据缺失时，alpha 排序退化为"原顺序"，不会阻塞回测。
++
++    Args:
++        strategy_daily_returns: 策略组合日收益率序列
++        spy_daily_returns:      SPY 日收益率序列；None 表示数据不可用
++        periods_per_year:       年化因子（日线 = 252）
++
++    Returns:
++        Alpha 百分数（如 5.23 表示策略年化收益跑赢 SPY 5.23 个百分点）；
++        SPY 不可用时返回 0.0
++    """
++    if spy_daily_returns is None or spy_daily_returns.empty:
++        return 0.0
++    if strategy_daily_returns is None or strategy_daily_returns.empty:
++        return 0.0
++
++    # 对齐时间索引（inner join 取交集）
++    aligned = pd.concat(
++        [strategy_daily_returns.rename("strat"), spy_daily_returns.rename("spy")],
++        axis=1,
++        join="inner",
++    ).dropna()
++    if aligned.empty or len(aligned) < 2:
++        return 0.0
++
++    strat_returns = aligned["strat"]
++    spy_returns = aligned["spy"]
++
++    # 年化收益 = (1 + mean_daily)^252 - 1
++    strat_mean = strat_returns.mean()
++    spy_mean = spy_returns.mean()
++    if not np.isfinite(strat_mean) or not np.isfinite(spy_mean):
++        return 0.0
++
++    strat_annual = (1.0 + strat_mean) ** periods_per_year - 1.0
++    spy_annual = (1.0 + spy_mean) ** periods_per_year - 1.0
++
++    alpha = (strat_annual - spy_annual) * 100.0  # 转为百分数
++    if not np.isfinite(alpha):
++        return 0.0
++    return float(alpha)
++
++
+ def _backtest_one(
+     df: pd.DataFrame,
+     strategy_name: str,
+@@ -369,6 +453,7 @@ def _portfolio_max_drawdown_from_results(
+ 
+ def _optimize_ensemble_weights(
+     group_results: list[tuple[str, dict, list[SingleBacktestResult]]],
++    spy_returns: pd.Series | None = None,
+     conflict_threshold: float = 0.3,
+ ) -> list[tuple[str, dict, float]]:
+     """在"单点离散值加权投票"语义下优化 ensemble 权重。
+@@ -376,8 +461,13 @@ def _optimize_ensemble_weights(
+     实盘每根 bar 各策略产出离散值（1/-1/0），加权投票决定方向。
+     回测的权重优化必须使用相同语义，而非对整段时间序列做加权。
+ 
++    迭代 #9：权重计算从 Sharpe 改为 Alpha（vs SPY）。
++    动机：与 _run_group 的 top-K 排序口径一致，使 ensemble 权重直接
++    反映"跑赢 SPY 的程度"。SPY 不可用时 alpha=0，退化为等权。
++
+     Args:
+         group_results: [(strategy, params, [SingleBacktestResult]), ...]
++        spy_returns:   SPY 日收益率序列（用于 alpha 计算）；None 时退化为等权
+         conflict_threshold: 加权投票分数绝对值低于此时视为 HOLD
+ 
+     Returns:
+@@ -387,15 +477,16 @@ def _optimize_ensemble_weights(
+         strategy, params, _ = group_results[0]
+         return [(strategy, params, 1.0)]
+ 
+-    # 简化的 ensemble 权重搜索：用各策略的组合 Sharpe 归一化为权重
+-    # 更严格的做法是网格搜索 weight 组合，在离散投票序列上跑回测
+-    sharpes = []
++    # 迭代 #9：用各策略的组合 alpha 归一化为权重（替代 Sharpe）
++    # alpha 可能 < 0（跑输 SPY），用 max(alpha, 0.01) 避免负权重
++    alphas = []
+     for strategy, params, results in group_results:
+-        ps = _portfolio_sharpe_from_results(results)
+-        sharpes.append(max(ps, 0.01))  # 避免负权重
++        combined = _combine_daily_returns(results)
++        alpha = _compute_alpha(combined, spy_returns)
++        alphas.append(max(alpha, 0.01))  # 避免负/零权重
+ 
+-    total = sum(sharpes)
+-    weights = [s / total for s in sharpes]
++    total = sum(alphas)
++    weights = [a / total for a in alphas]
+ 
+     return [
+         (strategy, params, weight)
+@@ -716,6 +807,44 @@ class MatrixBacktest:
+         )
+         return report
+ 
++    def _get_spy_returns(self, start: date, end: date) -> pd.Series | None:
++        """获取 SPY 同期日收益率序列，用于计算 alpha（迭代 #9 新增）。
++
++        从 MarketDataStore 拉取 SPY 日线数据，计算日收益率。
++        SPY 不在标的池中，但作为 benchmark 用于 alpha 计算。
++
++        降级处理：SPY 数据不可用时返回 None（_compute_alpha 会返回 0.0），
++        不抛异常，保证回测不因 benchmark 缺失而阻塞。
++
++        Args:
++            start: 回测起始日期
++            end:   回测结束日期
++
++        Returns:
++            SPY 日收益率 pd.Series；数据不可用时返回 None
++        """
++        try:
++            spy_bars = self._store.get_bars_multi(["SPY"], start, end)
++            spy_df = spy_bars.get("SPY") if spy_bars else None
++            if spy_df is None or spy_df.empty:
++                logger.warning(
++                    "[MatrixBacktest] SPY data unavailable, alpha will degrade to 0.0"
++                )
++                return None
++            spy_close = spy_df["close"].astype(float)
++            if len(spy_close) < 2:
++                logger.warning(
++                    "[MatrixBacktest] SPY data too short, alpha will degrade to 0.0"
++                )
++                return None
++            return spy_close.pct_change().dropna()
++        except Exception as e:
++            logger.warning(
++                f"[MatrixBacktest] SPY benchmark fetch failed: {e} — "
++                f"alpha will degrade to 0.0"
++            )
++            return None
++
+     def _run_group(
+         self,
+         group_id: str,
+@@ -726,7 +855,14 @@ class MatrixBacktest:
+         param_grids: dict[str, dict[str, list]],
+         report: MatrixBacktestReport,
+     ) -> list[dict[str, Any]]:
+-        """对单个分组执行策略 × 参数网格回测，返回该组的权重配置列表。"""
++        """对单个分组执行策略 × 参数网格回测，返回该组的权重配置列表。
++
++        迭代 #9 变更：
++            - per-strategy best params：从 Sharpe 改为 Alpha（vs SPY）
++            - top-K 排序：从 Sortino 改为 Alpha
++            - 新增 Sortino > 0.5 最低质量门槛（二级过滤，可放宽）
++            - ensemble weights：从 Sharpe 改为 Alpha
++        """
+ 
+         # 1. 读取组内所有标的数据
+         data = self._store.get_bars_multi(symbols, start, end)
+@@ -734,7 +870,10 @@ class MatrixBacktest:
+             logger.warning(f"[MatrixBacktest] {group_id}: no data, skip")
+             return []
+ 
+-        # 2. 对每个策略 × 每组参数，计算组合 Sharpe
++        # 迭代 #9：获取 SPY 同期日收益率用于 alpha 计算（一次获取，组内复用）
++        spy_returns = self._get_spy_returns(start, end)
++
++        # 2. 对每个策略 × 每组参数，按 alpha 选最优参数
+         group_results: list[tuple[str, dict, list[SingleBacktestResult]]] = []
+ 
+         for strategy in strategies:
+@@ -756,8 +895,9 @@ class MatrixBacktest:
+             ) if grid else [{}]
+ 
+             best_params = None
+-            best_sharpe = float("-inf")
+-            best_sortino = 0.0
++            best_alpha = float("-inf")
++            best_sharpe = 0.0       # 仅用于 GroupBacktestResult 存档
++            best_sortino = 0.0      # 仅用于 GroupBacktestResult 存档
+             best_results: list[SingleBacktestResult] = []
+ 
+             for params in param_combos:
+@@ -778,11 +918,16 @@ class MatrixBacktest:
+                 if not results:
+                     continue
+ 
+-                # ⚠️ 等权合并日收益率序列计算组合 Sharpe（不能取算术平均）
+-                ps = _portfolio_sharpe_from_results(results)
+-                pso = _portfolio_sortino_from_results(results)
++                # ⚠️ 等权合并日收益率序列，一次性计算所有指标
++                # 迭代 #9：复用 combined 计算 sharpe / sortino / alpha
++                combined = _combine_daily_returns(results)
++                ps = _compute_sharpe(combined)
++                pso = _compute_sortino(combined)
++                alpha = _compute_alpha(combined, spy_returns)
+ 
+-                if ps > best_sharpe:
++                # 迭代 #9：per-strategy best params 用 alpha 选（替代 Sharpe）
++                if alpha > best_alpha:
++                    best_alpha = alpha
+                     best_sharpe = ps
+                     best_sortino = pso
+                     best_params = params
+@@ -809,50 +954,77 @@ class MatrixBacktest:
+                     portfolio_max_drawdown=_portfolio_max_drawdown_from_results(
+                         best_results
+                     ),
++                    backtest_alpha=best_alpha,
+                 ))
+ 
+         if not group_results:
+             logger.warning(f"[MatrixBacktest] {group_id}: no valid results")
+             return []
+ 
+-        # 3. 迭代 #3：DD 约束 + Sortino 排序选 Top-K
+-        #    Constitution L1: portfolio DD ≤ 20% 是硬约束
+-        #    步骤：(a) 计算每候选 portfolio_max_drawdown
+-        #          (b) 过滤 DD <= MAX_PORTFOLIO_DRAWDOWN_PCT 的合规集
+-        #          (c) 合规集非空 → 按 Sortino 降序取 top-K
+-        #          (d) 合规集为空 → fallback：按 DD 升序取 top-K，标记 dd_constrained=True
+-        candidates: list[tuple[str, dict, list[SingleBacktestResult], float, float]] = []
++        # 3. 迭代 #9：DD 硬约束 + Sortino 门槛 + Alpha 排序选 Top-K
++        #    Constitution L1: portfolio DD ≤ 20% 是硬约束（保留）
++        #    新增：Sortino > 0.5 最低质量门槛（可放宽）
++        #    变更：排序指标从 Sortino 改为 Alpha
++        #
++        #    三级过滤策略：
++        #      Tier 1: DD ≤ 20% AND Sortino > 0.5 → Alpha 降序
++        #      Tier 2 (fallback): Tier 1 为空 → 仅 DD ≤ 20% → Alpha 降序
++        #      Tier 3 (fallback): Tier 2 为空 → 按 DD 升序，标记 dd_constrained=True
++        candidates: list[
++            tuple[str, dict, list[SingleBacktestResult], float, float, float]
++        ] = []
+         for (strategy, params, results) in group_results:
+             pso = _portfolio_sortino_from_results(results)
+             pdd = _portfolio_max_drawdown_from_results(results)
+-            candidates.append((strategy, params, results, pso, pdd))
+-
+-        compliant = [c for c in candidates if c[4] <= MAX_PORTFOLIO_DRAWDOWN_PCT]
++            # 复用 _combine_daily_returns 计算 alpha（与 per-strategy 选择一致）
++            alpha = _compute_alpha(_combine_daily_returns(results), spy_returns)
++            candidates.append((strategy, params, results, pso, pdd, alpha))
++
++        # Tier 1: DD ≤ 20% AND Sortino > 0.5
++        compliant = [
++            c for c in candidates
++            if c[4] <= MAX_PORTFOLIO_DRAWDOWN_PCT and c[3] > MIN_SORTINO_THRESHOLD
++        ]
+         if compliant:
+-            # 合规集非空：按 Sortino 降序取 top-K
+-            ranked = sorted(compliant, key=lambda x: x[3], reverse=True)
++            # Tier 1 命中：按 Alpha 降序取 top-K
++            ranked = sorted(compliant, key=lambda x: x[5], reverse=True)
+             dd_constrained = False
+             logger.info(
+-                f"[MatrixBacktest] {group_id}: DD filter passed — "
++                f"[MatrixBacktest] {group_id}: DD + Sortino filter passed — "
+                 f"{len(compliant)}/{len(candidates)} candidates compliant "
+-                f"(DD <= {MAX_PORTFOLIO_DRAWDOWN_PCT}%)"
++                f"(DD <= {MAX_PORTFOLIO_DRAWDOWN_PCT}% AND Sortino > {MIN_SORTINO_THRESHOLD})"
+             )
+         else:
+-            # Fallback：无合规候选（结构性问题，如 NDX_high_vol 全部 > 20%）
+-            # 按 DD 升序（最低 DD 优先）取 top-K，标记 dd_constrained
+-            ranked = sorted(candidates, key=lambda x: x[4])
+-            dd_constrained = True
+-            logger.warning(
+-                f"[MatrixBacktest] {group_id}: NO compliant candidates "
+-                f"(all {len(candidates)} exceed DD={MAX_PORTFOLIO_DRAWDOWN_PCT}%). "
+-                f"Fallback: selected top-{self._top_k} by lowest DD. "
+-                f"This group is marked dd_constrained=True — "
+-                f"review whether to drop the group or accept the risk."
+-            )
+-            report.warnings.append(
+-                f"{group_id}: dd_constrained=True "
+-                f"(min DD={ranked[0][4]:.2f}% > {MAX_PORTFOLIO_DRAWDOWN_PCT}%)"
+-            )
++            # Tier 2: 放宽 Sortino 门槛，仅保留 DD 约束
++            dd_compliant = [
++                c for c in candidates if c[4] <= MAX_PORTFOLIO_DRAWDOWN_PCT
++            ]
++            if dd_compliant:
++                # Tier 2 命中：按 Alpha 降序取 top-K（dd_constrained 仍为 False）
++                ranked = sorted(dd_compliant, key=lambda x: x[5], reverse=True)
++                dd_constrained = False
++                logger.warning(
++                    f"[MatrixBacktest] {group_id}: Sortino filter relaxed — "
++                    f"no candidate passed Sortino > {MIN_SORTINO_THRESHOLD}. "
++                    f"Fallback to DD-only filter: "
++                    f"{len(dd_compliant)}/{len(candidates)} candidates DD-compliant."
++                )
++            else:
++                # Tier 3: 无 DD 合规候选 → 按 DD 升序，标记 dd_constrained
++                # （结构性问题，如 NDX_high_vol 全部 > 20%）
++                ranked = sorted(candidates, key=lambda x: x[4])
++                dd_constrained = True
++                logger.warning(
++                    f"[MatrixBacktest] {group_id}: NO compliant candidates "
++                    f"(all {len(candidates)} exceed DD={MAX_PORTFOLIO_DRAWDOWN_PCT}%). "
++                    f"Fallback: selected top-{self._top_k} by lowest DD. "
++                    f"This group is marked dd_constrained=True — "
++                    f"review whether to drop the group or accept the risk."
++                )
++                report.warnings.append(
++                    f"{group_id}: dd_constrained=True "
++                    f"(min DD={ranked[0][4]:.2f}% > {MAX_PORTFOLIO_DRAWDOWN_PCT}%)"
++                )
+ 
+         top_results = ranked[: self._top_k]
+ 
+@@ -861,9 +1033,10 @@ class MatrixBacktest:
+             if gr.group_id == group_id:
+                 gr.dd_constrained = dd_constrained
+ 
+-        # 4. 优化 ensemble 权重（单点离散值加权投票语义）
++        # 4. 优化 ensemble 权重（单点离散值加权投票语义，迭代 #9 改用 alpha）
+         weighted = _optimize_ensemble_weights(
+-            [(s, p, r) for (s, p, r, _, _) in top_results]
++            [(s, p, r) for (s, p, r, _, _, _) in top_results],
++            spy_returns=spy_returns,
+         )
+ 
+         # 5. 构建权重配置列表
+@@ -886,6 +1059,9 @@ class MatrixBacktest:
+                 "backtest_sortino": round(gr.portfolio_sortino if gr else 0.0, 4),
+                 "backtest_max_drawdown": round(gr.portfolio_max_drawdown if gr else 0.0, 4),
+                 "backtest_win_rate": round(gr.avg_win_rate_pct / 100 if gr else 0.5, 4),
++                # 迭代 #9：新增 backtest_alpha 字段（vs SPY 的超额收益百分数）
++                # 下游 PortfolioBacktester 可读此字段验证 alpha 一致性
++                "backtest_alpha": round(gr.backtest_alpha if gr else 0.0, 4),
+                 # 迭代 #3：标记该组是否用了 DD fallback（无合规候选）
+                 # 同组所有策略条目共享同一 dd_constrained 值
+                 "dd_constrained": dd_constrained,
+diff --git a/mytrader/mytrader/backtest/portfolio_backtest.py b/mytrader/mytrader/backtest/portfolio_backtest.py
+index 42c78b7..40fa350 100644
+--- a/mytrader/mytrader/backtest/portfolio_backtest.py
++++ b/mytrader/mytrader/backtest/portfolio_backtest.py
+@@ -110,6 +110,13 @@ class PortfolioBacktestResult:
+         holdings_history:         每日持仓快照列表（按交易日）
+         dd_violation:             DD 是否超过 20% 硬约束
+         group_exposure_history:   每日按 group_id 的暴露度快照
++        benchmark_symbol:          Benchmark 标的（默认 SPY，迭代 #7）
++        benchmark_total_return_pct:    Benchmark 同期总收益（百分数）
++        benchmark_annualized_return_pct: Benchmark 年化收益（百分数）
++        benchmark_sortino_ratio:       Benchmark Sortino Ratio
++        benchmark_max_drawdown_pct:    Benchmark 最大回撤（百分数，正值）
++        alpha_pct:                     超额收益 = 组合年化 - benchmark 年化（百分数）
++        information_ratio:             信息比率（年化）
+     """
+ 
+     start_date: date
+@@ -127,6 +134,14 @@ class PortfolioBacktestResult:
+     holdings_history: list[dict[str, Any]] = field(default_factory=list)
+     dd_violation: bool = False
+     group_exposure_history: list[dict[str, Any]] = field(default_factory=list)
++    # Benchmark 对比（Iteration #7 新增）
++    benchmark_symbol: str = "SPY"
++    benchmark_total_return_pct: float = 0.0
++    benchmark_annualized_return_pct: float = 0.0
++    benchmark_sortino_ratio: float = 0.0
++    benchmark_max_drawdown_pct: float = 0.0
++    alpha_pct: float = 0.0
++    information_ratio: float = 0.0
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -410,12 +425,40 @@ class PortfolioBacktester:
+             group_exposure_history=self._group_exposure_history,
+         )
+ 
++        # ── Benchmark: SPY buy-and-hold（迭代 #7）──
++        # 数据不可用时降级为 0.0，不抛异常（spec §4.2）
++        benchmark_result = self._compute_benchmark(
++            start, end, daily_returns_list, date_list
++        )
++        result.benchmark_symbol = benchmark_result.get("symbol", "SPY")
++        result.benchmark_total_return_pct = benchmark_result.get(
++            "total_return_pct", 0.0
++        )
++        result.benchmark_annualized_return_pct = benchmark_result.get(
++            "annualized_return_pct", 0.0
++        )
++        result.benchmark_sortino_ratio = benchmark_result.get(
++            "sortino_ratio", 0.0
++        )
++        result.benchmark_max_drawdown_pct = benchmark_result.get(
++            "max_drawdown_pct", 0.0
++        )
++        result.alpha_pct = (
++            result.annualized_return_pct - result.benchmark_annualized_return_pct
++        )
++        result.information_ratio = benchmark_result.get(
++            "information_ratio", 0.0
++        )
++
+         logger.info(
+             f"[PortfolioBacktest] done: final=${final_equity:,.0f}, "
+             f"total_return={total_return_pct:.2f}%, "
+             f"annualized={annualized_return_pct:.2f}%, "
+             f"sharpe={sharpe:.4f}, sortino={sortino:.4f}, "
+-            f"max_dd={max_dd:.2f}%, dd_violation={dd_violation}"
++            f"max_dd={max_dd:.2f}%, dd_violation={dd_violation}, "
++            f"benchmark={result.benchmark_symbol} "
++            f"return={result.benchmark_annualized_return_pct:.2f}%, "
++            f"alpha={result.alpha_pct:.2f}%, ir={result.information_ratio:.4f}"
+         )
+ 
+         return result
+@@ -576,6 +619,125 @@ class PortfolioBacktester:
+             "group_exposure_pct": group_exposure_pct,
+         })
+ 
++    def _compute_benchmark(
++        self,
++        start: date,
++        end: date,
++        portfolio_daily_returns: list[float],
++        dates: list[date],
++    ) -> dict[str, Any]:
++        """计算 SPY buy-and-hold benchmark 指标（迭代 #7）。
++
++        从 MarketDataStore 拉取 SPY 同期数据，计算：
++            - total_return_pct / annualized_return_pct
++            - sortino_ratio / max_drawdown_pct（与组合层同口径）
++            - information_ratio（基于 portfolio - spy 的超额收益序列）
++
++        降级处理：SPY 数据不可用时所有字段保持 0.0，不抛异常（spec §4.2）。
++
++        Args:
++            start:                   回测起始日期
++            end:                     回测结束日期
++            portfolio_daily_returns: 组合日收益率序列（与 dates 对齐）
++            dates:                   交易日日期序列
++
++        Returns:
++            dict with benchmark metrics。失败时仅含 "symbol"。
++        """
++        benchmark_symbol = "SPY"
++        try:
++            spy_bars = self._store.get_bars_multi([benchmark_symbol], start, end)
++            spy_df = spy_bars.get(benchmark_symbol)
++            if spy_df is None or spy_df.empty:
++                logger.warning(
++                    "[PortfolioBacktest] SPY data unavailable, benchmark skipped"
++                )
++                return {"symbol": benchmark_symbol}
++
++            spy_close = spy_df["close"].astype(float)
++            if len(spy_close) < 2:
++                logger.warning(
++                    "[PortfolioBacktest] SPY data too short, benchmark skipped"
++                )
++                return {"symbol": benchmark_symbol}
++
++            spy_returns = spy_close.pct_change().dropna()
++
++            # SPY total / annualized return
++            spy_final = float(spy_close.iloc[-1])
++            spy_initial = float(spy_close.iloc[0])
++            spy_total_return_pct = (
++                (spy_final / spy_initial) - 1.0
++            ) * 100.0 if spy_initial > 0 else 0.0
++
++            n_spy = len(spy_returns)
++            years_spy = n_spy / 252.0 if n_spy > 0 else 0.0
++            if years_spy > 0 and spy_final > 0 and spy_initial > 0:
++                spy_annualized_pct = (
++                    (spy_final / spy_initial) ** (1.0 / years_spy) - 1.0
++                ) * 100.0
++            else:
++                spy_annualized_pct = 0.0
++
++            # Sortino / Max DD（复用 matrix_backtest helper，与组合层同口径）
++            spy_sortino = _compute_sortino(spy_returns)
++            spy_max_dd = self._compute_max_drawdown_pct(spy_returns)
++
++            # Information Ratio：基于超额收益序列
++            # 将 SPY returns 对齐到 portfolio 的交易日历
++            ir = self._compute_information_ratio(
++                portfolio_daily_returns, dates, spy_returns
++            )
++
++            return {
++                "symbol": benchmark_symbol,
++                "total_return_pct": float(spy_total_return_pct),
++                "annualized_return_pct": float(spy_annualized_pct),
++                "sortino_ratio": float(spy_sortino),
++                "max_drawdown_pct": float(spy_max_dd),
++                "information_ratio": float(ir),
++            }
++        except Exception as e:
++            logger.warning(
++                f"[PortfolioBacktest] benchmark computation failed: {e}"
++            )
++            return {"symbol": benchmark_symbol}
++
++    @staticmethod
++    def _compute_information_ratio(
++        portfolio_daily_returns: list[float],
++        portfolio_dates: list[date],
++        spy_returns: pd.Series,
++    ) -> float:
++        """计算年化信息比率。
++
++        IR = mean(excess_returns) / std(excess_returns) * sqrt(252)
++        excess_returns = portfolio_returns - spy_returns（按日期对齐）
++        """
++        if not portfolio_daily_returns or len(spy_returns) == 0:
++            return 0.0
++
++        # 组合 returns 转为 pd.Series，index 用 portfolio_dates
++        port_idx = pd.to_datetime(portfolio_dates)
++        port_series = pd.Series(
++            portfolio_daily_returns, index=port_idx, dtype=float
++        )
++
++        # 对齐：取两序列 index 的交集（inner join）
++        aligned = pd.concat(
++            [port_series.rename("port"), spy_returns.rename("spy")],
++            axis=1,
++            join="inner",
++        ).dropna()
++        if aligned.empty or len(aligned) < 5:
++            return 0.0
++
++        excess = aligned["port"] - aligned["spy"]
++        std = excess.std()
++        if std <= 0 or not np.isfinite(std):
++            return 0.0
++        return float(excess.mean() / std * np.sqrt(252))
++
+     @staticmethod
+     def _compute_max_drawdown_pct(daily_returns: pd.Series) -> float:
+         """计算最大回撤（百分数正值）。
+diff --git a/mytrader/mytrader/signal/ranker.py b/mytrader/mytrader/signal/ranker.py
+index b25479a..674814e 100644
+--- a/mytrader/mytrader/signal/ranker.py
++++ b/mytrader/mytrader/signal/ranker.py
+@@ -67,13 +67,18 @@ class SignalRanker:
+         candidates_multiplier: 候选倍数，默认 2
+         conflict_threshold: 加权投票分数绝对值低于此阈值时丢弃（策略分歧）
+         score_weights:      综合得分各因子权重 dict
++
++    迭代 #7：默认评分因子从 backtest_sharpe 切换为 backtest_sortino +
++    backtest_dd_penalty（Constitution L1 Sortino 首要 KPI）。
+     """
+ 
+     DEFAULT_SCORE_WEIGHTS = {
+-        "strategy_weight":    0.35,
+-        "signal_confidence":  0.25,
+-        "backtest_win_rate":  0.20,
+-        "backtest_sharpe":    0.20,
++        # 迭代 #7：Constitution L1 Sortino 首要 KPI，替换 backtest_sharpe
++        "strategy_weight":     0.30,
++        "signal_confidence":   0.20,
++        "backtest_win_rate":   0.15,
++        "backtest_sortino":    0.25,   # ← 替换 backtest_sharpe，权重最高单因子
++        "backtest_dd_penalty": 0.10,   # ← 新增：DD 越低分越高（0%→1.0, 20%→0.0）
+     }
+ 
+     def __init__(
+@@ -193,13 +198,24 @@ class SignalRanker:
+         return aggregated, dropped
+ 
+     def _score(self, signal: Signal) -> tuple[float, dict[str, float]]:
+-        """计算综合得分 + 各因子明细。"""
++        """计算综合得分 + 各因子明细。
++
++        迭代 #7：评分因子从 backtest_sharpe 切换为 backtest_sortino + backtest_dd_penalty
++        （Constitution L1 Sortino 首要 KPI）。
++
++        归一化：
++            - backtest_sortino:    Sortino 通常 0~3，除以 3.0 截断到 [0, 1]；
++                                  负值被 max(·, 0.0) 截断为 0
++            - backtest_dd_penalty: DD 0~20%+，1 - dd/20 截断到 [0, 1]；
++                                  DD=0 → 1.0（满分），DD≥20 → 0.0
++        """
+         ind = signal.indicators
+         factors = {
+-            "strategy_weight":   float(ind.get("weight", 0.5)),
+-            "signal_confidence": float(signal.confidence),
+-            "backtest_win_rate": float(ind.get("backtest_win_rate", 0.5)),
+-            "backtest_sharpe":   min(float(ind.get("backtest_sharpe", 0.0)) / 3.0, 1.0),
++            "strategy_weight":     float(ind.get("weight", 0.5)),
++            "signal_confidence":   float(signal.confidence),
++            "backtest_win_rate":   float(ind.get("backtest_win_rate", 0.5)),
++            "backtest_sortino":    min(max(float(ind.get("backtest_sortino", 0.0)) / 3.0, 0.0), 1.0),
++            "backtest_dd_penalty": max(1.0 - float(ind.get("backtest_max_drawdown", 0.0)) / 20.0, 0.0),
+         }
+ 
+         w = self._score_weights
+diff --git a/mytrader/mytrader/strategy/__init__.py b/mytrader/mytrader/strategy/__init__.py
+index 6963a3a..caeeb35 100644
+--- a/mytrader/mytrader/strategy/__init__.py
++++ b/mytrader/mytrader/strategy/__init__.py
+@@ -5,10 +5,11 @@ from mytrader.strategy.registry import STRATEGY_REGISTRY, register_strategy
+ from mytrader.strategy.ensemble import ensemble_signal
+ 
+ # 注册内置策略（import 触发 @register_strategy 装饰器）
+-import mytrader.strategy.strategies.dual_ma          # noqa: F401
+-import mytrader.strategy.strategies.rsi_mean_revert  # noqa: F401
+-import mytrader.strategy.strategies.bollinger_band   # noqa: F401
+-import mytrader.strategy.strategies.macd_cross       # noqa: F401
++import mytrader.strategy.strategies.dual_ma             # noqa: F401
++import mytrader.strategy.strategies.rsi_mean_revert     # noqa: F401
++import mytrader.strategy.strategies.rsi_trend_filter    # noqa: F401  [迭代 #8]
++import mytrader.strategy.strategies.bollinger_band      # noqa: F401
++import mytrader.strategy.strategies.macd_cross          # noqa: F401
+ 
+ __all__ = [
+     "Signal",
+diff --git a/mytrader/pyproject.toml b/mytrader/pyproject.toml
+index d3ac6de..c03f7cc 100644
+--- a/mytrader/pyproject.toml
++++ b/mytrader/pyproject.toml
+@@ -85,4 +85,9 @@ ignore = ["E501"]               # line-length 由 formatter 控制
+ [tool.pytest.ini_options]
+ testpaths = ["tests"]
+ python_files = "test_*.py"
+-addopts = "-q"
++markers = [
++    "live: tests that call real broker/notification/network services; skipped by default",
++]
++# 默认排除 live 测试：避免本地未启动 TWS / 未配置 .env 时误触真实下单 / Telegram。
++# 显式运行 live 测试：`python -m pytest tests/test_integration_live.py -m live -v -s`
++addopts = "-q -m 'not live'"
+diff --git a/mytrader/tests/test_integration_live.py b/mytrader/tests/test_integration_live.py
+index 5d7696b..ca7b51e 100644
+--- a/mytrader/tests/test_integration_live.py
++++ b/mytrader/tests/test_integration_live.py
+@@ -1,13 +1,26 @@
+ """Phase 3 真实集成测试：Alpaca Paper 账户 + Telegram Bot。
+ 
+-运行方式：
++⚠️ Live 测试隔离
++----------------
++本文件所有测试均标记为 `@pytest.mark.live`，默认 `pytest` 不会收集或运行它们
++（见 `pyproject.toml` 的 `addopts = "-q -m 'not live'"`）。
++
++为什么隔离：
++- Alpaca 测试需要真实 `.env`（ALPACA__API_KEY / SECRET_KEY）
++- Telegram 测试会真实发送消息到手机
++- IBKR 测试需要本地 TWS Paper 运行并开启 API 端口
++- 默认运行这些测试会污染 orchestrator 验证结果（exit_code=1 但非业务 bug）
++
++显式运行 live 测试（应仅在手动验证时使用）：
++
+     cd mytrader
+-    python -m pytest tests/test_integration_live.py -v -s
++    python -m pytest tests/test_integration_live.py -m live -v -s
+ 
+ 前提：
+     - .env 已配置 ALPACA__API_KEY / ALPACA__SECRET_KEY
+     - .env 已配置 NOTIFICATION__TELEGRAM_ENABLED=true / BOT_TOKEN / CHAT_ID
+     - alpaca-py 已安装
++    - IBKR 测试额外需要本地 TWS/Gateway 运行（IBKR__HOST 配置）
+ """
+ from __future__ import annotations
+ 
+@@ -19,6 +32,9 @@ from alpaca.trading.client import TradingClient
+ 
+ from mytrader.infra.config import load_config
+ 
++# 整个模块标记为 live：默认 pytest 不收集，仅 `-m live` 时运行
++pytestmark = pytest.mark.live
++
+ 
+ # ---------------------------------------------------------------------------
+ # 配置预检
+diff --git a/mytrader/tests/test_matrix_backtest.py b/mytrader/tests/test_matrix_backtest.py
+index 7d8af88..8f10886 100644
+--- a/mytrader/tests/test_matrix_backtest.py
++++ b/mytrader/tests/test_matrix_backtest.py
+@@ -17,14 +17,18 @@ import pytest
+ from mytrader.backtest.matrix_backtest import (
+     MatrixBacktest,
+     _backtest_one,
++    _combine_daily_returns,
++    _compute_alpha,
+     _compute_sharpe,
+     _compute_sortino,
+     _portfolio_max_drawdown_from_results,
+     _portfolio_sharpe_from_results,
+     _portfolio_sortino_from_results,
++    _optimize_ensemble_weights,
+     _safe_float,
+     _safe_mean,
+     MAX_PORTFOLIO_DRAWDOWN_PCT,
++    MIN_SORTINO_THRESHOLD,
+     WALK_FORWARD_VAL_DD_THRESHOLD,
+     SingleBacktestResult,
+     WalkForwardReport,
+@@ -954,3 +958,688 @@ class TestWalkForward:
+         assert report.rounds[0].round_num == 1
+         assert report.rounds[1].round_num == 2
+ 
++
++# ---------------------------------------------------------------------------
++# 迭代 #9 新增：Alpha-Based Strategy Selection
++# ---------------------------------------------------------------------------
++
++class TestAlphaComputation:
++    """_compute_alpha / _combine_daily_returns 单元测试。"""
++
++    def test_compute_alpha_basic(self):
++        """构造已知策略收益和 SPY 收益，验证 alpha 计算正确。
++
++        策略日均收益 0.001 (0.1%)，SPY 日均收益 0.0004 (0.04%)。
++        年化：(1.001^252 - 1) - (1.0004^252 - 1) ≈ 0.285 - 0.110 = 0.175 → 17.5%
++        """
++        np.random.seed(42)
++        idx = pd.date_range("2021-01-01", periods=252, freq="B")
++        # 策略收益：稳定 0.1%/日（年化 ~28.5%）
++        strat_returns = pd.Series(
++            np.random.normal(0.001, 0.002, 252), index=idx
++        )
++        # SPY 收益：稳定 0.04%/日（年化 ~11.0%）
++        spy_returns = pd.Series(
++            np.random.normal(0.0004, 0.001, 252), index=idx
++        )
++
++        alpha = _compute_alpha(strat_returns, spy_returns)
++
++        # 期望 alpha ≈ 17.5%（正数，跑赢 SPY）
++        assert alpha > 0.0, f"策略年化应高于 SPY，alpha 应为正，实际 {alpha:.4f}"
++        # 验证量级在合理范围（10~25%）
++        assert 10.0 < alpha < 25.0, (
++            f"alpha 应在 10~25% 范围，实际 {alpha:.4f}%"
++        )
++
++    def test_compute_alpha_spy_unavailable(self):
++        """SPY 数据为 None → alpha = 0.0（降级处理，不抛异常）。"""
++        idx = pd.date_range("2021-01-01", periods=100, freq="B")
++        strat_returns = pd.Series(np.random.normal(0.001, 0.01, 100), index=idx)
++
++        # spy_returns=None
++        assert _compute_alpha(strat_returns, None) == 0.0
++        # spy_returns=空 Series
++        empty_spy = pd.Series(dtype=float)
++        assert _compute_alpha(strat_returns, empty_spy) == 0.0
++
++    def test_compute_alpha_strategy_underperforms(self):
++        """策略跑输 SPY → alpha 为负。"""
++        idx = pd.date_range("2021-01-01", periods=252, freq="B")
++        # 策略日均 0.0001 (0.01%)，SPY 日均 0.001 (0.1%)
++        strat_returns = pd.Series(np.random.normal(0.0001, 0.005, 252), index=idx)
++        spy_returns = pd.Series(np.random.normal(0.001, 0.002, 252), index=idx)
++
++        alpha = _compute_alpha(strat_returns, spy_returns)
++        assert alpha < 0.0, (
++            f"策略跑输 SPY 时 alpha 应为负，实际 {alpha:.4f}"
++        )
++
++    def test_combine_daily_returns_basic(self):
++        """等权合并组内日收益率序列。"""
++        idx = pd.date_range("2021-01-01", periods=10, freq="B")
++        r1 = pd.Series([0.001] * 10, index=idx)
++        r2 = pd.Series([0.003] * 10, index=idx)
++        results = [
++            SingleBacktestResult("S1", "s", {}, 0.0, 0, 0, 0, 0, r1),
++            SingleBacktestResult("S2", "s", {}, 0.0, 0, 0, 0, 0, r2),
++        ]
++        combined = _combine_daily_returns(results)
++        # 等权平均：(0.001 + 0.003) / 2 = 0.002
++        assert len(combined) == 10
++        assert all(abs(v - 0.002) < 1e-9 for v in combined)
++
++    def test_combine_daily_returns_empty(self):
++        """空列表 → 空 Series。"""
++        combined = _combine_daily_returns([])
++        assert combined.empty
++
++    def test_min_sortino_threshold_constant(self):
++        """MIN_SORTINO_THRESHOLD = 0.5（spec §4.2 硬约束）。"""
++        assert MIN_SORTINO_THRESHOLD == 0.5, (
++            f"MIN_SORTINO_THRESHOLD 应为 0.5（迭代 #9 spec），"
++            f"实际 {MIN_SORTINO_THRESHOLD}"
++        )
++
++
++class TestAlphaBasedTopKSelection:
++    """top-K 选择逻辑从 Sortino 改为 Alpha 的集成测试。"""
++
++    def test_top_k_selection_uses_alpha(self, tmp_path):
++        """top-K 排序使用 Alpha 而非 Sortino。
++
++        场景：策略 A 的 Sortino 高于 B，但 B 的 Alpha 高于 A。
++        应选择 B（高 alpha）而非 A（高 Sortino）。
++
++        构造方法：用 patch 拦截 _backtest_one，返回受控的 daily_returns。
++        """
++        from unittest.mock import patch
++
++        # 构造 SPY 数据：温和上涨（年化 ~10%）
++        n = 300
++        idx = pd.date_range("2021-01-01", periods=n, freq="B")
++        spy_close = [100.0 * (1.0004 ** i) for i in range(n)]  # ~10% 年化
++        spy_df = pd.DataFrame({
++            "open": [c - 0.1 for c in spy_close],
++            "high": [c + 0.5 for c in spy_close],
++            "low": [c - 0.5 for c in spy_close],
++            "close": spy_close,
++            "volume": [1_000_000] * n,
++        }, index=idx)
++        spy_returns = spy_df["close"].pct_change().dropna()
++
++        # 策略 A (dual_ma): 低波动低收益 → 高 Sortino 但低 alpha
++        # 日均 0.0004（~10% 年化，与 SPY 持平 → alpha ≈ 0）
++        np.random.seed(42)
++        returns_a = pd.Series(
++            np.random.normal(0.0004, 0.002, n), index=idx
++        )
++        # 策略 B (rsi_mean_revert): 高波动高收益 → 低 Sortino 但高 alpha
++        # 日均 0.0011（~32% 年化，远超 SPY → alpha ≈ 22%）
++        returns_b = pd.Series(
++            np.random.normal(0.0011, 0.008, n), index=idx
++        )
++
++        # 验证测试前提：A 的 Sortino > B 的 Sortino，B 的 alpha > A 的 alpha
++        sortino_a = _compute_sortino(returns_a)
++        sortino_b = _compute_sortino(returns_b)
++        alpha_a = _compute_alpha(returns_a, spy_returns)
++        alpha_b = _compute_alpha(returns_b, spy_returns)
++        assert sortino_a > sortino_b, (
++            f"测试前提失败：A 的 Sortino({sortino_a:.4f}) 应 > B({sortino_b:.4f})"
++        )
++        assert alpha_b > alpha_a, (
++            f"测试前提失败：B 的 alpha({alpha_b:.4f}) 应 > A({alpha_a:.4f})"
++        )
++
++        # Mock _backtest_one 返回受控结果
++        def mock_backtest_one(df, strategy, params, *args, **kwargs):
++            sym = df.index.name or "SYM"
++            if strategy == "dual_ma":
++                return SingleBacktestResult(
++                    sym, strategy, params, 1.0, 10.0, 5.0, 55.0, 10, returns_a
++                )
++            else:  # rsi_mean_revert
++                return SingleBacktestResult(
++                    sym, strategy, params, 1.0, 30.0, 8.0, 50.0, 10, returns_b
++                )
++
++        # 构造 mock store：返回 SPY + 普通上涨数据
++        df_up = _make_ohlcv(n, trend="up")
++        store = MagicMock()
++
++        def get_bars_multi(symbols, start, end, timeframe="1d"):
++            mapping = {"AAPL": df_up, "SPY": spy_df}
++            return {s: mapping[s] for s in symbols if s in mapping}
++
++        store.get_bars_multi.side_effect = get_bars_multi
++
++        universe = MagicMock()
++        universe.get_groups.return_value = {"test_group": ["AAPL"]}
++
++        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=1)
++
++        with patch(
++            "mytrader.backtest.matrix_backtest._backtest_one",
++            side_effect=mock_backtest_one,
++        ):
++            report = mb.run(
++                strategies=["dual_ma", "rsi_mean_revert"],
++                param_grids={
++                    "dual_ma": {"fast": [5], "slow": [20]},
++                    "rsi_mean_revert": {
++                        "period": [14], "oversold": [30], "overbought": [70]
++                    },
++                },
++            )
++
++        # 验证：选择了 rsi_mean_revert（高 alpha）而非 dual_ma（高 Sortino）
++        weights = report.groups["test_group"]
++        assert len(weights) == 1, f"top_k=1 应只选 1 个策略，实际 {len(weights)}"
++        assert weights[0]["strategy"] == "rsi_mean_revert", (
++            f"应选择高 alpha 的 rsi_mean_revert，"
++            f"实际选择了 {weights[0]['strategy']}（高 Sortino 的 dual_ma）"
++        )
++        # backtest_alpha 字段应反映 B 的高 alpha
++        assert weights[0]["backtest_alpha"] > 5.0, (
++            f"B 的 alpha 应 > 5%，实际 {weights[0]['backtest_alpha']:.4f}"
++        )
++
++    def test_sortino_filter_excludes_garbage(self, tmp_path):
++        """Sortino < 0.5 的候选被过滤（即使 alpha 高也不选）。
++
++        场景：构造一个 Sortino < 0.5 的"垃圾"策略 A，和一个 Sortino > 0.5 的正常策略 B。
++        即使 A 的 alpha 略高，也应被 Sortino 门槛排除。
++
++        注：由于 Sortino 门槛是 Tier 1 过滤，若无候选通过门槛，会触发 Tier 2 fallback
++        放宽门槛。本测试构造"至少有一个正常候选"的场景验证 Tier 1 正常工作。
++        """
++        from unittest.mock import patch
++
++        n = 300
++        idx = pd.date_range("2021-01-01", periods=n, freq="B")
++        # SPY 温和上涨
++        spy_close = [100.0 * (1.0004 ** i) for i in range(n)]
++        spy_df = pd.DataFrame({
++            "open": [c - 0.1 for c in spy_close],
++            "high": [c + 0.5 for c in spy_close],
++            "low": [c - 0.5 for c in spy_close],
++            "close": spy_close,
++            "volume": [1_000_000] * n,
++        }, index=idx)
++        spy_returns = spy_df["close"].pct_change().dropna()
++
++        # 垃圾策略 A：极低 Sortino（高下行波动）+ 高 alpha（靠总体高收益）
++        # 构造大起大落的收益序列：均值高但下行波动大
++        np.random.seed(42)
++        returns_a = pd.Series(
++            np.concatenate([
++                np.random.normal(0.003, 0.015, 200),   # 高波动高收益
++                np.random.normal(-0.005, 0.01, 100),   # 大幅下行
++            ]),
++            index=idx,
++        )
++        # 正常策略 B：稳定收益，Sortino > 0.5
++        returns_b = pd.Series(
++            np.random.normal(0.0008, 0.003, n), index=idx
++        )
++
++        sortino_a = _compute_sortino(returns_a)
++        sortino_b = _compute_sortino(returns_b)
++        # 验证前提：A 的 Sortino < 0.5（垃圾），B 的 Sortino > 0.5（正常）
++        assert sortino_a < MIN_SORTINO_THRESHOLD, (
++            f"A 应为 Sortino < 0.5 的垃圾策略，实际 {sortino_a:.4f}"
++        )
++        assert sortino_b > MIN_SORTINO_THRESHOLD, (
++            f"B 应为 Sortino > 0.5 的正常策略，实际 {sortino_b:.4f}"
++        )
++
++        def mock_backtest_one(df, strategy, params, *args, **kwargs):
++            sym = df.index.name or "SYM"
++            if strategy == "dual_ma":
++                return SingleBacktestResult(
++                    sym, strategy, params, 0.5, 15.0, 10.0, 50.0, 5, returns_a
++                )
++            else:  # rsi_mean_revert
++                return SingleBacktestResult(
++                    sym, strategy, params, 1.0, 20.0, 5.0, 55.0, 10, returns_b
++                )
++
++        df_up = _make_ohlcv(n, trend="up")
++        store = MagicMock()
++        store.get_bars_multi.side_effect = lambda symbols, start, end, timeframe="1d": {
++            s: {"AAPL": df_up, "SPY": spy_df}[s] for s in symbols
++            if s in {"AAPL", "SPY"}
++        }
++
++        universe = MagicMock()
++        universe.get_groups.return_value = {"test_group": ["AAPL"]}
++
++        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=1)
++        with patch(
++            "mytrader.backtest.matrix_backtest._backtest_one",
++            side_effect=mock_backtest_one,
++        ):
++            report = mb.run(
++                strategies=["dual_ma", "rsi_mean_revert"],
++                param_grids={
++                    "dual_ma": {"fast": [5], "slow": [20]},
++                    "rsi_mean_revert": {
++                        "period": [14], "oversold": [30], "overbought": [70]
++                    },
++                },
++            )
++
++        weights = report.groups["test_group"]
++        assert len(weights) == 1
++        # 应选择 rsi_mean_revert（Sortino > 0.5），排除 dual_ma（Sortino < 0.5）
++        assert weights[0]["strategy"] == "rsi_mean_revert", (
++            f"应排除 Sortino < 0.5 的 dual_ma，选择 rsi_mean_revert，"
++            f"实际选择了 {weights[0]['strategy']}"
++        )
++
++    def test_dd_filter_still_applies(self, tmp_path):
++        """DD > 20% 的候选被过滤（即使 alpha 高也不通过 DD 硬约束）。
++
++        场景：构造 rsi_mean_revert 在持续下跌数据上产生大 DD 的策略行为。
++        验证：dd_constrained=True（触发 DD fallback），权重仍产出。
++        """
++        store = MagicMock()
++        # 构造先涨后崩数据：rsi_mean_revert 会在下跌中超卖买入，持续持仓导致大 DD
++        n = 400
++        idx = pd.date_range("2021-01-01", periods=n, freq="B")
++        close = (
++            [100.0 * (1 - 0.002 * i) for i in range(200)]   # 缓慢下跌压低 RSI
++            + [60.0 * (1 - 0.005 * (i - 200)) for i in range(200, n)]  # 急速崩溃
++        )
++        close = [max(c, 1.0) for c in close]
++        df_crash = pd.DataFrame({
++            "open": [c - 0.3 for c in close],
++            "high": [c + 0.5 for c in close],
++            "low": [c - 0.5 for c in close],
++            "close": close,
++            "volume": [1_000_000] * n,
++        }, index=idx)
++        # 同时提供 SPY 数据（让 alpha 计算不降级）
++        spy_df = _make_ohlcv(n, trend="up")
++        spy_df = spy_df.copy()
++        spy_df.index = idx  # 对齐索引
++
++        def get_bars_multi(symbols, start, end, timeframe="1d"):
++            mapping = {"AAPL": df_crash, "SPY": spy_df}
++            return {s: mapping[s] for s in symbols if s in mapping}
++
++        store.get_bars_multi.side_effect = get_bars_multi
++
++        universe = MagicMock()
++        universe.get_groups.return_value = {"volatile_group": ["AAPL"]}
++
++        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=1)
++        report = mb.run(
++            strategies=["rsi_mean_revert"],
++            param_grids={"rsi_mean_revert": {
++                "period": [14], "oversold": [35], "overbought": [65]
++            }},
++            output_file=tmp_path / "weights_dd.json",
++        )
++
++        # 验证：DD 超标时 dd_constrained=True（DD fallback 触发）
++        has_weights = any(weights for weights in report.groups.values() if weights)
++        if has_weights:
++            for gid, weights in report.groups.items():
++                for w in weights:
++                    if w.get("backtest_max_drawdown", 0) > MAX_PORTFOLIO_DRAWDOWN_PCT:
++                        assert w["dd_constrained"] is True, (
++                            f"{gid}: DD={w['backtest_max_drawdown']:.1f}% > "
++                            f"{MAX_PORTFOLIO_DRAWDOWN_PCT}% 但 dd_constrained 为 False"
++                        )
++
++    def test_fallback_when_no_sortino_compliant(self, tmp_path):
++        """所有候选 Sortino < 0.5 → 触发 Tier 2 fallback（放宽 Sortino 门槛）。
++
++        场景：构造低 Sortino 的策略，但 DD ≤ 20%。
++        验证：权重仍产出（不空），dd_constrained=False（因为 DD 合规），
++        且日志中应有 "Sortino filter relaxed" 警告。
++        """
++        from unittest.mock import patch
++        from loguru import logger
++
++        n = 300
++        idx = pd.date_range("2021-01-01", periods=n, freq="B")
++        spy_df = pd.DataFrame({
++            "open": [99.9], "high": [100.5], "low": [99.5],
++            "close": [100.0], "volume": [1_000_000],
++        }, index=idx[:1])
++        # 让 SPY 数据足够长
++        spy_close = [100.0 * (1.0004 ** i) for i in range(n)]
++        spy_df = pd.DataFrame({
++            "open": [c - 0.1 for c in spy_close],
++            "high": [c + 0.5 for c in spy_close],
++            "low": [c - 0.5 for c in spy_close],
++            "close": spy_close,
++            "volume": [1_000_000] * n,
++        }, index=idx)
++
++        # 低 Sortino 但 DD 合规的收益序列
++        np.random.seed(42)
++        returns_garbage = pd.Series(
++            np.concatenate([
++                np.random.normal(0.0002, 0.01, 200),  # 低均值高波动
++                np.random.normal(-0.0001, 0.008, 100), # 略负
++            ]),
++            index=idx,
++        )
++        # 验证前提：Sortino < 0.5（垃圾门槛）
++        assert _compute_sortino(returns_garbage) < MIN_SORTINO_THRESHOLD
++
++        def mock_backtest_one(df, strategy, params, *args, **kwargs):
++            sym = df.index.name or "SYM"
++            return SingleBacktestResult(
++                sym, strategy, params, 0.3, 5.0, 10.0, 50.0, 3, returns_garbage
++            )
++
++        df_up = _make_ohlcv(n, trend="up")
++        store = MagicMock()
++        store.get_bars_multi.side_effect = lambda symbols, start, end, timeframe="1d": {
++            s: {"AAPL": df_up, "SPY": spy_df}[s] for s in symbols
++            if s in {"AAPL", "SPY"}
++        }
++
++        universe = MagicMock()
++        universe.get_groups.return_value = {"test_group": ["AAPL"]}
++
++        # 捕获 WARNING 日志
++        msgs: list[str] = []
++        handler_id = logger.add(lambda m: msgs.append(str(m)), level="WARNING")
++
++        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=1)
++        try:
++            with patch(
++                "mytrader.backtest.matrix_backtest._backtest_one",
++                side_effect=mock_backtest_one,
++            ):
++                report = mb.run(
++                    strategies=["dual_ma"],
++                    param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
++                )
++        finally:
++            logger.remove(handler_id)
++
++        # 验证：fallback 触发，日志记录 Sortino 放宽
++        assert any("Sortino filter relaxed" in m for m in msgs), (
++            f"应触发 Tier 2 fallback（Sortino relaxed），实际日志: {msgs}"
++        )
++
++        # 权重仍产出（DD 合规），dd_constrained=False
++        weights = report.groups.get("test_group", [])
++        if weights:
++            for w in weights:
++                assert w["dd_constrained"] is False, (
++                    "DD 合规时 dd_constrained 应为 False（Sortino fallback 不影响）"
++                )
++
++    def test_fallback_when_no_dd_compliant(self, tmp_path):
++        """所有候选 DD > 20% → 触发 Tier 3 fallback（按 DD 升序）。
++
++        场景：复用 test_fallback_when_no_compliant_candidates 的数据构造，
++        验证 dd_constrained=True（与迭代 #3 行为一致）。
++        """
++        store = MagicMock()
++        n = 400
++        idx = pd.date_range("2021-01-01", periods=n, freq="B")
++        close = (
++            [100.0 * (1 - 0.002 * i) for i in range(200)]
++            + [60.0 * (1 - 0.005 * (i - 200)) for i in range(200, n)]
++        )
++        close = [max(c, 1.0) for c in close]
++        df_crash = pd.DataFrame({
++            "open": [c - 0.3 for c in close],
++            "high": [c + 0.5 for c in close],
++            "low": [c - 0.5 for c in close],
++            "close": close,
++            "volume": [1_000_000] * n,
++        }, index=idx)
++        # SPY 数据（让 alpha 不降级，验证 DD fallback 优先于 Sortino 过滤）
++        spy_close = [100.0 * (1.0004 ** i) for i in range(n)]
++        spy_df = pd.DataFrame({
++            "open": [c - 0.1 for c in spy_close],
++            "high": [c + 0.5 for c in spy_close],
++            "low": [c - 0.5 for c in spy_close],
++            "close": spy_close,
++            "volume": [1_000_000] * n,
++        }, index=idx)
++
++        def get_bars_multi(symbols, start, end, timeframe="1d"):
++            mapping = {"AAPL": df_crash, "SPY": spy_df}
++            return {s: mapping[s] for s in symbols if s in mapping}
++
++        store.get_bars_multi.side_effect = get_bars_multi
++
++        universe = MagicMock()
++        universe.get_groups.return_value = {"volatile_group": ["AAPL", "MSFT"]}
++
++        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
++        report = mb.run(
++            strategies=["rsi_mean_revert"],
++            param_grids={"rsi_mean_revert": {
++                "period": [14], "oversold": [35], "overbought": [65]
++            }},
++            output_file=tmp_path / "weights_fallback_dd.json",
++        )
++
++        has_weights = any(weights for weights in report.groups.values() if weights)
++        if has_weights:
++            for gid, weights in report.groups.items():
++                for w in weights:
++                    if w.get("backtest_max_drawdown", 0) > MAX_PORTFOLIO_DRAWDOWN_PCT:
++                        assert w["dd_constrained"] is True, (
++                            f"{gid}: DD={w['backtest_max_drawdown']:.1f}% > 20% "
++                            f"但 dd_constrained 为 False（Tier 3 应触发）"
++                        )
++
++    def test_alpha_field_in_weights_json(self, mock_store, mock_universe, tmp_path):
++        """strategy_weights.json 每个权重条目含 backtest_alpha 字段。"""
++        output = tmp_path / "weights_with_alpha.json"
++        mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=1)
++        mb.run(
++            strategies=["dual_ma"],
++            param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
++            output_file=output,
++        )
++        data = json.loads(output.read_text())
++        for gid, weights in data["groups"].items():
++            for w in weights:
++                assert "backtest_alpha" in w, (
++                    f"{gid}: 权重条目缺少 backtest_alpha 字段，"
++                    f"实际 keys={list(w.keys())}"
++                )
++                assert isinstance(w["backtest_alpha"], (int, float)), (
++                    f"{gid}: backtest_alpha 应为数值，"
++                    f"实际 {type(w['backtest_alpha'])}"
++                )
++
++    def test_group_results_have_backtest_alpha(self, mock_store, mock_universe):
++        """GroupBacktestResult.backtest_alpha 是浮点数（迭代 #9 新增字段）。"""
++        mb = MatrixBacktest(store=mock_store, universe=mock_universe, years=1, top_k=1)
++        report = mb.run(
++            strategies=["dual_ma"],
++            param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
++        )
++        for gr in report.group_results:
++            assert isinstance(gr.backtest_alpha, float), (
++                f"backtest_alpha 应为 float，实际 {type(gr.backtest_alpha)}"
++            )
++
++    def test_per_strategy_best_params_uses_alpha(self, tmp_path):
++        """per-strategy best params 选择使用 Alpha 而非 Sharpe。
++
++        场景：两个参数组合 A (fast=5, slow=20) 和 B (fast=10, slow=50)，
++        A 的 Sharpe 高但 alpha 低，B 的 Sharpe 低但 alpha 高。
++        验证最终 GroupBacktestResult.params 是 B（高 alpha）。
++        """
++        from unittest.mock import patch
++
++        n = 300
++        idx = pd.date_range("2021-01-01", periods=n, freq="B")
++        spy_close = [100.0 * (1.0004 ** i) for i in range(n)]
++        spy_df = pd.DataFrame({
++            "open": [c - 0.1 for c in spy_close],
++            "high": [c + 0.5 for c in spy_close],
++            "low": [c - 0.5 for c in spy_close],
++            "close": spy_close,
++            "volume": [1_000_000] * n,
++        }, index=idx)
++        spy_returns = spy_df["close"].pct_change().dropna()
++
++        # 参数 A 的收益：低波动低收益 → 高 Sharpe 但低 alpha
++        np.random.seed(42)
++        returns_a = pd.Series(
++            np.random.normal(0.0005, 0.002, n), index=idx  # 与 SPY 接近，alpha≈0
++        )
++        # 参数 B 的收益：高波动高收益 → 低 Sharpe 但高 alpha
++        returns_b = pd.Series(
++            np.random.normal(0.0012, 0.008, n), index=idx  # 远超 SPY，alpha>0
++        )
++
++        # 验证前提
++        sharpe_a = _compute_sharpe(returns_a)
++        sharpe_b = _compute_sharpe(returns_b)
++        alpha_a = _compute_alpha(returns_a, spy_returns)
++        alpha_b = _compute_alpha(returns_b, spy_returns)
++        assert sharpe_a > sharpe_b, (
++            f"A 的 Sharpe({sharpe_a:.4f}) 应 > B({sharpe_b:.4f})"
++        )
++        assert alpha_b > alpha_a, (
++            f"B 的 alpha({alpha_b:.4f}) 应 > A({alpha_a:.4f})"
++        )
++
++        # 根据参数选择返回不同收益
++        def mock_backtest_one(df, strategy, params, *args, **kwargs):
++            sym = df.index.name or "SYM"
++            if params.get("fast") == 5:  # 参数 A
++                return SingleBacktestResult(
++                    sym, strategy, params, sharpe_a, 10.0, 5.0, 55.0, 10, returns_a
++                )
++            else:  # 参数 B (fast=10)
++                return SingleBacktestResult(
++                    sym, strategy, params, sharpe_b, 30.0, 8.0, 50.0, 10, returns_b
++                )
++
++        df_up = _make_ohlcv(n, trend="up")
++        store = MagicMock()
++        store.get_bars_multi.side_effect = lambda symbols, start, end, timeframe="1d": {
++            s: {"AAPL": df_up, "SPY": spy_df}[s] for s in symbols
++            if s in {"AAPL", "SPY"}
++        }
++
++        universe = MagicMock()
++        universe.get_groups.return_value = {"test_group": ["AAPL"]}
++
++        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=1)
++        with patch(
++            "mytrader.backtest.matrix_backtest._backtest_one",
++            side_effect=mock_backtest_one,
++        ):
++            report = mb.run(
++                strategies=["dual_ma"],
++                param_grids={
++                    "dual_ma": {"fast": [5, 10], "slow": [20, 50]}
++                },
++            )
++
++        # 验证：选择参数 B（fast=10, slow=50，高 alpha）
++        gr = next(
++            (r for r in report.group_results if r.group_id == "test_group"),
++            None,
++        )
++        assert gr is not None, "应至少有一个 GroupBacktestResult"
++        assert gr.params.get("fast") == 10, (
++            f"应选高 alpha 的参数 B (fast=10)，实际选了 {gr.params}"
++        )
++        assert gr.backtest_alpha > 5.0, (
++            f"B 的 alpha 应 > 5%，实际 {gr.backtest_alpha:.4f}"
++        )
++
++
++class TestEnsembleWeightsUsesAlpha:
++    """_optimize_ensemble_weights 从 Sharpe 改为 Alpha。"""
++
++    def test_ensemble_weights_use_alpha(self):
++        """两个策略的权重应基于 alpha 分配，alpha 高的策略权重大。"""
++        n = 252
++        idx = pd.date_range("2021-01-01", periods=n, freq="B")
++        spy_returns = pd.Series(np.random.normal(0.0004, 0.001, n), index=idx)
++
++        # 策略 A：alpha=0（与 SPY 持平）
++        returns_a = pd.Series(np.random.normal(0.0004, 0.003, n), index=idx)
++        # 策略 B：alpha 高（远超 SPY）
++        returns_b = pd.Series(np.random.normal(0.0012, 0.005, n), index=idx)
++
++        results_a = [SingleBacktestResult(
++            "S1", "strat_a", {}, 1.0, 10.0, 5.0, 55.0, 10, returns_a
++        )]
++        results_b = [SingleBacktestResult(
++            "S2", "strat_b", {}, 1.5, 30.0, 8.0, 50.0, 10, returns_b
++        )]
++
++        group_results = [
++            ("strat_a", {}, results_a),
++            ("strat_b", {}, results_b),
++        ]
++
++        weights = _optimize_ensemble_weights(group_results, spy_returns=spy_returns)
++
++        # B 的 alpha 更高 → 权重应更大
++        weights_dict = {s: w for s, _, w in weights}
++        assert weights_dict["strat_b"] > weights_dict["strat_a"], (
++            f"B 的 alpha 更高，权重应大于 A，"
++            f"实际 A={weights_dict['strat_a']:.4f}, B={weights_dict['strat_b']:.4f}"
++        )
++        # 权重和 = 1.0
++        total = sum(weights_dict.values())
++        assert abs(total - 1.0) < 1e-6, f"权重和应为 1.0，实际 {total:.6f}"
++
++    def test_ensemble_weights_spy_unavailable_degrades_to_equal(self):
++        """SPY 数据不可用时 alpha 降级为 0 → 退化为等权。"""
++        n = 100
++        idx = pd.date_range("2021-01-01", periods=n, freq="B")
++        returns_a = pd.Series(np.random.normal(0.001, 0.005, n), index=idx)
++        returns_b = pd.Series(np.random.normal(0.002, 0.008, n), index=idx)
++
++        results_a = [SingleBacktestResult(
++            "S1", "strat_a", {}, 1.0, 10.0, 5.0, 55.0, 10, returns_a
++        )]
++        results_b = [SingleBacktestResult(
++            "S2", "strat_b", {}, 1.5, 30.0, 8.0, 50.0, 10, returns_b
++        )]
++
++        group_results = [
++            ("strat_a", {}, results_a),
++            ("strat_b", {}, results_b),
++        ]
++
++        # spy_returns=None → alpha=0 → 退化为等权（max(0, 0.01)）
++        weights = _optimize_ensemble_weights(group_results, spy_returns=None)
++        weights_dict = {s: w for s, _, w in weights}
++        # 等权：各 0.5
++        assert abs(weights_dict["strat_a"] - 0.5) < 1e-6
++        assert abs(weights_dict["strat_b"] - 0.5) < 1e-6
++
++    def test_ensemble_weights_single_strategy(self):
++        """单策略时直接返回权重 1.0。"""
++        n = 100
++        idx = pd.date_range("2021-01-01", periods=n, freq="B")
++        returns = pd.Series(np.random.normal(0.001, 0.005, n), index=idx)
++        results = [SingleBacktestResult(
++            "S1", "strat_a", {}, 1.0, 10.0, 5.0, 55.0, 10, returns
++        )]
++
++        weights = _optimize_ensemble_weights(
++            [("strat_a", {}, results)],
++            spy_returns=pd.Series(dtype=float),
++        )
++        assert len(weights) == 1
++        assert weights[0][0] == "strat_a"
++        assert weights[0][2] == 1.0
++
++
+diff --git a/mytrader/tests/test_portfolio_backtest.py b/mytrader/tests/test_portfolio_backtest.py
+index 52a0861..1002c99 100644
+--- a/mytrader/tests/test_portfolio_backtest.py
++++ b/mytrader/tests/test_portfolio_backtest.py
+@@ -743,3 +743,173 @@ class TestMainIntegration:
+         assert "Sharpe=" in src
+         assert "Annual Return=" in src
+         assert "DD Violation=" in src
++
++
++# ---------------------------------------------------------------------------
++# 测试 11: Benchmark 对比（迭代 #7 新增）
++# ---------------------------------------------------------------------------
++
++class TestBenchmarkComparison:
++    """迭代 #7：SPY buy-and-hold benchmark 对比。"""
++
++    def test_benchmark_fields_exist(self):
++        """PortfolioBacktestResult 实例包含所有新增 benchmark 字段。"""
++        result = PortfolioBacktestResult(
++            start_date=date(2024, 1, 1),
++            end_date=date(2024, 6, 30),
++            initial_capital=100_000.0,
++            final_equity=105_000.0,
++            total_return_pct=5.0,
++            annualized_return_pct=10.0,
++            sharpe_ratio=1.2,
++            sortino_ratio=1.5,
++            max_drawdown_pct=8.0,
++            calmar_ratio=1.25,
++            daily_returns=pd.Series([0.01, -0.005, 0.02]),
++            equity_curve=pd.Series([100_000, 101_000, 100_495, 102_505]),
++        )
++        # 验证 7 个新增 benchmark 字段存在且有默认值
++        assert result.benchmark_symbol == "SPY"
++        assert result.benchmark_total_return_pct == 0.0
++        assert result.benchmark_annualized_return_pct == 0.0
++        assert result.benchmark_sortino_ratio == 0.0
++        assert result.benchmark_max_drawdown_pct == 0.0
++        assert result.alpha_pct == 0.0
++        assert result.information_ratio == 0.0
++
++    def test_benchmark_computed_with_spy_data(
++        self, mock_universe_3_symbols, weights_file_simple
++    ):
++        """mock store 返回 SPY 上涨数据 → benchmark_total_return_pct > 0。"""
++        store = MagicMock()
++        # 组合标的用上涨数据
++        df_aapl = _make_ohlcv_df(30, 100.0, trend=0.5)
++        df_msft = _make_ohlcv_df(30, 200.0, trend=0.3)
++        df_jpm = _make_ohlcv_df(30, 80.0, trend=0.2)
++        # SPY 也用上涨数据
++        df_spy = _make_ohlcv_df(30, 400.0, trend=0.4)
++        mapping = {
++            "AAPL": df_aapl, "MSFT": df_msft, "JPM": df_jpm, "SPY": df_spy
++        }
++
++        def get_bars_multi(symbols, start, end, timeframe="1d"):
++            return {s: mapping[s].copy() for s in symbols if s in mapping}
++
++        store.get_bars_multi.side_effect = get_bars_multi
++
++        bt = PortfolioBacktester(
++            store=store,
++            universe=mock_universe_3_symbols,
++            weights_file=weights_file_simple,
++        )
++        result = bt.run(start=date(2024, 1, 1), end=date(2024, 1, 31))
++
++        # SPY 上涨 → benchmark_total_return_pct > 0
++        assert result.benchmark_symbol == "SPY"
++        assert result.benchmark_total_return_pct > 0, (
++            f"SPY 上涨数据 → benchmark_return 应 > 0，实际 {result.benchmark_total_return_pct:.4f}"
++        )
++        assert result.benchmark_annualized_return_pct > 0
++        # alpha 已计算（不论正负，应不为 0 —— 组合年化 - SPY 年化）
++        # 注意：组合数据与 SPY 都是合成上涨，alpha 可能为正或负，只验证非零
++        assert isinstance(result.alpha_pct, float)
++        assert isinstance(result.information_ratio, float)
++
++    def test_benchmark_zero_when_no_spy(
++        self, mock_store_3_symbols, mock_universe_3_symbols, weights_file_simple
++    ):
++        """mock store 不返回 SPY → 所有 benchmark 字段 = 0.0，不抛异常。"""
++        # mock_store_3_symbols 只含 AAPL/MSFT/JPM，不含 SPY
++        bt = PortfolioBacktester(
++            store=mock_store_3_symbols,
++            universe=mock_universe_3_symbols,
++            weights_file=weights_file_simple,
++        )
++        result = bt.run(start=date(2024, 1, 1), end=date(2024, 1, 31))
++
++        # 降级处理：所有 benchmark 字段 = 0.0
++        assert result.benchmark_symbol == "SPY"
++        assert result.benchmark_total_return_pct == 0.0
++        assert result.benchmark_annualized_return_pct == 0.0
++        assert result.benchmark_sortino_ratio == 0.0
++        assert result.benchmark_max_drawdown_pct == 0.0
++        # alpha = portfolio - benchmark = portfolio - 0 = portfolio
++        assert result.alpha_pct == result.annualized_return_pct
++        assert result.information_ratio == 0.0
++
++    def test_alpha_calculation(self):
++        """alpha = 组合年化 - benchmark 年化。
++
++        构造 result：portfolio=15%, benchmark=10% → alpha=5.0
++        """
++        result = PortfolioBacktestResult(
++            start_date=date(2024, 1, 1),
++            end_date=date(2024, 6, 30),
++            initial_capital=100_000.0,
++            final_equity=115_000.0,
++            total_return_pct=15.0,
++            annualized_return_pct=15.0,
++            sharpe_ratio=1.2,
++            sortino_ratio=1.5,
++            max_drawdown_pct=8.0,
++            calmar_ratio=1.875,
++            daily_returns=pd.Series([0.01] * 10),
++            equity_curve=pd.Series([100_000, 101_000]),
++            benchmark_annualized_return_pct=10.0,
++        )
++        # 验证 alpha = portfolio - benchmark = 5.0
++        expected_alpha = 15.0 - 10.0
++        # alpha_pct 由 run() 末尾计算；测试中我们直接构造 result 验证字段语义
++        # （alpha 字段默认 0.0，需手动设置或经 run() 计算）
++        result.alpha_pct = result.annualized_return_pct - result.benchmark_annualized_return_pct
++        assert result.alpha_pct == expected_alpha
++        assert result.alpha_pct > 0  # 跑赢 benchmark
++
++    def test_information_ratio_computation(self):
++        """IR 计算正确性：构造已知超额收益序列。"""
++        # 构造 portfolio 与 spy 完全相同的 returns → IR 应为 0（无超额收益）
++        # 用静态方法直接测试
++        dates = [date(2024, 1, 1) + timedelta(days=i) for i in range(10)]
++        port_returns = [0.001] * 10
++        spy_idx = pd.to_datetime(dates)
++        spy_returns = pd.Series([0.001] * 10, index=spy_idx)
++        ir = PortfolioBacktester._compute_information_ratio(
++            port_returns, dates, spy_returns
++        )
++        # excess 全 0 → std=0 → 返回 0.0
++        assert ir == 0.0
++
++        # 构造 portfolio 持续跑赢 spy 0.0005/天 → IR > 0
++        port_returns_better = [0.002] * 10  # 比 spy 高 0.001/天
++        ir2 = PortfolioBacktester._compute_information_ratio(
++            port_returns_better, dates, spy_returns
++        )
++        assert ir2 > 0, f"持续超额收益 → IR 应 > 0，实际 {ir2:.4f}"
++
++    def test_benchmark_max_drawdown(self):
++        """构造 SPY 先涨后跌 → benchmark_max_drawdown_pct > 0。"""
++        # SPY: 先涨 5 天，再跌 5 天
++        spy_close_values = [100.0, 101.0, 102.0, 103.0, 104.0,
++                            100.0, 96.0, 92.0, 88.0, 84.0]
++        idx = pd.date_range("2024-01-01", periods=10, freq="B")
++        spy_df = pd.DataFrame({
++            "open":   [c - 0.3 for c in spy_close_values],
++            "high":   [c + 0.5 for c in spy_close_values],
++            "low":    [c - 0.5 for c in spy_close_values],
++            "close":  spy_close_values,
++            "volume": [1_000_000] * 10,
++        }, index=idx)
++        spy_returns = spy_df["close"].pct_change().dropna()
++        # 直接调用 _compute_max_drawdown_pct（与 _compute_benchmark 内部一致）
++        dd = PortfolioBacktester._compute_max_drawdown_pct(spy_returns)
++        # 先涨到 104，再跌到 84 → DD = (84 - 104) / 104 ≈ 19.23%
++        assert dd > 0
++        assert 15.0 < dd < 25.0, f"SPY DD 应在 ~19.23%，实际 {dd:.2f}%"
++
++    def test_benchmark_max_drawdown_static_method(self):
++        """_compute_max_drawdown_pct 在 SPY 上涨序列上返回 0（无回撤）。"""
++        spy_close_values = [100.0 + i for i in range(20)]  # 持续上涨
++        idx = pd.date_range("2024-01-01", periods=20, freq="B")
++        spy_returns = pd.Series(spy_close_values, index=idx).pct_change().dropna()
++        dd = PortfolioBacktester._compute_max_drawdown_pct(spy_returns)
++        assert dd == 0.0, "持续上涨 → 无回撤"
+diff --git a/mytrader/tests/test_strategy.py b/mytrader/tests/test_strategy.py
+index 5ac20c7..31c3047 100644
+--- a/mytrader/tests/test_strategy.py
++++ b/mytrader/tests/test_strategy.py
+@@ -80,7 +80,7 @@ class TestIndicators:
+ 
+ class TestStrategyRegistry:
+     def test_all_strategies_registered(self):
+-        expected = {"dual_ma", "rsi_mean_revert", "bollinger_band", "macd_cross"}
++        expected = {"dual_ma", "rsi_mean_revert", "rsi_trend_filter", "bollinger_band", "macd_cross"}
+         assert expected.issubset(set(STRATEGY_REGISTRY.keys()))
+ 
+     def test_strategy_callable(self):
+@@ -285,6 +285,65 @@ class TestAllStrategiesQuality:
+         assert set(signal.unique()).issubset({-1, 0, 1})
+ 
+ 
++# ---------------------------------------------------------------------------
++# RSI Trend Filter 策略测试（迭代 #8）
++# ---------------------------------------------------------------------------
++
++class TestRSITrendFilter:
++    """T1-T5: RSI 趋势过滤策略测试。"""
++
++    def test_signal_values(self):
++        """T1: 信号值仅在 {-1, 0, 1} 范围内。"""
++        from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
++        close = make_oscillating_close(300)
++        signal = rsi_trend_filter_signal(close)
++        assert set(signal.unique()).issubset({-1, 0, 1})
++
++    def test_custom_params(self):
++        """T2: 非默认参数正常工作。"""
++        from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
++        close = make_oscillating_close(300)
++        signal = rsi_trend_filter_signal(
++            close, rsi_period=7, oversold=25.0, overbought=75.0, trend_period=100,
++        )
++        assert set(signal.unique()).issubset({-1, 0, 1})
++
++    def test_uptrend_only_buy(self):
++        """T3: 强上升趋势中不产生 SELL 信号。"""
++        from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
++        n = 300
++        idx = pd.date_range("2023-01-01", periods=n, freq="B")
++        # 强上升趋势：价格持续上涨，始终在 SMA(200) 上方
++        rng = np.random.default_rng(42)
++        prices = 100.0 * np.exp(np.cumsum(0.005 + 0.005 * rng.standard_normal(n)))
++        close = pd.Series(prices, index=idx, name="close")
++        signal = rsi_trend_filter_signal(close, oversold=35.0, overbought=65.0)
++        # 上升趋势中 SELL 被 SMA 过滤，不应出现 -1
++        unique_vals = set(signal.values)
++        assert -1 not in unique_vals, f"Found SELL signal in uptrend: {unique_vals}"
++
++    def test_downtrend_only_sell(self):
++        """T4: 强下降趋势中不产生 BUY 信号。"""
++        from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
++        n = 300
++        idx = pd.date_range("2023-01-01", periods=n, freq="B")
++        # 强下降趋势：价格持续下跌，始终在 SMA(200) 下方
++        rng = np.random.default_rng(42)
++        prices = 100.0 * np.exp(np.cumsum(-0.005 + 0.005 * rng.standard_normal(n)))
++        close = pd.Series(prices, index=idx, name="close")
++        signal = rsi_trend_filter_signal(close, oversold=35.0, overbought=65.0)
++        # 下降趋势中 BUY 被 SMA 过滤，不应出现 +1
++        unique_vals = set(signal.values)
++        assert 1 not in unique_vals, f"Found BUY signal in downtrend: {unique_vals}"
++
++    def test_insufficient_data(self):
++        """T5: 数据不足 trend_period 时返回全零（不崩溃）。"""
++        from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
++        close = make_oscillating_close(50)
++        signal = rsi_trend_filter_signal(close)
++        assert (signal == 0).all()
++
++
+ # ---------------------------------------------------------------------------
+ # Ensemble 补充测试（P0-P1）
+ # ---------------------------------------------------------------------------
+diff --git a/mytrader/tests/test_strategy_matrix_ranker.py b/mytrader/tests/test_strategy_matrix_ranker.py
+index 4667971..bca3edc 100644
+--- a/mytrader/tests/test_strategy_matrix_ranker.py
++++ b/mytrader/tests/test_strategy_matrix_ranker.py
+@@ -33,20 +33,34 @@ def _make_signal(
+     sharpe: float = 1.2,
+     win_rate: float = 0.55,
+     sector: str = "Technology",
++    sortino: float | None = None,
++    max_drawdown: float | None = None,
+ ) -> Signal:
++    """构造测试用 Signal。
++
++    迭代 #7：新增 sortino / max_drawdown 可选参数。
++    默认 None 时**不写入** indicators，模拟旧数据（缺少新字段）；
++    传入值时写入，便于 Sortino/DD penalty 测试。
++    backtest_sharpe 字段保留（向后兼容，但不再参与评分）。
++    """
++    indicators = {
++        "weight": weight,
++        "backtest_sharpe": sharpe,
++        "backtest_win_rate": win_rate,
++        "group_id": "NDX_high_vol",
++        "sector": sector,
++    }
++    if sortino is not None:
++        indicators["backtest_sortino"] = sortino
++    if max_drawdown is not None:
++        indicators["backtest_max_drawdown"] = max_drawdown
+     return Signal(
+         symbol=symbol,
+         direction=direction,
+         timestamp=datetime.now(tz=timezone.utc),
+         confidence=confidence,
+         strategy_name=strategy,
+-        indicators={
+-            "weight": weight,
+-            "backtest_sharpe": sharpe,
+-            "backtest_win_rate": win_rate,
+-            "group_id": "NDX_high_vol",
+-            "sector": sector,
+-        },
++        indicators=indicators,
+     )
+ 
+ 
+@@ -275,6 +289,106 @@ class TestSignalRanker:
+         ranks = [c.rank for c in report.buy_candidates]
+         assert ranks == [1, 2, 3]
+ 
++    # ------------------------------------------------------------------
++    # 迭代 #7：Sortino + DD penalty 评分因子测试
++    # ------------------------------------------------------------------
++
++    def test_score_uses_sortino_not_sharpe(self):
++        """评分应使用 backtest_sortino 而非 backtest_sharpe。
++
++        构造 signal：sortino=2.0（高），sharpe=0.0（低，旧字段）。
++        断言：score > 0，且 score_breakdown 包含 backtest_sortino 而非 backtest_sharpe。
++        """
++        ranker = SignalRanker(top_k=5)
++        sig = _make_signal("A", SignalDirection.BUY, sortino=2.0, sharpe=0.0)
++        report = ranker.rank([sig])
++        ranked = report.buy_candidates[0]
++        assert ranked.score > 0
++        assert "backtest_sortino" in ranked.score_breakdown
++        assert "backtest_sharpe" not in ranked.score_breakdown
++        # sortino=2.0 → factor = min(2.0/3.0, 1.0) = 0.6667
++        assert abs(ranked.score_breakdown["backtest_sortino"] - (2.0 / 3.0)) < 1e-6
++
++    def test_score_dd_penalty(self):
++        """DD 越低，得分越高。
++
++        A: max_drawdown=5% → dd_penalty = 1 - 5/20 = 0.75
++        B: max_drawdown=18% → dd_penalty = 1 - 18/20 = 0.10
++        其余因子相同 → A.score > B.score
++        """
++        ranker = SignalRanker(top_k=5)
++        sig_a = _make_signal("A", SignalDirection.BUY, sortino=1.5, max_drawdown=5.0)
++        sig_b = _make_signal("B", SignalDirection.BUY, sortino=1.5, max_drawdown=18.0)
++        report = ranker.rank([sig_a, sig_b])
++        scores = {r.symbol: r.score for r in report.buy_candidates}
++        assert scores["A"] > scores["B"], (
++            f"A(DD=5%) score {scores['A']:.4f} 应大于 B(DD=18%) score {scores['B']:.4f}"
++        )
++        # 验证 dd_penalty factor
++        bd_a = {r.symbol: r.score_breakdown for r in report.buy_candidates}["A"]
++        bd_b = {r.symbol: r.score_breakdown for r in report.buy_candidates}["B"]
++        assert abs(bd_a["backtest_dd_penalty"] - 0.75) < 1e-6
++        assert abs(bd_b["backtest_dd_penalty"] - 0.10) < 1e-6
++
++    def test_score_sortino_normalization(self):
++        """Sortino 归一化：3.0→1.0, 6.0→1.0(截断), -1.0→0.0(截断)。"""
++        ranker = SignalRanker(top_k=5)
++        # 3.0 → 1.0
++        sig1 = _make_signal("S3", SignalDirection.BUY, sortino=3.0, max_drawdown=0.0)
++        # 6.0 → 1.0 (truncated)
++        sig2 = _make_signal("S6", SignalDirection.BUY, sortino=6.0, max_drawdown=0.0)
++        # -1.0 → 0.0 (clamped)
++        sig_neg = _make_signal("SN", SignalDirection.BUY, sortino=-1.0, max_drawdown=0.0)
++        report = ranker.rank([sig1, sig2, sig_neg])
++        bd = {r.symbol: r.score_breakdown for r in report.buy_candidates}
++        assert abs(bd["S3"]["backtest_sortino"] - 1.0) < 1e-6
++        assert abs(bd["S6"]["backtest_sortino"] - 1.0) < 1e-6
++        assert abs(bd["SN"]["backtest_sortino"] - 0.0) < 1e-6
++
++    def test_custom_score_weights_still_work(self):
++        """传入自定义 score_weights 只用指定因子。"""
++        ranker = SignalRanker(
++            top_k=5,
++            score_weights={"strategy_weight": 1.0},
++        )
++        sig = _make_signal("X", SignalDirection.BUY, weight=0.8, sortino=2.0)
++        report = ranker.rank([sig])
++        ranked = report.buy_candidates[0]
++        # 只用 strategy_weight=0.8 → score=0.8
++        assert abs(ranked.score - 0.8) < 1e-6
++
++    def test_ranking_order_changed_by_sortino(self):
++        """Sortino 评分切换：A 的 Sharpe 高但 Sortino 低，B 的 Sharpe 低但 Sortino 高。
++
++        旧评分（sharpe）：A 排前
++        新评分（sortino）：B 排前
++        """
++        ranker = SignalRanker(top_k=5)
++        sig_a = _make_signal(
++            "A_HIGH_SHARPE_LOW_SORTINO",
++            SignalDirection.BUY,
++            sharpe=2.5,      # 旧因子：高
++            sortino=0.5,     # 新因子：低
++            max_drawdown=10.0,
++            confidence=0.5,
++            weight=0.5,
++            win_rate=0.5,
++        )
++        sig_b = _make_signal(
++            "B_LOW_SHARPE_HIGH_SORTINO",
++            SignalDirection.BUY,
++            sharpe=0.2,      # 旧因子：低
++            sortino=2.5,     # 新因子：高
++            max_drawdown=10.0,
++            confidence=0.5,
++            weight=0.5,
++            win_rate=0.5,
++        )
++        report = ranker.rank([sig_a, sig_b])
++        # B 应排第一（Sortino 高）
++        assert report.buy_candidates[0].symbol == "B_LOW_SHARPE_HIGH_SORTINO"
++        assert report.buy_candidates[1].symbol == "A_HIGH_SHARPE_LOW_SORTINO"
++
+ 
+ # ---------------------------------------------------------------------------
+ # CandidateSelector

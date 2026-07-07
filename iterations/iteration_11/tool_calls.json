@@ -1,0 +1,1682 @@
+[
+  {
+    "tool": "Read",
+    "timestamp": 1783392318.095874
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392318.096247
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392318.452806
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392318.4531572
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392319.086408
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392319.086642
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392319.1102211
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392319.1126652
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392319.114249
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392319.11567
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392319.116874
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392319.117676
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392323.7141309
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392323.71451
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392323.732517
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392324.041971
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392330.487217
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392330.487533
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392330.491269
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392330.607251
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392336.4185128
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392336.418672
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392336.467702
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392336.467842
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392336.4753559
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392336.4754272
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392336.480882
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392336.490849
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392336.496563
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392336.503715
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392336.5050502
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392336.5066729
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392341.7877812
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392341.788173
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392341.802297
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392341.813256
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392346.2502909
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392346.2512472
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392346.263606
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392346.285038
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392350.974475
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392350.974633
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392350.980041
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392350.992865
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392361.3680131
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392361.3682392
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392361.4089432
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392367.5106041
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392375.741846
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392375.7421498
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392375.779331
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392379.8552918
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392401.021882
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392401.022212
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392401.0334
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392405.9820921
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392415.302839
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392415.303037
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392415.4393091
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392415.459906
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392420.0326242
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392420.0327349
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392420.2838988
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392422.414099
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392426.351279
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392426.351441
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392426.360343
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392428.4158459
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392433.688124
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392433.688245
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392433.696172
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392433.728723
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392437.86484
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392437.864924
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392437.8699892
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392437.879921
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392441.006975
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392441.0071151
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392441.0121129
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392441.0204759
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392445.162125
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392445.1623309
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392445.263181
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392445.270922
+  },
+  {
+    "tool": "Grep",
+    "timestamp": 1783392450.49946
+  },
+  {
+    "tool": "Grep",
+    "timestamp": 1783392450.499598
+  },
+  {
+    "tool": "Grep",
+    "timestamp": 1783392450.5886762
+  },
+  {
+    "tool": "Grep",
+    "timestamp": 1783392450.9768372
+  },
+  {
+    "tool": "Grep",
+    "timestamp": 1783392454.922123
+  },
+  {
+    "tool": "Grep",
+    "timestamp": 1783392454.922184
+  },
+  {
+    "tool": "Grep",
+    "timestamp": 1783392454.9257338
+  },
+  {
+    "tool": "Grep",
+    "timestamp": 1783392454.940128
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392460.5221272
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392460.522249
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392460.542593
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392460.567924
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392465.836374
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392465.8364952
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392465.84217
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392465.8685749
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392469.570146
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392469.570244
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392469.601951
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392469.6319711
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392473.7887092
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392473.788817
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392473.794833
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392473.8206332
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392478.696775
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392478.696822
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392478.700854
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392478.7074492
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392483.3747258
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392483.374846
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392483.391572
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392483.413714
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392487.672956
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392487.6731489
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392487.679053
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392487.689274
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392492.205361
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392492.205507
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392493.0932748
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392493.0935118
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392494.225714
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392494.226107
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392495.391948
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392495.392084
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392496.5862908
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392496.586575
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392496.6119769
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392496.612843
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392496.613868
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392496.614795
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392496.61659
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392496.6281128
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392496.629211
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392496.629889
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392496.630503
+  },
+  {
+    "tool": "TaskCreate",
+    "timestamp": 1783392496.631052
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392499.641357
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392499.641425
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392499.655937
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392499.6598148
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392511.756397
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392511.756593
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392511.769141
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392511.78565
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392515.33032
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392515.33038
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392515.515417
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392515.515977
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392515.548077
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392515.551222
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392515.5576398
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392515.558789
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392524.716125
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392524.716469
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392524.831716
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392524.8415082
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392534.518739
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392534.518966
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392534.528449
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392534.537181
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392537.7110112
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392537.711079
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392537.77971
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392537.779943
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392537.7864408
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392537.7920692
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392537.797951
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392537.799027
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392546.218514
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392546.2187479
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392546.229027
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392546.2361898
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392557.5867362
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392557.5873358
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392557.5941272
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392557.6021068
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392566.224433
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392566.224673
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392566.2396102
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392566.243087
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392571.696011
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392571.696337
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392571.712987
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392571.739313
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392575.740885
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392575.7410119
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392575.7468538
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392575.7539861
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392581.847209
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392581.847683
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392581.857923
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392581.865877
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392586.370991
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392586.371318
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392586.378365
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392586.398564
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392592.889298
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392592.889455
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392592.90037
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392595.187722
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392600.0257962
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392600.0259671
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392600.0318348
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392600.036341
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392612.359803
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392612.36005
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392612.427797
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392612.4432042
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392617.376916
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392617.3773692
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392617.3914828
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392619.2217119
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392636.684217
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392636.684459
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392636.698327
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392641.678931
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392652.9389892
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392652.9393039
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392652.9547782
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392657.043019
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392662.2864032
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392662.28652
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392662.3309922
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392671.413898
+  },
+  {
+    "tool": "Grep",
+    "timestamp": 1783392688.795242
+  },
+  {
+    "tool": "Grep",
+    "timestamp": 1783392688.7954402
+  },
+  {
+    "tool": "Grep",
+    "timestamp": 1783392688.80912
+  },
+  {
+    "tool": "Grep",
+    "timestamp": 1783392688.826829
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392695.343672
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392695.3438988
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392695.354065
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392695.359895
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392698.880468
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392698.880563
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392698.887331
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392698.89431
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392717.449564
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392717.4497778
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392717.461023
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392717.4662662
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392726.492643
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392726.4930098
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392726.6165571
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392726.620331
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392732.626684
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392732.626911
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392732.685392
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783392732.6899688
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392739.7584682
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392739.7589738
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392739.7692852
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392739.78537
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392748.2406132
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392748.240726
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392748.247853
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392748.257161
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392753.8933399
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392753.8936288
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392753.996798
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392754.005056
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392760.953999
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392760.954092
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392760.9641302
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392760.974976
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392769.398072
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392769.398162
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392769.437217
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392769.453162
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392775.14175
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392775.142157
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392775.155209
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783392775.164493
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392780.0384881
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392780.0386481
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392780.0500789
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392793.03441
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392796.780575
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392796.7806551
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392796.785277
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392809.6833339
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392814.318547
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392814.318825
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392814.329708
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392827.20029
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392831.0417202
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392831.041881
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392831.079702
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392831.080097
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392831.159327
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392831.160353
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392831.166089
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392831.167362
+  },
+  {
+    "tool": "Write",
+    "timestamp": 1783392923.4035158
+  },
+  {
+    "tool": "Write",
+    "timestamp": 1783392923.4044921
+  },
+  {
+    "tool": "Write",
+    "timestamp": 1783392923.428223
+  },
+  {
+    "tool": "Write",
+    "timestamp": 1783392923.434038
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392927.927466
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392927.927689
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392927.942442
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392934.871315
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392940.102203
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392940.1025019
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392940.116987
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392942.244985
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392950.254796
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392950.254978
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392950.417005
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392950.417365
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392950.429346
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392950.4299011
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392950.434779
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783392950.4361558
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392954.902227
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392954.9026089
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392954.9262002
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392969.725913
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392974.8823612
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392974.882484
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392974.893559
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783392997.815304
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393003.153671
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393003.1539772
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393003.187309
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393003.1992729
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393013.288886
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393013.289162
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393013.301028
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393013.3164952
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393026.7024782
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393026.702971
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393026.7130759
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393026.719788
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393031.414997
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393031.415175
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393031.500934
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393031.523262
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393035.4281468
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393035.428189
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393035.440374
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393035.447254
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393083.986997
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393083.9874392
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393083.9958389
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393084.008378
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393088.057847
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393088.058058
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393088.065172
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393088.0913768
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393092.609576
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393092.6097338
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393092.696575
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393092.7253928
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393097.4159732
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393097.4161851
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393097.422372
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393097.445267
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393102.849386
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393102.849491
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393102.8816378
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393102.901175
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393107.597453
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393107.598092
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393107.6072981
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393107.617362
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393143.854547
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393143.8548858
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393143.8620758
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393143.872187
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393149.106561
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393149.106621
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393149.120626
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393149.136223
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393154.7250938
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393154.7252638
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393154.732672
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393154.7582011
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393159.1115499
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393159.1117618
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393159.118679
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393159.1266901
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393186.959661
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393186.9600499
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393186.967786
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393186.985877
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393193.0814772
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393193.081564
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393193.103866
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393193.129406
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393200.2534158
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393200.253597
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393200.268832
+  },
+  {
+    "tool": "Read",
+    "timestamp": 1783393200.2738729
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393206.201371
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393206.201602
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393206.21758
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393206.2281
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393211.9015522
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393211.901681
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393211.908973
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393211.917641
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393224.885406
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393224.885537
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393224.894828
+  },
+  {
+    "tool": "Edit",
+    "timestamp": 1783393224.9089978
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393232.1061618
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393232.106252
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393232.155068
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393255.473968
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783393258.843734
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783393258.84393
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783393258.8536582
+  },
+  {
+    "tool": "TaskUpdate",
+    "timestamp": 1783393258.85821
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393266.317068
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393266.317385
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393266.3287292
+  },
+  {
+    "tool": "Bash",
+    "timestamp": 1783393266.366399
+  }
+]

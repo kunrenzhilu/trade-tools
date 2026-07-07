@@ -1,0 +1,41 @@
+# 迭代 #4 Prompt
+
+**任务**: 按 iterations/iteration_4/spec.md 进行开发。先读 spec 文件理解完整需求，然后实施步骤 1-3（P0+P1，不含 P2 临时 Guardrail）。
+
+核心任务：
+
+## P0: 新增 Portfolio Backtest 模块
+
+新增文件 mytrader/mytrader/backtest/portfolio_backtest.py，包含：
+1. PortfolioBacktestConfig dataclass（initial_capital=100000, top_k=5, candidates_multiplier=2, max_single_position_pct=0.20, max_total_exposure_pct=0.80, max_sector_exposure_pct=0.40, rebalance_freq='daily', signal_valid_bars=3）
+2. PortfolioBacktestResult dataclass（start_date, end_date, initial_capital, final_equity, total_return_pct, annualized_return_pct, sharpe_ratio, sortino_ratio, max_drawdown_pct, calmar_ratio, daily_returns: pd.Series, equity_curve: pd.Series, holdings_history: list[dict], dd_violation: bool, group_exposure_history: list[dict]）
+3. PortfolioBacktester 类：__init__(store, universe, weights_file, config) + run(start, end) -> PortfolioBacktestResult
+4. run() 的核心逻辑：按日期遍历，每个交易日复用 StrategyMatrixRunner 生成信号、SignalRanker 排名、CandidateSelector 选股，模拟换仓并计算净值
+5. 复用现有组件，不重写 StrategyMatrixRunner/SignalRanker/CandidateSelector
+6. 防前视偏差：每个交易日只用截至当日的数据
+
+## P1: main.py 集成
+
+在 main.py 的 _run_reoptimize 中，MatrixBacktest.run() + run_walk_forward() 之后，自动运行 PortfolioBacktester，结果输出到日志。格式：[Portfolio Backtest] DD=X%, Sortino=Y, Sharpe=Z, Annual Return=W%, DD Violation=YES/NO
+
+## P1b: per-group DD 降级
+
+在 matrix_backtest.py 中，dd_constrained 字段和 fallback 逻辑保留不变。但 Gate 1 判定逻辑中，per-group DD > 20% 不再是阻塞项，改为作为 risk metadata 输出。具体：在 _write_weights 中新增 backtest_dd_status 字段（值 'pass' 或 'dd_constrained'），作为风险信号标记。
+
+## 测试要求
+
+新增至少 8 个测试：
+- PortfolioBacktestResult dataclass 测试
+- PortfolioBacktester 基本流程测试（mock 数据，3 只标的 × 10 天）
+- max_drawdown_pct 计算正确性测试
+- 换仓逻辑测试（Top-5 变化时正确卖出/买入）
+- 信号过期测试（signal_valid_bars）
+- dd_violation 标记测试（DD>20% 时为 True）
+- group_exposure_history 记录测试
+- _write_weights 中 backtest_dd_status 字段输出测试
+
+完成后运行 pytest 确认全部通过（测试数不得下降，基线 498）。更新 alignment/iteration_trajectory.md 和 alignment/decision_log.md。低风险变更，不触及 risk/execution 模块的核心风控参数（P2 Guardrail 不在本次范围）。
+
+**时间**: 2026-07-01T16:11:28.527002+00:00
+
+**注**: 完整 prompt 由 build_constitution_prompt() 动态生成，注入了 ai_constitution.md 的禁止行为、验证流水线、代码规范等规则。

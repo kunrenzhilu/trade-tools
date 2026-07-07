@@ -1,0 +1,23 @@
+ M .codebuddy/CODEBUDDY.md
+ M .codebuddy/skills/cb-acp-dev/scripts/orchestrator.py
+ M alignment/decision_log.md
+ M alignment/iteration_trajectory.md
+ M alignment/orchestrator.py
+ M mytrader/config/strategy_weights.json
+ M mytrader/designs/design_v2/07-backtest-module.md
+ M mytrader/designs/design_v2/13-signal-ranker.md
+ M mytrader/designs/design_v2/CHANGELOG.md
+ M mytrader/main.py
+ M mytrader/mytrader/backtest/matrix_backtest.py
+ M mytrader/mytrader/backtest/portfolio_backtest.py
+ M mytrader/mytrader/signal/ranker.py
+ M mytrader/mytrader/strategy/__init__.py
+ M mytrader/pyproject.toml
+ M mytrader/tests/test_integration_live.py
+ M mytrader/tests/test_matrix_backtest.py
+ M mytrader/tests/test_portfolio_backtest.py
+ M mytrader/tests/test_strategy.py
+ M mytrader/tests/test_strategy_matrix_ranker.py
+?? alignment/tests/
+?? demo_harness/
+?? mytrader/mytrader/strategy/strategies/rsi_trend_filter.py

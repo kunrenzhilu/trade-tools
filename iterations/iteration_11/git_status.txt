@@ -1,0 +1,11 @@
+ M .codebuddy/CODEBUDDY.md
+ M .codebuddy/notes/experience.md
+ M .codebuddy/skills/meta-agent/SKILL.md
+ M alignment/decision_log.md
+ M alignment/iteration_trajectory.md
+ M mytrader/config/strategy_weights.json
+ M mytrader/designs/design_v2/07-backtest-module.md
+ M mytrader/mytrader/backtest/matrix_backtest.py
+ M mytrader/tests/test_batch_backtest.py
+ M mytrader/tests/test_matrix_backtest.py
+?? mytrader/tests/test_degenerate_filter.py

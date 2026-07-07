@@ -2,11 +2,6 @@
 .DS_Store
 .claude/
 tmp/
-# iterations/ 大文件 ignore，但保留 spec.md 和 summary.md（核心迭代记录）
-iterations/**
-!iterations/iteration_*/
-!iterations/iteration_*/spec.md
-!iterations/iteration_*/summary.md
 demo_harness
 
 # Python

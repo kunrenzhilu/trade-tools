@@ -1,0 +1,35 @@
+{
+  "iteration": 7,
+  "iteration_id": "cc98c43f",
+  "timestamp_utc": "2026-07-04T03:15:39.685272+00:00",
+  "status": "failed",
+  "tests": {
+    "count_before": 562,
+    "count_after": 574,
+    "passed": 0,
+    "failed": 0,
+    "errors": 0,
+    "warnings": 11,
+    "exit_code": 0,
+    "summary": "tests/test_risk_manager.py: 11 warnings",
+    "has_test_failures": false
+  },
+  "snapshot": {
+    "changed_files_count": 14,
+    "includes_untracked": false,
+    "untracked_count": 0,
+    "git_status_file": "git_status.txt",
+    "untracked_files_file": null,
+    "untracked_diff_file": null
+  },
+  "compliance": {
+    "violations": [
+      "mytrader/tests/test_strategy_matrix_ranker.py: 高风险参数变更 (dd_threshold)，需用户审批"
+    ],
+    "high_risk_files_touched": [],
+    "buffer_overflow_count": 0
+  },
+  "trajectory_updated_by_codebuddy": true,
+  "decision_log_updated_by_codebuddy": true,
+  "error": null
+}

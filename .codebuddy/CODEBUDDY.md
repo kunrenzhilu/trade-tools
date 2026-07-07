@@ -1,6 +1,6 @@
 # Trade-Tools 项目核心参考文档
 
-> 最后更新：2026-07-05 (Iter #9: MatrixBacktest Alpha-Based Strategy Selection)  
+> 最后更新：2026-07-07 (Iter #11: Sanity Gate / Reject Degenerate Strategies)  
 > 本文是项目规范 + 关键索引，供 AI 助手快速建立项目上下文。  
 > **各阶段开发详情见** → [`.codebuddy/notes/dev_records.md`](.codebuddy/notes/dev_records.md)
 
@@ -125,7 +125,7 @@ mytrader/
     │                           # [迭代 #5] build_matrix_signal_indicators 共享 helper
     ├── backtest/               # Module 07 — Backtest ✅
     │   ├── runner.py           # BacktestRunner（含 daily_returns）
-    │   ├── matrix_backtest.py  # [Phase 5] MatrixBacktest（含 backtest_dd_status 风险 metadata + [Iter #9] backtest_alpha / alpha-based selection）
+    │   ├── matrix_backtest.py  # [Phase 5] MatrixBacktest（含 backtest_dd_status 风险 metadata + [Iter #9] backtest_alpha / alpha-based selection + [Iter #11] closed_trades / sanity gate / no_valid_strategy）
     │   └── portfolio_backtest.py  # [迭代 #4] PortfolioBacktester（组合层级回测）
     │                               # [迭代 #5] 复用 build_matrix_signal_indicators
     │                               # [迭代 #7] SPY benchmark 对比（alpha/IR/benchmark Sortino/DD）
@@ -196,9 +196,11 @@ mytrader/
 | **Iter #7** | ✅ 完成 | 12 | SignalRanker Sortino Priority + Benchmark Comparison（sharpe→sortino 评分切换 + PortfolioBacktest SPY benchmark alpha/IR） |
 | **Iter #8** | ✅ 完成 | 11 | RSI Trend-Filtered Mean Reversion 策略（RSI 超卖/超买 + 200日SMA趋势过滤，5新测试） |
 | **Iter #9** | ✅ 完成 | 17 | MatrixBacktest Alpha-Based Strategy Selection（SPY benchmark + alpha 计算 + top-K/per-strategy/ensemble 从 Sortino/Sharpe 改为 Alpha + Sortino > 0.5 门槛 + 三级 fallback） |
+| **Iter #10** | ✅ 完成 | 24 | vectorbt Batch Backtest Optimization（`_backtest_batch` 一次 vbt 调用处理组内所有标的 + batch vs single 数值一致性测试） |
+| **Iter #11** | ✅ 完成 | 20 | Sanity Gate / Reject Degenerate Strategies（`SingleBacktestResult.closed_trades` 字段 + `_is_degenerate_strategy` + `_run_group` 排序前剔除退化策略 + 全退化组空仓 `no_valid_strategy` 标记） |
 | **Phase 6** | 🔲 待开发 | — | AlpacaBroker auto 端到端验证 + 对账真实集成 + 港股支持 |
 
-**当前总测试数：602 passed，0 failed**（live 测试默认隔离，迭代 #9 后；harness 测试 38 个在 `alignment/tests/`）
+**当前总测试数：646 passed，0 failed**（live 测试默认隔离，迭代 #11 后；harness 测试 38 个在 `alignment/tests/`）
 
 > 各阶段详细实现见 **[dev_records.md](.codebuddy/notes/dev_records.md)**
 

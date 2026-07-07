@@ -389,20 +389,30 @@ def run_matrix_backtest(universe: UniverseManager,
 | **SPY Benchmark 获取**（迭代 #9 新增） | `_get_spy_returns(start, end)` 从 MarketDataStore 拉取 SPY 日收益率；`_compute_alpha(strat, spy)` 计算年化 alpha | SPY 不可用时 alpha 降级为 0.0（不阻塞回测），所有候选 alpha=0 ��退化为原顺序 |
 | **per-strategy best params 用 Alpha**（迭代 #9 新增） | 每个策略的最优参数选择从 Sharpe 改为 Alpha | 与 top-K 排序口径一致，避免 per-strategy 用 Sharpe 选低收益高稳定的参数 |
 | **ensemble weights 用 Alpha**（迭代 #9 新增） | `_optimize_ensemble_weights` 接收 `spy_returns` 参数，权重计算从 Sharpe 改为 Alpha | 与 top-K 排序口径一致，ensemble 权重直接反映"跑赢 SPY 的程度"；SPY 不可用时退化为等权 |
+| **健全性门槛（Reject Degenerate）**（迭代 #11 新增） | `SingleBacktestResult.closed_trades` 字段 + `_is_degenerate_strategy()` 函数；`_run_group` 在 candidates 构建前剔除 `>= 80%` 标的 `closed_trades==0` 的退化策略；全退化组返回空权重 + `no_valid_strategy=True` 标记 | 退化策略（入场/出场条件互斥，如 Iter #8 `rsi_trend_filter`）仓位靠末尾强平凑出 Sortino/alpha 假象，会骗过 alpha 排序进入权重（Iter #10 实测 alpha=-25%）。`closed_trades` 区分"真交易闭环"与"伪 buy-and-hold"。0.8 阈值保守，只拦"近乎全标的零平仓"，不误伤低频合法策略。`experience.md #8`：sanity → risk → rank，排序前必须先过硬门槛 |
 | **参数按组** | 同组共用参数，不对单只优化 | 防过拟合（详见 02-strategy-engine.md 6.3） |
 | **历史分组对齐** | 矩阵回测使用 point-in-time 分组（按回测时间点重算波动率），而非当前静态分组 | 避免回测静态分组而实盘动态分组导致回测/实盘不一致 |
 | **实盘 ensemble 对齐** | MatrixBacktest 的 ensemble 权重优化须在"单点离散值聚合"语义下验证 | 实盘只取 iloc[-1] 单点离散值加权，与序列级加权不等价，权重必须在相同语义下产出 |
 | **Walk-Forward** | 滚动训练窗口，月度重优化 | 平衡过拟合与适应性 |
 
-### 10.4.1 Top-K 选择三级 Fallback（迭代 #9 新增）
+### 10.4.1 Top-K 选择三级 Fallback（迭代 #9 新增，迭代 #11 前置健全性门槛）
 
 ```
+[迭代 #11 前置] 健全性过滤：剔除 closed_trades==0 比例 ≥ 80% 的退化策略
+                全退化组 → 空权重 + no_valid_strategy=True（hold cash）
+                    ↓
 Tier 1: DD ≤ 20% AND Sortino > 0.5  →  Alpha 降序取 top-K
    ↓ (若空)
 Tier 2: DD ≤ 20%（放宽 Sortino）   →  Alpha 降序取 top-K，WARNING 日志
    ↓ (若空)
 Tier 3: 无 DD 合规候选              →  DD 升序取 top-K，dd_constrained=True
 ```
+
+**迭代 #11 健全性门槛（先于 Tier 1-3）**：
+- `SingleBacktestResult.closed_trades` 字段从 vbt `pf.trades.closed.count()` 提取（区分"真交易闭环"与"末尾强平计 1 笔的伪 buy-and-hold"）
+- 退化定义：组内 `closed_trades==0` 的标的比例 ≥ `DEGENERATE_NO_CLOSE_FRACTION (0.8)`
+- 全退化组返回空权重（持仓现金），不强行选退化策略；标记 `GroupBacktestResult.no_valid_strategy=True`
+- 设计动机（`experience.md #8`）：Iter #10 `rsi_trend_filter` 凭"持仓盯市 + 末尾强平"的 Sortino/alpha 假象骗过 alpha 排序进入 4/6 组权重 → 组合 alpha=-25.26%。`closed_trades` 信号缺失时无健全性门槛可拦住整个灾难。0.8 阈值保守，低频合法策略（每标的 2-3 笔）不会被误伤
 
 **设计动机**（iteration #9 spec §1-2）：
 - Constitution 目标：年化 20-30%（需 alpha +10~20%）

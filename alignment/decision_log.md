@@ -385,3 +385,51 @@
 - **经验教训**: mock 是实现耦合的，当被测函数的内部依赖改变时，mock 需要同步更新。未来应优先用真实数据测试（如 `test_batch_backtest.py` 的数值一致性测试），减少 mock 依赖。
 
 ---
+
+### [2026-07-07 UTC] 迭代 #11 — 三处模糊决策（vbt API、阈值取值、mock 同步）
+
+- **困境描述**: 实现健全性门槛时遇到三处需要判断的决策点：
+  1. spec §4.2 提到的 vbt API `pf.trades.status_closed.count()` 在 vbt 1.0.0 不存在
+  2. `DEGENERATE_NO_CLOSE_FRACTION` 阈值取 0.8 还是更低/更高
+  3. 现有 mock-based 测试（`test_top_k_selection_uses_alpha` 等 4 处）的 `SingleBacktestResult` 构造默认 `closed_trades=0`，会触发新的健全性门槛误判
+
+- **涉及 AI Constitution 条款**:
+  - L1: KPI 可解释 — 健全性门槛是 KPI 之前的硬门槛
+  - L7: 测试纪律 — 新增字段不应破坏现有测试
+  - L9: 进化 — 门槛设计要考虑可调性（回滚/调整成本）
+
+- **决策逻辑**:
+
+  **决策 1: vbt API 用 `pf.trades.closed.count()`**
+  - spec §4.2 已预见并要求实现者查证 vbt 1.0.0 实际 API
+  - 用最小验证脚本确认：单标的 `pf.trades.closed.count()` 返回 int（已平仓交易数）；多标的 `pf[sym].trades.closed.count()` 返回 per-symbol int
+  - 提取失败降级为 0（不抛异常），与 `_safe_float` 同保守语义
+  - **不**用 `pf.trades.records_readable['Status'].value_counts()['Closed']`（DataFrame 路径，慢且类型不稳）
+
+  **决策 2: 阈值取 0.8（保守）**
+  - 0.8 = "近乎全部标的零平仓"才触发，给低频合法策略（如 monthly rebalance 每标的 2-3 笔）留缓冲
+  - 边界：4/5=0.8 触发（>=）、3/5=0.6 不触发。spec §5.7 要求边界测试覆盖
+  - 0.5/0.6 太激进：单只标的数据不足（刚上市）就可能牵连整组判定
+  - 0.9/1.0 太宽松：5 标的里 1 笔 closed_trades 就能蒙混过关，拦不住 rsi_trend_filter 这种"少数熊市标的偶尔触发出场"的情形
+  - 0.8 是经验值，可调（`DEGENERATE_NO_CLOSE_FRACTION` 常量），未来若发现误伤合法策略可上调
+
+  **决策 3: 同步更新 mock 测试，显式传 `closed_trades`**
+  - mock 的 `SingleBacktestResult(sym, strat, params, sharpe, ret, dd, win, trades, returns)` 默认 `closed_trades=0` → 触发健全性门槛 → 测试失败
+  - 选项 A：改健全性门槛只对"多标的"生效（>=2）—— 这是 hack，破坏门槛语义
+  - 选项 B：在 mock 中显式传 `closed_trades=<total_trades>` —— 反映"mock 假定策略闭环"的语义，正确
+  - 选 B：4 处 mock 各加 `closed_trades=` kwarg，与 `total_trades` 同值
+  - 同步更新 `test_batch_backtest.py::_assert_results_match` 加 `closed_trades` 一致性断言
+
+- **决策结果**:
+  - vbt API 用 `pf.trades.closed.count()`，单/多标的一致
+  - `DEGENERATE_NO_CLOSE_FRACTION = 0.8`，注释说明阈值设计动机
+  - 4 处 mock 测试显式传 `closed_trades`，`_assert_results_match` 加一致性断言
+  - 全部 646 测试通过
+
+- **经验教训**:
+  - **spec 预见 API 差异是规范做法**：spec §4.2 明确写了"若 vbt API 名称不同，实现者需查 vbt 1.0.0 实际 API"，省去了与 spec 作者反复确认的成本
+  - **保守阈值 + 边界测试**：取 0.8 而非 0.5/1.0，并在测试中覆盖 4/5=0.8 触发、3/5=0.6 不触发两个边界。阈值是可调常量，未来调整无需改逻辑
+  - **mock 与实现耦合的代价再次验证**：Iter #10 的 decision_log 已记录此教训，Iter #11 再次遇到（新增字段 → mock 默认值触发新逻辑）。强化了"优先用真实数据测试"的原则
+
+---
+

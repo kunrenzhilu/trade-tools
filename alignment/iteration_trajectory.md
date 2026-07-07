@@ -1138,3 +1138,114 @@ Full pytest (excluding live tests):
 > - CodeBuddy 自行更新了 trajectory ✅
 
 ---
+
+## 迭代 #11 — 选择器健全性门槛（Reject Degenerate Strategies）
+
+- **日期**: 2026-07-07 UTC
+- **类型**: 选择器治理漏洞修复（低风险，仅改 `matrix_backtest.py`）
+- **变更摘要**: 给 `SingleBacktestResult` 新增 `closed_trades` 字段（vbt 已平仓交易数），在 `_run_group` 排序前加健全性门槛剔除退化策略（≥ 80% 标的零平仓 = 入场/出场条件互斥的伪 buy-and-hold）；全退化组返回空权重 + `no_valid_strategy` 标记（持仓现金，不强行选退化策略）
+- **状态**: passed
+- **执行时长**: 1 轮对话（手动开发）
+- **测试数**: 626 → 646（+20 新测试用例）
+
+### 背景
+
+Iter #10 的 `--reoptimize`（Alpha 排序）产出灾难性结果：年化 -4.88%，Sortino -0.66，Alpha -25.26%。三方审计 + 本机实测（`tmp/audit_verify.py`）钉死根因 —— `rsi_trend_filter` 入场条件（close>SMA200，上升趋势）与出场条件（close<SMA200，下降趋势）在趋势方向上互斥，5 只股票产生 0 个出场信号，每只只开 1 仓挂到末尾强平，win_rate 全为 NaN。它的 Sortino/alpha 只是持仓盯市假象，不是真实交易能力。**选择器没有任何健全性门槛**让这个伪策略骗过 alpha 排序，进入 4/6 组权重。
+
+### 变更详情
+
+**P0: `SingleBacktestResult.closed_trades` 字段** (`matrix_backtest.py`)
+- 新增 `closed_trades: int = 0` 字段（vbt `pf.trades.closed.count()`，已平仓交易数）
+- 区分"真交易闭环"与"末尾强平计 1 笔的伪 buy-and-hold"
+- 在 `_backtest_one` 和 `_backtest_batch` 中填充；batch 与 single 数值一致（沿用 Iter #10 一致性范式）
+- vbt 1.0 实际 API 是 `pf.trades.closed.count()`（spec 中提到的 `status_closed` 在 1.0 不存在）
+
+**P0: `_is_degenerate_strategy()` 健全性判定函数** (`matrix_backtest.py`)
+- 退化定义：组内 `closed_trades==0` 的标的比例 ≥ `DEGENERATE_NO_CLOSE_FRACTION (0.8)`
+- 阈值取 0.8（保守）：只在"近乎全部标的零平仓"时触发，避免误伤低频合法策略
+- 空结果列表视为退化（True）
+
+**P0: `_run_group` 集成健全性过滤** (`matrix_backtest.py::_run_group`)
+- 在 candidates 构建**之前**插入过滤（`experience.md #8`：sanity → risk → rank）
+- 退化策略 WARNING 日志 + 不进入 candidates（其 `GroupBacktestResult` 存档条目保留供审计）
+- 全退化组：返回空 weights_list，`report.warnings` 追加 `no_valid_strategy` 标记，对应 `GroupBacktestResult.no_valid_strategy=True`
+- 后续 DD/Sortino/Alpha 三级过滤、Alpha 排序、ensemble 权重逻辑全部作用于"通过健全性过滤后的存活候选"，不变
+
+**P0: `GroupBacktestResult.no_valid_strategy` 字段** (`matrix_backtest.py`)
+- 新增 `no_valid_strategy: bool = False` 标记，标记该组是否因全退化而空仓
+- 与 `dd_constrained` 同义但更可读，下游消费方可读此字段判断该组权重的可靠性
+
+**测试** (`tests/test_degenerate_filter.py`, +20 用例)
+- `closed_trades` 字段存在性 + 默认值
+- 正常策略 `closed_trades > 0`；`rsi_trend_filter` 在强趋势上 `closed_trades=0`（退化）
+- batch vs single `closed_trades` 一致性（4 策略 × 多标的）
+- `_is_degenerate_strategy`：空列表、全零、正常、阈值边界（4/5=0.8 触发、3/5=0.6 不触发）、低频不被误伤、单零不牵连整组
+- `_run_group` 集成：退化策略剔除、全退化空仓 + 标记、正常策略不受影响
+- `GroupBacktestResult.no_valid_strategy` 默认 False
+- 同步更新 `test_batch_backtest.py::_assert_results_match` 加 `closed_trades` 一致性断言、`test_result_fields_populated` 加字段类型断言
+- 同步更新 `test_matrix_backtest.py` 中 4 处 mock `_backtest_batch` 的 `SingleBacktestResult` 构造，显式传 `closed_trades` 反映"mock 假定策略闭环"
+
+### 回测结果
+
+- 本轮不运行 `--reoptimize`（spec §6 验收阶段由 Meta-Agent 独立执行）
+- 单元/集成测试全部通过：646 passed, 0 failed, 16 deselected (live)
+- `closed_trades` 提取在真实数据上验证：`rsi_trend_filter` 5 标的 0 closed_trades → 退化；`rsi_mean_revert` 5 标的各 1-2 closed_trades → 不退化
+- batch vs single `closed_trades` 严格一致（4 策略 × 3 标的 × random walk 数据）
+
+### Constitution 合规
+
+- ✅ 未突破 DD 20% 约束（DD 过滤逻辑完全不变）
+- ✅ 测试覆盖率提升（+20 测试，626 → 646）
+- ✅ 未修改策略代码 / 指标代码 / risk / execution（spec §3 排除项遵守）
+- ✅ 未改 alpha 排序为 OOS（→ Iter #12）
+- ✅ 未加 `alpha>0` 硬门槛（→ Iter #12）
+- ✅ 未修 `rsi_trend_filter` 出场逻辑（健全性门槛会自动排除它；策略重设计是独立任务）
+- ✅ 决策可解释（健全性门槛先于排序，退化策略的 Sortino/alpha 假象被拦在 top-K 之前）
+- ✅ 未引入 RL / 未引入不安全依赖
+- ✅ 未触发真实交易
+- ✅ 文档与代码同步（07-backtest-module.md + CODEBUDDY.md + trajectory）
+
+### Experience Learned
+
+- **`closed_trades` 是更便宜的健全性信号**：比 OOS alpha / holdout 早一步、比 win_rate 非 NaN 更直接。`total_trades` 包含末尾强平的 open trade，无法区分"真交易"和"买一次不动"；`closed_trades` 直接反映"完成买卖闭环"的能力
+- **vbt 1.0 API 实测优先**：spec 提到的 `pf.trades.status_closed.count()` 在 vbt 1.0.0 不存在，实际 API 是 `pf.trades.closed.count()`（spec §4.2 已预见并要求实现者查证）。这印证了 `experience.md #1`：不要假设 API，先写最小验证脚本
+- **mock 测试需要同步更新**：当被测对象新增字段（`closed_trades`）且参与选择逻辑（健全性门槛），mock 出的 `SingleBacktestResult` 必须显式设置该字段，否则默认值（0）会触发误判。这是 mock 与实现耦合的代价
+- **0.8 阈值的边界设计**：4/5=0.8 触发（>=）、3/5=0.6 不触发。取 0.8 而非 0.5/0.6 是为了"只在近乎全标的全死时才判退化"，给低频合法策略留缓冲（spec §5.7 边界测试）
+- **健全性过滤先于 candidates 构建**：把退化策略拦在 DD/Sortino/Alpha 三级过滤之前，避免其"漂亮"的盯市假象污染任何后续指标。`experience.md #8` 顺序：sanity → risk → rank
+- **空仓是正确动作**：全退化组返回空权重（持仓现金）而非"矬子里拔将军"强行 top-K。`experience.md #8`：没有候选满足门槛时，正确动作是"空仓/降现金/回退 benchmark"
+
+### 后续建议
+
+1. **Meta-Agent 验收**（spec §6）：运行 `python main.py --reoptimize`，验证：
+   - `rsi_trend_filter` 不再出现在任何组权重中
+   - 各组权重 `backtest_win_rate` 不再是 ≈0 的退化值
+   - PortfolioBacktest 组合指标从 Iter #10 的 alpha=-25% 恢复到 ≈Iter #7 的可信基线（正收益、Sortino>0）
+2. **Iter #12 OOS alpha 排序 + alpha>0 硬门槛**（spec §3 排除项）：健全性门槛只解决"退化策略骗过排序"，不解决"样本内 alpha 过拟合"和"全负 alpha 矬子里拔将军"
+3. **修 `rsi_trend_filter` 出场逻辑**（独立任务）：出场改为均值回归自然出场（RSI 回中性 50）或去掉出场的趋势门槛；趋势过滤只作用于入场。健全性门槛会自动排除当前退化版本
+4. **WF gate 增加 alpha 校验**（`experience.md #8`）：当前 WF 只校验 DD/Sortino 不校验 alpha，Iter #10 WF 4/4 pass 但组合 alpha=-25.26%。需加：平均验证期 alpha>0、最近一轮 alpha>0、无单轮 alpha<-5%
+
+### L7 流水线状态
+```
+✅ Backtest (≥5年, alpha-based selection, batch-optimized, sanity-gated)
+✅ Walk-Forward (4轮, 自动继承 alpha 排序, batch-optimized)
+✅ Portfolio Backtest | ✅ Paper Trading Integrity
+✅ Harness Reliability | ✅ SignalRanker Sortino Priority
+✅ Strategy Diversity (5 策略 pool)
+✅ Alpha-Based Selection (迭代 #9 完成)
+✅ Batch Backtest Optimization (迭代 #10 完成)
+✅ Sanity Gate / Reject Degenerate (迭代 #11 完成)
+⬜ OOS Alpha Sort + alpha>0 Threshold (→ Iter #12)
+⬜ Paper Trade ≥1月 | ⬜ Live
+```
+
+---
+
+> **Orchestrator 验证记录** (自动追加)
+> - 迭代状态: passed
+> - 测试: 0 passed, 0 failed
+> - 违规: 0 条
+> - 高风险文件: 0 个
+> - 测试数变化: 626 → 646
+> - CodeBuddy 自行更新了 trajectory ✅
+
+---

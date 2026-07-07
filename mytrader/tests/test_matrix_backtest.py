@@ -1100,11 +1100,13 @@ class TestAlphaBasedTopKSelection:
                     continue
                 if strategy_name == "dual_ma":
                     results.append(SingleBacktestResult(
-                        sym, strategy_name, params, 1.0, 10.0, 5.0, 55.0, 10, returns_a
+                        sym, strategy_name, params, 1.0, 10.0, 5.0, 55.0, 10, returns_a,
+                        closed_trades=10,
                     ))
                 else:  # rsi_mean_revert
                     results.append(SingleBacktestResult(
-                        sym, strategy_name, params, 1.0, 30.0, 8.0, 50.0, 10, returns_b
+                        sym, strategy_name, params, 1.0, 30.0, 8.0, 50.0, 10, returns_b,
+                        closed_trades=10,
                     ))
             return results
 
@@ -1205,11 +1207,13 @@ class TestAlphaBasedTopKSelection:
                     continue
                 if strategy_name == "dual_ma":
                     results.append(SingleBacktestResult(
-                        sym, strategy_name, params, 0.5, 15.0, 10.0, 50.0, 5, returns_a
+                        sym, strategy_name, params, 0.5, 15.0, 10.0, 50.0, 5, returns_a,
+                        closed_trades=5,
                     ))
                 else:  # rsi_mean_revert
                     results.append(SingleBacktestResult(
-                        sym, strategy_name, params, 1.0, 20.0, 5.0, 55.0, 10, returns_b
+                        sym, strategy_name, params, 1.0, 20.0, 5.0, 55.0, 10, returns_b,
+                        closed_trades=10,
                     ))
             return results
 
@@ -1346,7 +1350,8 @@ class TestAlphaBasedTopKSelection:
                 if df is None or df.empty or len(df) < 30:
                     continue
                 results.append(SingleBacktestResult(
-                    sym, strategy_name, params, 0.3, 5.0, 10.0, 50.0, 3, returns_garbage
+                    sym, strategy_name, params, 0.3, 5.0, 10.0, 50.0, 3, returns_garbage,
+                    closed_trades=3,
                 ))
             return results
 
@@ -1533,11 +1538,13 @@ class TestAlphaBasedTopKSelection:
                     continue
                 if params.get("fast") == 5:  # 参数 A
                     results.append(SingleBacktestResult(
-                        sym, strategy_name, params, sharpe_a, 10.0, 5.0, 55.0, 10, returns_a
+                        sym, strategy_name, params, sharpe_a, 10.0, 5.0, 55.0, 10, returns_a,
+                        closed_trades=10,
                     ))
                 else:  # 参数 B (fast=10)
                     results.append(SingleBacktestResult(
-                        sym, strategy_name, params, sharpe_b, 30.0, 8.0, 50.0, 10, returns_b
+                        sym, strategy_name, params, sharpe_b, 30.0, 8.0, 50.0, 10, returns_b,
+                        closed_trades=10,
                     ))
             return results
 

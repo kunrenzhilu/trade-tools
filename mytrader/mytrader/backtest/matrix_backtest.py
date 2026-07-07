@@ -46,6 +46,14 @@ WALK_FORWARD_VAL_DD_THRESHOLD: float = 15.0
 # fallback：若无候选通过此门槛，放宽过滤（仅保留 DD 硬约束）
 MIN_SORTINO_THRESHOLD: float = 0.5
 
+# 迭代 #11 新增：健全性门槛 —— 识别"退化策略"（几乎不平仓的伪 buy-and-hold）
+# 判定：组内"有效标的中，已平仓交易数为 0 的比例"超过此阈值 → 退化
+# 设计动机：真策略应在多数标的上完成买卖闭环；若近乎所有标的都从不平仓，
+#           说明入场/出场条件矛盾（如 Iter #8 rsi_trend_filter），其收益只是
+#           持仓盯市 + 末尾强平的假象，必须在排序前剔除（experience.md #8）。
+# 阈值取 0.8（保守）：只在"近乎全部标的零平仓"时触发，避免误伤低频合法策略。
+DEGENERATE_NO_CLOSE_FRACTION: float = 0.8
+
 
 # ---------------------------------------------------------------------------
 # 数据结构
@@ -65,6 +73,7 @@ class SingleBacktestResult:
     total_trades: int
     daily_returns: pd.Series    # pf.returns() — 供组合 Sharpe / Sortino 计算
     sortino: float = 0.0       # Constitution L1 首要 KPI（迭代 #1 新增）
+    closed_trades: int = 0     # 迭代 #11 新增：已平仓交易数（区分退化 buy-and-hold）
 
 
 @dataclass
@@ -83,6 +92,7 @@ class GroupBacktestResult:
     portfolio_max_drawdown: float = 0.0     # 等权组合最大回撤（迭代 #2 新增，Constitution L1 KPI）
     dd_constrained: bool = False            # 迭代 #3：该组是否用了 DD fallback（无合规候选）
     backtest_alpha: float = 0.0              # 迭代 #9：alpha vs SPY（百分数），用于排序策略选择
+    no_valid_strategy: bool = False         # 迭代 #11：该组是否因全退化而空仓（hold cash）
 
 
 @dataclass
@@ -259,6 +269,27 @@ def _combine_daily_returns(results: list[SingleBacktestResult]) -> pd.Series:
     return pd.concat(valid, axis=1).mean(axis=1)
 
 
+def _is_degenerate_strategy(results: list[SingleBacktestResult]) -> bool:
+    """判定一个策略在组内是否退化（几乎不产生已平仓交易）（迭代 #11 新增）。
+
+    退化定义：有效标的中 closed_trades==0 的比例 >= DEGENERATE_NO_CLOSE_FRACTION。
+    这类策略的入场/出场条件互斥（如 Iter #8 rsi_trend_filter 趋势过滤锁死均值
+    回归出场），仓位无法平仓，其 Sortino/alpha 只是持仓盯市假象，不代表真实
+    交易能力，必须在排序前剔除（experience.md #8：sanity → risk → rank）。
+
+    Args:
+        results: 单策略多标的的回测结果列表
+
+    Returns:
+        True 表示退化（应剔除）；空结果视为退化（True）
+    """
+    if not results:
+        return True
+    n = len(results)
+    no_close = sum(1 for r in results if r.closed_trades <= 0)
+    return (no_close / n) >= DEGENERATE_NO_CLOSE_FRACTION
+
+
 def _compute_alpha(
     strategy_daily_returns: pd.Series,
     spy_daily_returns: pd.Series | None,
@@ -373,6 +404,14 @@ def _backtest_one(
 
         daily_returns = pf.returns()
 
+        # 迭代 #11：已平仓交易数（用于健全性门槛 _is_degenerate_strategy）
+        # vbt 1.0 API: pf.trades.closed.count() 返回 Status==Closed 的交易数
+        # 区分"真交易闭环"与"末尾强平计 1 笔的伪 buy-and-hold"
+        try:
+            closed_trades = int(pf.trades.closed.count())
+        except Exception:
+            closed_trades = 0
+
         return SingleBacktestResult(
             symbol=str(df.index.name or ""),
             strategy=strategy_name,
@@ -384,6 +423,7 @@ def _backtest_one(
             total_trades=int(_safe_float(stats.get("Total Trades"), default=0.0)),
             daily_returns=daily_returns,
             sortino=_compute_sortino(daily_returns),
+            closed_trades=closed_trades,
         )
     except Exception as e:
         logger.debug(f"[backtest_one] {strategy_name}({params}) failed: {e}")
@@ -525,6 +565,12 @@ def _backtest_batch(
             pf_sym = pf[sym]
             stats = pf_sym.stats()
             daily_returns = pf_sym.returns()
+            # 迭代 #11：已平仓交易数（与 _backtest_one 同 API、同语义）
+            # pf_sym 是单列 pf，pf_sym.trades.closed.count() 返回 int
+            try:
+                closed_trades = int(pf_sym.trades.closed.count())
+            except Exception:
+                closed_trades = 0
             results.append(SingleBacktestResult(
                 symbol=sym,
                 strategy=strategy_name,
@@ -536,6 +582,7 @@ def _backtest_batch(
                 total_trades=int(_safe_float(stats.get("Total Trades"), default=0.0)),
                 daily_returns=daily_returns,
                 sortino=_compute_sortino(daily_returns),
+                closed_trades=closed_trades,
             ))
         except Exception as e:
             logger.debug(
@@ -1134,6 +1181,40 @@ class MatrixBacktest:
                 f"(elapsed {time.time() - group_start:.1f}s)"
             )
             return []
+
+        # 迭代 #11：健全性过滤 —— 排序前先剔除退化策略
+        # （experience.md #8：sanity → risk → rank）
+        # 退化策略 = 组内 ≥ 80% 标的 closed_trades==0（入场/出场条件互斥，
+        # 仓位靠末尾强平凑出 Sortino/alpha 假象）。此类策略必须先于 DD/Sortino/
+        # Alpha 过滤剔除，否则其盯市假象会骗过 alpha 排序进入权重。
+        sane_results: list[tuple[str, dict, list[SingleBacktestResult]]] = []
+        for (strategy, params, results) in group_results:
+            if _is_degenerate_strategy(results):
+                logger.warning(
+                    f"[MatrixBacktest] {group_id}: strategy '{strategy}' is DEGENERATE "
+                    f"(>= {DEGENERATE_NO_CLOSE_FRACTION:.0%} symbols have 0 closed trades) "
+                    f"— excluded before ranking. Its Sortino/alpha is mark-to-market illusion."
+                )
+                continue
+            sane_results.append((strategy, params, results))
+
+        if not sane_results:
+            # 全组退化 → 空权重（持仓现金），标记 no_valid_strategy，不强行选退化策略
+            logger.warning(
+                f"[MatrixBacktest] {group_id}: ALL strategies degenerate — "
+                f"group produces EMPTY weights (hold cash). Marked no_valid_strategy."
+            )
+            report.warnings.append(
+                f"{group_id}: no_valid_strategy (all strategies degenerate)"
+            )
+            # 标记已 append 的 GroupBacktestResult 条目（供审计追溯）
+            for gr in report.group_results:
+                if gr.group_id == group_id:
+                    gr.no_valid_strategy = True
+            return []
+
+        # 后续 candidates 构建、DD/Sortino/Alpha 过滤、排序，全部改用 sane_results
+        group_results = sane_results
 
         # 3. 迭代 #9：DD 硬约束 + Sortino 门槛 + Alpha 排序选 Top-K
         #    Constitution L1: portfolio DD ≤ 20% 是硬约束（保留）

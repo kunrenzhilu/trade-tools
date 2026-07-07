@@ -113,9 +113,9 @@ Run the orchestrator with the spec-guided task. **Do NOT modify orchestrator.py 
 
 Monitor via heartbeat log. If ACP buffer overflow occurs, the orchestrator will log it but continue (non-fatal).
 
-### Phase 3: Summary (Result Judgment + Documentation)
+### Phase 3: Summary (Result Judgment + Documentation + Commit)
 
-**After** CodeBuddy completes (or ACP crashes), Meta-Agent must produce a summary document.
+**After** CodeBuddy completes (or ACP crashes), Meta-Agent must produce a summary document, independently verify results, and **commit the iteration's output to git** (版本解耦).
 
 #### Workflow
 
@@ -136,6 +136,8 @@ Monitor via heartbeat log. If ACP buffer overflow occurs, the orchestrator will 
    - Did the actual trading metrics improve? (Run `--reoptimize` if strategy-related)
    - Did the system get closer to the Sortino/DD/return targets?
    - Is the system more deployable now than before?
+   - **Is the strategy actually trading?** Check `backtest_win_rate` in `strategy_weights.json`: NaN or ≈0 means degenerate (no closed trades) — the metrics are fake. A "selected" strategy is NOT a "valid" strategy.
+   - **Did alpha actually improve out-of-sample?** In-sample alpha/Sortino means nothing if the portfolio backtest (recent period) shows negative alpha. Always compare in-sample selection metric vs OOS portfolio result — a large gap = overfitting.
 
    **C. Strategic Fit (Was this the right thing to do?)**
    - Could the time have been better spent on a different task?
@@ -150,6 +152,56 @@ Monitor via heartbeat log. If ACP buffer overflow occurs, the orchestrator will 
    - **Gate status** (Gate 1/2/3 pass/fail with numbers)
    - **Next steps** (what the next iteration should focus on — this is the input for the next Plan phase)
    - **Lessons learned** (what worked, what didn't, what to do differently)
+
+4. **Commit & Push** (版本解耦 — 每次迭代验证通过后必须 commit):
+
+   **前置条件**（全部满足才 commit）：
+   - pytest 0 failed（独立验证，非 CodeBuddy 自报）
+   - `iterations/iteration_N/spec.md` 和 `summary.md` 都存在
+   - 迭代判定不是 REVERT（如果是 REVERT，先 `git stash` 或 `git checkout -- .` 丢弃改动）
+
+   **步骤**：
+
+   a. **检查 git status**，确认改动范围吻合 spec（无意外文件）：
+      ```bash
+      cd /Users/rickouyang/Github/trade-tools && git status --short
+      ```
+
+   b. **Stage 迭代产出**（按类别 add，不用 `git add -A` 以防误加）：
+      ```bash
+      git add iterations/iteration_N/           # spec + summary + snapshot
+      git add mytrader/mytrader/ mytrader/tests/  # 代码 + 测试
+      git add mytrader/designs/                   # 设计文档
+      git add mytrader/config/strategy_weights.json  # reoptimize 产出（如有）
+      git add alignment/                          # trajectory + decision_log
+      git add .codebuddy/CODEBUDDY.md             # 项目状态
+      git add .codebuddy/notes/experience.md      # 经验提炼（如有）
+      ```
+
+   c. **Commit**（message 格式必须包含测试数和关键指标，便于跨迭代对比）：
+      ```bash
+      git commit -m "Iter #N: <一句话描述>
+
+      - Tests: <before> → <after>
+      - Key metrics: Sortino=<x>, DD=<x>%, Alpha=<x>%
+      - Files: <count> changed (+<additions>/-<deletions>)
+
+      Spec: iterations/iteration_N/spec.md
+      Summary: iterations/iteration_N/summary.md"
+      ```
+
+   d. **Push**：
+      ```bash
+      git push origin master
+      ```
+
+   **规则**：
+   - pytest 有 failed → **不 commit**（先修复或 `git stash` 保留改动）
+   - 缺 spec.md 或 summary.md → **不 commit**（迭代记录不完整）
+   - 用户明确说"不要 commit" → 尊重用户意愿
+   - `reports/` 目录不 commit（.gitignore 已排除）
+   - `experience.md` 和 `SKILL.md` 的手动编辑（非 CodeBuddy 产出）也应包含在 commit 中，因为它们是迭代的一部分
+   - commit 后 `git status` 应该 clean（除 .gitignore 文件外）—— 这是下一轮迭代干净起点的保证
 
 #### Summary template
 
@@ -190,6 +242,8 @@ Monitor via heartbeat log. If ACP buffer overflow occurs, the orchestrator will 
 ```
 
 ### Phase 4: Next Iteration Planning
+
+> **前置条件**：Phase 3 的 Commit & Push 已完成，`git status` clean。每轮迭代从干净的 git 状态开始，确保版本解耦。
 
 Based on the judgment, decide what CodeBuddy should do next:
 
@@ -266,6 +320,23 @@ Tests passing is necessary but not sufficient. After strategy changes:
 3. Look at actual Sortino/Sharpe/DD numbers — are they reasonable?
 4. Compare to previous iteration — did things get better or worse?
 
+### 7. "Selected" ≠ "Valid" — and In-Sample Ranking Always Overfits
+
+**The Iter #8/9/10 disaster in one principle.** When an iteration's goal is "make strategy X get selected," and it succeeds, that is NOT success. A strategy entering the weights table only proves the selector picked it — not that it works.
+
+- **A metric is a filter, not the target.** Don't change the ranking metric (Sortino→Alpha) just to make a favored strategy rank higher. That treats the symptom and amplifies overfitting. Ask first: *is the underlying strategy even valid?*
+- **Selecting on in-sample data always overfits, regardless of metric.** If parameter search AND strategy selection both happen on the same 5-year window, the "best" strategy is curve-fit. Selection must use out-of-sample signal (Walk-Forward validation-period metrics, or a dedicated holdout period).
+- **When results get worse, first suspect the input (strategy/data), then the metric.** DeepSeek's audit was wrong precisely because it insisted "the strategy isn't broken, only the method is" — while the strategy was structurally broken (0 exit signals). Don't mis-locate the root cause one abstraction layer too high.
+- **Hard gates before ranking.** Order: ① sanity (closed trades / win_rate not degenerate) → ② risk (DD ≤ 20%) → ③ positive excess return (alpha > 0) → then rank survivors. If no candidate passes, the correct action is cash/benchmark fallback, NOT "pick the least-bad negative-alpha one."
+
+### 8. Distinguish "Why it's broken" from "Why it wasn't caught"
+
+When diagnosing a failed iteration, separate two questions:
+- **Why is the output bad?** → usually a code/logic/strategy defect (proximate cause).
+- **Why did the harness/gates let it through?** → a governance/gate gap.
+
+Both need fixing, but they live in different layers. A single cheap gate (e.g. "min closed trades ≥ N") often catches the problem earlier and cheaper than an elaborate methodology fix. Prefer the earliest, cheapest gate that would have caught it.
+
 ## Interaction with cb-acp-dev
 
 `cb-acp-dev` is the **execution layer** — it handles ACP protocol, monitoring, compliance checks.
@@ -313,11 +384,15 @@ The strategy doesn't need to be optimal — it just needs to not be garbage:
 
 | Condition | Threshold | Rationale |
 |-----------|-----------|-----------|
+| **Trade health (no degenerate)** | Each symbol has closed trades ≥ 3, `win_rate` is NOT NaN/≈0 | A strategy that never closes positions is a fake buy-and-hold, not a strategy (Iter #8 lesson) |
 | Sortino | > 0.5 | Below 0.5 = no better than random, no testing value |
 | Max DD | ≤ 20% | Constitution hard constraint |
+| **Positive alpha (OOS)** | Walk-Forward avg validation alpha > 0, no round with alpha < -5% | DD/Sortino passing ≠ beating benchmark. Iter #10 had WF 4/4 pass but portfolio alpha = -25% |
 | Walk-Forward | 4 rounds, no round with >15% loss | Not required to profit every round, but no disasters |
 | Ensemble diversity | ≥ 2 strategies in weights | Single strategy = no ensemble, fix that first |
 | Run `--reoptimize` | Actual weights produced, verified | Must have real numbers, not just code that should work |
+
+**Critical (Iter #8/9/10 lesson)**: Before trusting any Sortino/alpha in `strategy_weights.json`, check `backtest_win_rate`. A value of NaN or ≈0 (e.g. 0.0053) means the strategy produced almost no closed trades — its "returns" are just mark-to-market on a never-closed position (degenerate buy-and-hold). Such a strategy must NOT enter weights regardless of how high its alpha looks. This is a data sanity check, not an optional nicety.
 
 **If Gate 1 fails**: Continue iterating on strategy code. Do NOT go to paper.
 

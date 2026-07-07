@@ -158,6 +158,10 @@ def _assert_results_match(
     assert old.total_trades == new.total_trades, msg(
         f"total_trades mismatch: old={old.total_trades}, new={new.total_trades}"
     )
+    # 迭代 #11：closed_trades 严格一致（与 total_trades 同口径，从 vbt 提取）
+    assert old.closed_trades == new.closed_trades, msg(
+        f"closed_trades mismatch: old={old.closed_trades}, new={new.closed_trades}"
+    )
     # sortino 从 daily_returns 派生，应严格一致
     assert abs(old.sortino - new.sortino) < 1e-6, msg(
         f"sortino mismatch: old={old.sortino}, new={new.sortino}"
@@ -381,6 +385,9 @@ class TestBatchOutputFormat:
             assert isinstance(r.win_rate_pct, float)
             assert isinstance(r.total_trades, int)
             assert isinstance(r.sortino, float)
+            # 迭代 #11：closed_trades 字段必须存在且为 int
+            assert isinstance(r.closed_trades, int)
+            assert r.closed_trades >= 0
             assert not r.daily_returns.empty
             # 所有数值字段都应是有限值（_safe_float 已处理 NaN）
             for v in [r.sharpe, r.total_return_pct, r.max_drawdown_pct,

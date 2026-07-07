@@ -433,3 +433,28 @@
 
 ---
 
+### [2026-07-07 UTC] 迭代 #12 — alpha>0 门槛位置 + ensemble 归一化修复
+
+- **困境描述**: 实现 alpha>0 硬门槛时遇到两处需要判断的决策点：
+  1. alpha>0 门槛应该放在 top-K 选择之前还是之后？
+  2. `_optimize_ensemble_weights` 的负 alpha 归一化如何修？
+
+- **决策逻辑**:
+
+  **决策 1: alpha>0 门槛放在 Tier 1/2/3 之前（candidates 构建后）**
+  - `experience.md #8` 的门槛顺序：① 健全性 → ② 风险(DD) → ③ 正超额(alpha>0) → ④ 排序
+  - 放在 Tier 1 前：确保 Tier 1/2/3 只在正 alpha 候选中进行，不会遗漏正 alpha 策略
+  - 放在 top-K 后的缺点：如果 top-K 都是负 alpha，会空仓，但 top-K 之外可能有正 alpha 策略被遗漏
+
+  **决策 2: `_optimize_ensemble_weights` 用 `max(alpha, 0.0)` 替代 `max(alpha, 0.01)`**
+  - 旧代码 `max(alpha, 0.01)`：alpha=-7.79 和 alpha=-1.49 都变成 0.01 → 归一化后 50/50 等权
+  - 新代码 `max(alpha, 0.0)`：负 alpha 权重为 0，只有正 alpha 参与归一化
+  - 全负 alpha 时等权 fallback + WARNING（防御性设计，上游 alpha>0 门槛应已拦截）
+
+- **决策结果**: alpha>0 门槛在 Tier 1 前 + ensemble 用 `max(alpha, 0.0)`；659 测试通过
+
+- **经验教训**:
+  - 门槛顺序很重要：alpha>0 放在排序前比排序后更符合 experience.md #8，避免遗漏正 alpha 策略
+  - `max(x, ε)` 是危险的归一化模式：把"都不好"变成"等权都要"，掩盖质量问题。正确做法是让坏值权重为 0
+
+---

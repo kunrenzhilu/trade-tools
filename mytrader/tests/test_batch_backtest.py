@@ -433,12 +433,19 @@ class TestRunGroupBatchIntegration:
     """验证 _run_group 使用 _backtest_batch 后仍产出正确结果。"""
 
     def test_run_group_still_produces_weights(self) -> None:
-        """_run_group 使用 batch 后仍产出非空权重列表。"""
+        """_run_group 使用 batch 后仍产出非空权重列表。
+
+        迭代 #12：alpha>0 门槛需要 SPY benchmark 数据。用 trend="down" 的
+        SPY（负收益）确保 dual_ma 在 random walk 上的收益跑赢 SPY（alpha > 0）。
+        """
         data = _make_multi_symbol_data(
             ["AAPL", "MSFT"], n=300, trend="random", seed=11
         )
-        store = _make_mock_store(data)
-        # _get_spy_returns 会被调用，返回 None 即可（alpha 退化为 0）
+        # 迭代 #12：加 SPY benchmark（trend="down" → 负收益），
+        # 确保 dual_ma 的 random walk 收益跑赢 SPY（alpha > 0）
+        data_with_spy = dict(data)
+        data_with_spy["SPY"] = _make_ohlcv(300, trend="down")
+        store = _make_mock_store(data_with_spy)
         universe = _make_mock_universe({"TEST_GROUP": ["AAPL", "MSFT"]})
 
         mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)

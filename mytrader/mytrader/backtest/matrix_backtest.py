@@ -93,6 +93,7 @@ class GroupBacktestResult:
     dd_constrained: bool = False            # 迭代 #3：该组是否用了 DD fallback（无合规候选）
     backtest_alpha: float = 0.0              # 迭代 #9：alpha vs SPY（百分数），用于排序策略选择
     no_valid_strategy: bool = False         # 迭代 #11：该组是否因全退化而空仓（hold cash）
+    no_positive_alpha: bool = False         # 迭代 #12：该组是否因全负 alpha 而空仓（hold cash）
 
 
 @dataclass
@@ -669,6 +670,12 @@ def _optimize_ensemble_weights(
     动机：与 _run_group 的 top-K 排序口径一致，使 ensemble 权重直接
     反映"跑赢 SPY 的程度"。SPY 不可用时 alpha=0，退化为等权。
 
+    迭代 #12：修负 alpha 归一化 bug。
+    旧代码 `max(alpha, 0.01)` 把负 alpha 都变成 0.01，归一化后等权，
+    掩盖"都不好"的事实（experience.md #8）。新逻辑：负 alpha 权重为 0，
+    只有正 alpha 参与归一化；全负 alpha 时等权 fallback + WARNING
+    （上游 alpha>0 门槛应已拦截，此处为防御性设计）。
+
     Args:
         group_results: [(strategy, params, [SingleBacktestResult]), ...]
         spy_returns:   SPY 日收益率序列（用于 alpha 计算）；None 时退化为等权
@@ -681,16 +688,32 @@ def _optimize_ensemble_weights(
         strategy, params, _ = group_results[0]
         return [(strategy, params, 1.0)]
 
-    # 迭代 #9：用各策略的组合 alpha 归一化为权重（替代 Sharpe）
-    # alpha 可能 < 0（跑输 SPY），用 max(alpha, 0.01) 避免负权重
-    alphas = []
+    # 迭代 #12：负 alpha 策略不参与 ensemble（experience.md #8：负分不能用 max(x, ε) 掩盖）
+    # 只有正 alpha 的策略参与归一化；负 alpha 策略权重为 0。
+    # 上游 _run_group 的 alpha>0 门槛应已拦截全负 alpha 情形，
+    # 这里是防御性设计：即使上游漏过负 alpha，也不会被 max(0.01) 掩盖成等权。
+    raw_alphas = []
     for strategy, params, results in group_results:
         combined = _combine_daily_returns(results)
         alpha = _compute_alpha(combined, spy_returns)
-        alphas.append(max(alpha, 0.01))  # 避免负/零权重
+        raw_alphas.append(alpha)
 
-    total = sum(alphas)
-    weights = [a / total for a in alphas]
+    # 负 alpha → 权重 0；正 alpha → 参与归一化
+    positive_alphas = [max(a, 0.0) for a in raw_alphas]
+    total = sum(positive_alphas)
+
+    if total > 0:
+        weights = [a / total for a in positive_alphas]
+    else:
+        # 防御性 fallback：全负 alpha 或全零时等权
+        # （上游 alpha>0 门槛应已拦截，此处不应到达）
+        n = len(group_results)
+        weights = [1.0 / n] * n if n > 0 else []
+        logger.warning(
+            f"[ensemble_weights] all alphas <= 0 ({raw_alphas}), "
+            f"falling back to equal weight. This should not happen if "
+            f"alpha>0 gate is active upstream."
+        )
 
     return [
         (strategy, params, weight)
@@ -1234,6 +1257,37 @@ class MatrixBacktest:
             # 复用 _combine_daily_returns 计算 alpha（与 per-strategy 选择一致）
             alpha = _compute_alpha(_combine_daily_returns(results), spy_returns)
             candidates.append((strategy, params, results, pso, pdd, alpha))
+
+        # 迭代 #12：alpha>0 硬门槛（experience.md #8：正超额是排序前的硬门槛）
+        # 在 Tier 1/2/3 fallback 之前，剔除 alpha≤0 的候选。
+        # 理由：跑不赢 SPY 的策略不应进入权重，无论 DD/Sortino 多好。
+        # 顺序：健全性（Iter #11）→ 风险（DD，Tier 1/2/3）→ 正超额（alpha>0，本步）→ 排序
+        #
+        # 注意：这一步在 candidates 构建后、Tier 1 前，确保 Tier 1/2/3 只在正 alpha 候选中进行。
+        # 如果某组所有候选 alpha≤0，该组空仓（hold cash），不强行选负 alpha 策略
+        # （experience.md #8："没有候选满足门槛时，正确动作是空仓/降现金/回退 benchmark，
+        #   不是矬子里拔将军"）。
+        positive_alpha_candidates = [c for c in candidates if c[5] > 0]
+
+        if not positive_alpha_candidates:
+            # 全组 alpha≤0 → 空权重（持仓现金），标记 no_positive_alpha
+            alpha_strs = [f"{c[0]}({c[5]:.2f}%)" for c in candidates]
+            logger.warning(
+                f"[MatrixBacktest] {group_id}: ALL {len(candidates)} candidates have "
+                f"alpha <= 0 (cannot beat SPY) — {alpha_strs}. "
+                f"Group produces EMPTY weights (hold cash). Marked no_positive_alpha."
+            )
+            report.warnings.append(
+                f"{group_id}: no_positive_alpha (all {len(candidates)} candidates alpha <= 0)"
+            )
+            # 标记已 append 的 GroupBacktestResult 条目（供审计追溯）
+            for gr in report.group_results:
+                if gr.group_id == group_id:
+                    gr.no_positive_alpha = True
+            return []
+
+        # 后续 Tier 1/2/3 在正 alpha 候选中进行
+        candidates = positive_alpha_candidates
 
         # Tier 1: DD ≤ 20% AND Sortino > 0.5
         compliant = [

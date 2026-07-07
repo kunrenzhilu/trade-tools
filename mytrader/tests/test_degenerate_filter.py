@@ -388,7 +388,12 @@ class TestRunGroupDegenerateIntegration:
         data = _make_multi_symbol_data(
             ["AAA", "BBB", "CCC", "DDD", "EEE"], n=300, trend="random", seed=11
         )
-        store = _make_mock_store(data)
+        # 迭代 #12：alpha>0 门槛需要 SPY benchmark 数据。
+        # rsi_mean_revert 的 mock returns 均值 0.0008（年化 ~22%），
+        # 用 trend="down" 的 SPY（年化 ~-13%）确保 alpha > 0。
+        data_with_spy = dict(data)
+        data_with_spy["SPY"] = _make_ohlcv(300, trend="down")
+        store = _make_mock_store(data_with_spy)
         universe = _make_mock_universe({"test_group": list(data.keys())})
 
         mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
@@ -528,11 +533,19 @@ class TestRunGroupDegenerateIntegration:
         验证健全性门槛不会误伤正常策略 —— 用真实 _backtest_batch（不 mock）
         跑 dual_ma 在 random walk 数据上，应正常产出权重，且不触发
         no_valid_strategy 标记。
+
+        迭代 #12：新增 alpha>0 门槛后，需确保 mock 的策略 alpha > 0。
+        用 trend="down" 的 SPY（负收益）确保 dual_ma 在 random walk 上
+        的收益跑赢 SPY（alpha > 0）。
         """
         data = _make_multi_symbol_data(
             ["AAA", "BBB", "CCC"], n=300, trend="random", seed=33
         )
-        store = _make_mock_store(data)
+        # 迭代 #12：加 SPY benchmark（trend="down" → 负收益），
+        # 确保 dual_ma 的 random walk 收益跑赢 SPY（alpha > 0）
+        data_with_spy = dict(data)
+        data_with_spy["SPY"] = _make_ohlcv(300, trend="down")
+        store = _make_mock_store(data_with_spy)
         universe = _make_mock_universe({"test_group": list(data.keys())})
 
         mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)

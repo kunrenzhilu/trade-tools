@@ -1249,3 +1249,49 @@ Iter #10 的 `--reoptimize`（Alpha 排序）产出灾难性结果：年化 -4.8
 > - CodeBuddy 自行更新了 trajectory ✅
 
 ---
+
+## 迭代 #12 — Alpha>0 硬门槛（Reject Negative-Alpha Strategies）
+
+- **日期**: 2026-07-07 UTC
+- **类型**: 选择器治理漏洞修复（低风险，仅改 `matrix_backtest.py` 选择器 + ensemble 权重）
+- **变更摘要**: 在 `_run_group` Tier 1/2/3 排序之前加 alpha>0 硬门槛（剔除跑不赢 SPY 的策略）；全负 alpha 组返回空权重 + `no_positive_alpha` 标记；修 `_optimize_ensemble_weights` 负 alpha 归一化 bug（`max(alpha,0.01)` → `max(alpha,0.0)`）
+- **状态**: passed
+- **执行时长**: ~17 分钟（orchestrator），248 次工具调用
+- **测试数**: 646 → 659（+13 新测试用例）
+
+### 背景
+
+Iter #11 健全性门槛成功剔除了退化策略（rsi_trend_filter 从 4/6 组降到 1/6 组），但 reoptimize 完整结果显示组合 alpha=-21.41%——11 条权重中 9 条负 alpha（in-sample），系统正在用 9 个"5 年跑不赢 SPY"的策略组合去交易。WF 4/4 全过（Sortino 1.56~2.09）但 PortfolioBacktest alpha=-21%，精确复现审计报告 §5 第 6 点"WF gate 不校验 alpha"。
+
+### 变更详情
+
+**P0: `GroupBacktestResult.no_positive_alpha` 字段** (`matrix_backtest.py`)
+- 新增 `no_positive_alpha: bool = False` 标记，标记该组是否因全负 alpha 而空仓
+
+**P0: `_run_group` alpha>0 硬门槛** (`matrix_backtest.py::_run_group`)
+- 在 candidates 构建后、Tier 1/2/3 之前，剔除 `alpha≤0` 的候选
+- 全负 alpha 组返回空权重 + `no_positive_alpha=True` 标记
+- 符合 `experience.md #8` 的门槛顺序：健全性 → 风险(DD) → 正超额(alpha>0) → 排序
+
+**P0: `_optimize_ensemble_weights` 负 alpha 归一化修复** (`matrix_backtest.py`)
+- 旧代码 `max(alpha, 0.01)` 把负 alpha 都变成 0.01 → 归一化后等权，掩盖"都不好"
+- 新代码 `max(alpha, 0.0)` → 负 alpha 权重为 0，只有正 alpha 参与归一化
+- 全负 alpha 时等权 fallback + WARNING（防御性设计，上游 alpha>0 门槛应已拦截）
+
+**测试** (`tests/test_alpha_gate.py`, +13 用例)
+- `no_positive_alpha` 字段默认值 + 可设置
+- 全正 alpha 组正常产出权重；全负 alpha 组返回空权重 + 标记
+- 混合 alpha 组只保留正 alpha 候选
+- 健全性门槛 + alpha 门槛协同工作（退化策略先被健全性剔除，负 alpha 再被 alpha 门槛剔除）
+- `_optimize_ensemble_weights`：负 alpha 权重为 0、全正 alpha 正常归一化、混合只正 alpha 加权、全负 fallback 等权 + WARNING
+- SPY 不可用时退化为等权（与 Iter #9 行为一致）
+- 同步更新 3 个现有测试文件的 SPY benchmark 数据（用 trend="down" 的 SPY 确保策略 alpha>0，避免被新门槛误杀）
+
+### Constitution 合规
+- ✅ 未突破 DD 20% 约束（alpha>0 门槛不影响 DD 过滤）
+- ✅ 测试覆盖率提升（+13 测试）
+- ✅ 未引入黑箱策略 / 未引入 RL
+- ✅ 文档与代码同步（07-backtest-module.md + trajectory + decision_log + CODEBUDDY）
+- ✅ 低风险变更（仅选择器逻辑），符合自动部署条件
+
+---

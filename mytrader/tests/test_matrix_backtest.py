@@ -1312,18 +1312,19 @@ class TestAlphaBasedTopKSelection:
         场景：构造低 Sortino 的策略，但 DD ≤ 20%。
         验证：权重仍产出（不空），dd_constrained=False（因为 DD 合规），
         且日志中应有 "Sortino filter relaxed" 警告。
+
+        迭代 #12：alpha>0 门槛要求候选 alpha > 0。原 SPY 年化 ~10%，
+        策略均值 ~0.0001 → 负 alpha，被 alpha 门槛拦截。
+        改用 declining SPY（年化 ~-13%），使策略的低正收益（~2.5% 年化）
+        也能跑赢 SPY → 正 alpha，从而到达 Tier 1/2 验证 Sortino fallback。
         """
         from unittest.mock import patch
         from loguru import logger
 
         n = 300
         idx = pd.date_range("2021-01-01", periods=n, freq="B")
-        spy_df = pd.DataFrame({
-            "open": [99.9], "high": [100.5], "low": [99.5],
-            "close": [100.0], "volume": [1_000_000],
-        }, index=idx[:1])
-        # 让 SPY 数据足够长
-        spy_close = [100.0 * (1.0004 ** i) for i in range(n)]
+        # 迭代 #12：SPY 下跌（年化 ~-13%），让策略低正收益也能跑赢 → 正 alpha
+        spy_close = [100.0 * (0.9995 ** i) for i in range(n)]
         spy_df = pd.DataFrame({
             "open": [c - 0.1 for c in spy_close],
             "high": [c + 0.5 for c in spy_close],
@@ -1332,7 +1333,7 @@ class TestAlphaBasedTopKSelection:
             "volume": [1_000_000] * n,
         }, index=idx)
 
-        # 低 Sortino 但 DD 合规的收益序列
+        # 低 Sortino 但 DD 合规的收益序列（均值 ~0.0001，年化 ~2.5%）
         np.random.seed(42)
         returns_garbage = pd.Series(
             np.concatenate([
@@ -1343,6 +1344,12 @@ class TestAlphaBasedTopKSelection:
         )
         # 验证前提：Sortino < 0.5（垃圾门槛）
         assert _compute_sortino(returns_garbage) < MIN_SORTINO_THRESHOLD
+        # 迭代 #12：验证 alpha > 0（跑赢 declining SPY）
+        spy_returns = spy_df["close"].pct_change().dropna()
+        alpha = _compute_alpha(returns_garbage, spy_returns)
+        assert alpha > 0, (
+            f"策略应跑赢 declining SPY（正 alpha），实际 {alpha:.4f}"
+        )
 
         def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
             results = []

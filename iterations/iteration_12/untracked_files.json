@@ -1,0 +1,20 @@
+[
+  {
+    "path": "iterations/iteration_12/code_diff.patch",
+    "size": 619,
+    "sha256": "ff4b28d0842b532abc4fc799cae36b82384d9fa63b56d34c621dbc57e02dbf9a",
+    "sensitive": false
+  },
+  {
+    "path": "iterations/iteration_12/full_response.md",
+    "size": 681351,
+    "sha256": "5cfcebc74f767045cff8e83d52b90d95d779f547cfb0f2e5f19bf95cba86e596",
+    "sensitive": false
+  },
+  {
+    "path": "iterations/iteration_12/result.json",
+    "size": 3709,
+    "sha256": "8d323d581ff317d8bc00e23e8a93f1a0ce5507557e718fddd3e0a7c0949ccaae",
+    "sensitive": false
+  }
+]

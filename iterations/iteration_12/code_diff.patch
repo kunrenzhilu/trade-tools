@@ -1,0 +1,18 @@
+diff --git a/alignment/iteration_trajectory.md b/alignment/iteration_trajectory.md
+index f4f51f2..143f90e 100644
+--- a/alignment/iteration_trajectory.md
++++ b/alignment/iteration_trajectory.md
+@@ -1295,3 +1295,13 @@ Iter #11 健全性门槛成功剔除了退化策略（rsi_trend_filter 从 4/6 
+ - ✅ 低风险变更（仅选择器逻辑），符合自动部署条件
+ 
+ ---
++
++> **Orchestrator 验证记录** (自动追加)
++> - 迭代状态: passed
++> - 测试: 0 passed, 0 failed
++> - 违规: 0 条
++> - 高风险文件: 0 个
++> - 测试数变化: 646 → 659
++> - CodeBuddy 自行更新了 trajectory ✅
++
++---

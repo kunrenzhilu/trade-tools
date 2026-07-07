@@ -29,6 +29,7 @@ from mytrader.backtest.matrix_backtest import (
     _safe_mean,
     MAX_PORTFOLIO_DRAWDOWN_PCT,
     MIN_SORTINO_THRESHOLD,
+    WALK_FORWARD_VAL_ALPHA_FLOOR,
     WALK_FORWARD_VAL_DD_THRESHOLD,
     SingleBacktestResult,
     WalkForwardReport,
@@ -916,10 +917,20 @@ class TestWalkForward:
             assert isinstance(r.val_sortino, float)
             assert isinstance(r.val_max_dd, float)
             assert r.val_max_dd >= 0.0
+            assert isinstance(r.val_alpha, float)  # 迭代 #13：val_alpha 字段
             assert isinstance(r.passed, bool)
-            assert r.passed == (r.val_max_dd <= WALK_FORWARD_VAL_DD_THRESHOLD)
+            # 迭代 #13：passed = DD ≤ 15% AND alpha > -5%
+            expected_round_passed = (
+                r.val_max_dd <= WALK_FORWARD_VAL_DD_THRESHOLD
+                and r.val_alpha > WALK_FORWARD_VAL_ALPHA_FLOOR
+            )
+            assert r.passed == expected_round_passed
 
-        expected_pass = all(r.passed for r in report.rounds)
+        # 迭代 #13：pass_all_rounds = all rounds passed AND avg_val_alpha > 0
+        expected_pass = (
+            all(r.passed for r in report.rounds)
+            and report.avg_val_alpha > 0
+        )
         assert report.pass_all_rounds == expected_pass
         expected_max_dd = max(r.val_max_dd for r in report.rounds)
         assert abs(report.max_val_dd - expected_max_dd) < 1e-9

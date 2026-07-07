@@ -458,3 +458,39 @@
   - `max(x, ε)` 是危险的归一化模式：把"都不好"变成"等权都要"，掩盖质量问题。正确做法是让坏值权重为 0
 
 ---
+
+### [2026-07-08 UTC] 迭代 #13 — WF alpha gate 设计（单轮 floor + 汇总 avg 两层）
+
+- **困境描述**: 给 WF gate 加 alpha 校验时，需要决定：① 单轮 alpha 门槛用严格 > 0 还是允许小幅负值？② 汇总 pass_all_rounds 用什么条件？③ `val_alpha` 字段放在 dataclass 的什么位置？
+
+- **决策逻辑**:
+
+  **决策 1: 单轮 alpha floor = -5%（允许小幅跑输），汇总 avg > 0（平均必须跑赢）**
+  - 选项 A：单轮严格 alpha > 0 → 过严，单轮噪音可能误杀好策略（某轮恰好遇到 SPY 强势期）
+  - 选项 B：单轮 alpha > -5% + 汇总 avg > 0 → 允许单轮小幅跑输（市场噪音），但整体必须跑赢
+  - 选 B：两层设计更鲁棒。单轮 floor 拦截灾难性跑输（< -5%），汇总 avg 拦截系统性跑输
+  - floor 取 -5% 而非 -10%：-5% 已经是显著跑输（年化差 5 个百分点），更低的 floor 等于没门槛
+
+  **决策 2: `val_alpha` 字段放在 `passed` 之后（而非 spec 建议的之前）**
+  - spec 原文建议 `val_alpha` 放在 `passed` 之前，但这会导致 dataclass 字段顺序错误（有默认值的字段不能在无默认值的字段之前）
+  - 选项 A：给 `passed` 加默认值 `False` → 改变现有语义（`passed` 应该是必填的）
+  - 选项 B：把 `val_alpha` 放在 `passed` 之后 → 保持 `passed` 无默认值，`val_alpha` 有默认值 0.0
+  - 选 B：向后兼容（现有测试用 8 个位置参数 `WalkForwardRound(1, date, date, date, date, 1.0, 10.0, True)` 不需要修改），且 dataclass 字段顺序合法
+
+  **决策 3: SPY 不可用时 val_alpha=0.0 + pass_all_rounds=False（保守拒绝）**
+  - 选项 A：SPY 不可用时跳过 alpha gate（只校验 DD）→ 退化为旧逻辑，违反目标一致性
+  - 选项 B：SPY 不可用时 val_alpha=0.0 → avg=0 → pass_all_rounds=False（保守拒绝）
+  - 选 B：benchmark 数据缺失时应该保守拒绝，而不是放行。这迫使系统确保 SPY 数据可用
+
+- **决策结果**:
+  - 单轮 floor=-5% + 汇总 avg>0 两层 gate
+  - `val_alpha` 放在 `passed` 之后（向后兼容）
+  - SPY 不可用时保守拒绝（pass_all_rounds=False）
+  - 675 测试通过
+
+- **经验教训**:
+  - **spec 的字段顺序建议可能有 dataclass 兼容性问题**：spec 原文画了 `val_alpha` 在 `passed` 之前，但 Python dataclass 要求有默认值的字段在无默认值的之后。实现时需要判断 spec 的意图（加 alpha 字段）而非字面照搬
+  - **两层 gate 比单层更鲁棒**：单轮 floor 拦截灾难，汇总 avg 拦截系统性问题。这比"每轮都必须 > 0"更容错，避免因单轮市场噪音误杀
+  - **benchmark 缺失时保守拒绝**：比"跳过 gate"更安全。迫使系统确保 benchmark 数据可用，而不是在数据缺失时静默放行
+
+---

@@ -473,6 +473,52 @@ Python 稳定排序保留原顺序（按策略列表顺序）。
   方案 C：双窗口验证：短窗口（1年）+ 长窗口（5年）权重取交集，兼顾适应性与稳健性
 ```
 
+#### 10.5.1 Walk-Forward 4 轮验证 + Alpha Gate（迭代 #3 基础，迭代 #13 加 alpha 校验）
+
+Constitution L7 验证流水线硬要求：Backtest(≥5年) → Walk-Forward(4轮) → Paper → Live。
+
+**每轮流程**：
+1. 训练期 [train_start, train_end]：跑矩阵回测找最优参数（复用 `_run_group`）
+2. 验证期 [val_start, val_end]：用同参数回测，记录 portfolio Sortino / max DD / **alpha vs SPY**
+3. `passed = val_max_dd ≤ 15% AND val_alpha > -5%`（迭代 #13 新增 alpha gate）
+
+**Gate 逻辑**（迭代 #13）：
+
+| 层级 | 条件 | 常量 |
+|------|------|------|
+| 单轮 | `val_max_dd ≤ 15% AND val_alpha > -5%` | `WALK_FORWARD_VAL_DD_THRESHOLD=15.0`, `WALK_FORWARD_VAL_ALPHA_FLOOR=-5.0` |
+| 汇总 | `all rounds passed AND avg_val_alpha > 0` | （硬编码 avg > 0） |
+
+**设计动机**（目标一致性修复）：
+- matrix_backtest 用 alpha 选策略（Iter #9），WF 也必须校验 alpha
+- Iter #11 实证：WF 4/4 pass（DD-only gate）但组合 alpha=-21% → WF 通过 ≠ 跑赢 SPY
+- 单轮允许 alpha 在 -5%~0%（小幅跑输可能是市场噪音），但 4 轮平均必须 > 0
+- 与 matrix_backtest 的 alpha>0 门槛呼应：in-sample alpha>0 是入选条件，OOS avg alpha>0 是验证条件
+- 满足 `experience.md #8`："验收 gate 必须校验跑赢 benchmark（正 alpha）"
+
+**降级处理**：SPY 不可用时 `val_alpha=0.0`（不阻塞 WF），但 `avg_val_alpha=0` → `pass_all_rounds=False`（保守拒绝）
+
+**数据结构**：
+```python
+@dataclass
+class WalkForwardRound:
+    round_num: int
+    train_start: date; train_end: date
+    val_start: date; val_end: date
+    val_sortino: float
+    val_max_dd: float
+    passed: bool
+    val_alpha: float = 0.0   # 迭代 #13：验证期 portfolio alpha vs SPY（百分数）
+
+@dataclass
+class WalkForwardReport:
+    rounds: list[WalkForwardRound]
+    pass_all_rounds: bool      # all passed AND avg_val_alpha > 0
+    max_val_dd: float
+    avg_val_alpha: float = 0.0  # 迭代 #13：4 轮平均验证期 alpha
+    min_val_alpha: float = 0.0  # 迭代 #13：4 轮中最差的验证期 alpha
+```
+
 ### 10.6 输出文件
 
 ```

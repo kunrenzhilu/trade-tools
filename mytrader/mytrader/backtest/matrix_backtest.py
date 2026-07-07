@@ -40,6 +40,14 @@ MAX_PORTFOLIO_DRAWDOWN_PCT: float = 20.0
 # （低于 L1 的 20% 线，给样本外留缓冲）
 WALK_FORWARD_VAL_DD_THRESHOLD: float = 15.0
 
+# 迭代 #13 新增：WF 验证期 alpha 单轮下限（百分数）
+# 单轮允许小幅跑输 SPY（alpha > -5%），但 4 轮平均必须跑赢（avg > 0）
+# 设计动机：WF 与 matrix_backtest 目标一致性——matrix_backtest 用 alpha 选策略，
+# WF 也必须校验 alpha，否则 WF 通过 ≠ 跑赢 SPY
+# （Iter #11 实证：WF 4/4 pass 但组合 alpha=-21%，因为 WF gate 只校验 DD 不校验 alpha）
+# 详见 experience.md #8："验收 gate 必须校验跑赢 benchmark（正 alpha）"
+WALK_FORWARD_VAL_ALPHA_FLOOR: float = -5.0
+
 # 迭代 #9 新增：Sortino 最低质量门槛，用于 top-K 选择时的二级过滤
 # 排除 Sortino ≤ 0.5 的"垃圾"策略（即使 alpha 高也不选）
 # 设计动机：alpha 排序选出高绝对收益策略，但需 Sortino 门槛保证基本下行质量
@@ -125,7 +133,9 @@ class WalkForwardRound:
         val_end:      验证期结束日期（含）
         val_sortino:  验证期等权组合 Sortino Ratio（年化）
         val_max_dd:   验证期等权组合最大回撤（正值百分数，0~100）
-        passed:       是否通过 = val_max_dd <= WALK_FORWARD_VAL_DD_THRESHOLD (15%)
+        val_alpha:    验证期等权组合 alpha vs SPY（百分数，迭代 #13 新增）
+                      与 matrix_backtest 的 alpha 选择目标一致（目标一致性修复）
+        passed:       是否通过 = val_max_dd <= 15% AND val_alpha > -5%
     """
 
     round_num: int
@@ -136,6 +146,10 @@ class WalkForwardRound:
     val_sortino: float
     val_max_dd: float
     passed: bool
+    # 迭代 #13：验证期 portfolio alpha vs SPY（百分数）
+    # 放在 passed 之后以保持与现有位置参数调用的向后兼容
+    # （现有测试用 8 个位置参数：round_num...passed）
+    val_alpha: float = 0.0
 
 
 @dataclass
@@ -147,13 +161,18 @@ class WalkForwardReport:
 
     Attributes:
         rounds:         每轮结果列表（长度通常为 4）
-        pass_all_rounds: 是否所有轮都通过（all(r.passed for r in rounds)）
+        pass_all_rounds: 是否所有轮都通过 AND avg_val_alpha > 0
+                         （迭代 #13：加 avg alpha > 0 条件，要求 OOS 平均跑赢 SPY）
         max_val_dd:     所有轮中最大的验证期 DD（用于风险监控）
+        avg_val_alpha:  所有轮验证期 alpha 的平均值（迭代 #13 新增，百分数）
+        min_val_alpha:  所有轮中最差的验证期 alpha（迭代 #13 新增，百分数）
     """
 
     rounds: list[WalkForwardRound] = field(default_factory=list)
     pass_all_rounds: bool = False
     max_val_dd: float = 0.0
+    avg_val_alpha: float = 0.0   # 迭代 #13：4 轮平均验证期 alpha（百分数）
+    min_val_alpha: float = 0.0   # 迭代 #13：4 轮中最差的验证期 alpha（百分数）
 
 
 # ---------------------------------------------------------------------------
@@ -882,15 +901,17 @@ def run_walk_forward(
         if not all_returns:
             val_sortino = 0.0
             val_max_dd = 0.0
+            val_alpha = 0.0
             logger.warning(
                 f"[WalkForward] Round {round_num}: no valid val returns — "
-                f"sortino=0, dd=0, passed=True (vacuous)"
+                f"sortino=0, dd=0, alpha=0, passed=True (vacuous)"
             )
         else:
             combined = pd.concat(all_returns, axis=1).mean(axis=1).dropna()
             if len(combined) < 5:
                 val_sortino = 0.0
                 val_max_dd = 0.0
+                val_alpha = 0.0
             else:
                 val_sortino = _compute_sortino(combined)
                 wrapper = [SingleBacktestResult(
@@ -900,7 +921,25 @@ def run_walk_forward(
                 )]
                 val_max_dd = _portfolio_max_drawdown_from_results(wrapper)
 
-        passed = val_max_dd <= WALK_FORWARD_VAL_DD_THRESHOLD
+                # ── 迭代 #13：计算验证期 alpha vs SPY ──
+                # 与 matrix_backtest 的 alpha 选择目标一致（目标一致性修复）
+                # SPY 不可用时 alpha=0.0（与 _compute_alpha 的降级语义一致）
+                spy_val_returns = mb._get_spy_returns(val_start, val_end)
+                if spy_val_returns is not None:
+                    val_alpha = _compute_alpha(combined, spy_val_returns)
+                else:
+                    val_alpha = 0.0
+                    logger.warning(
+                        f"[WalkForward] Round {round_num}: SPY data unavailable for "
+                        f"val period {val_start}~{val_end} — val_alpha=0 (degraded)"
+                    )
+
+        # ── 迭代 #13：gate 加 alpha 校验 ──
+        # 单轮：DD ≤ 15% AND alpha > -5%（允许小幅跑输，不容忍灾难性跑输）
+        # 汇总（在 report 构建时）：all rounds passed AND avg_val_alpha > 0
+        dd_passed = val_max_dd <= WALK_FORWARD_VAL_DD_THRESHOLD
+        alpha_passed = val_alpha > WALK_FORWARD_VAL_ALPHA_FLOOR
+        passed = dd_passed and alpha_passed
         wf_rounds.append(WalkForwardRound(
             round_num=round_num,
             train_start=train_start,
@@ -909,23 +948,40 @@ def run_walk_forward(
             val_end=val_end,
             val_sortino=val_sortino,
             val_max_dd=val_max_dd,
+            val_alpha=val_alpha,
             passed=passed,
         ))
         logger.info(
             f"[WalkForward] Round {round_num} result: "
             f"sortino={val_sortino:.4f}, dd={val_max_dd:.4f}%, "
-            f"passed={passed} (threshold={WALK_FORWARD_VAL_DD_THRESHOLD}%)"
+            f"alpha={val_alpha:.4f}%, passed={passed} "
+            f"(dd_threshold={WALK_FORWARD_VAL_DD_THRESHOLD}%, "
+            f"alpha_floor={WALK_FORWARD_VAL_ALPHA_FLOOR}%)"
         )
+
+    # ── 迭代 #13：汇总 alpha 聚合 + pass_all_rounds 加 avg alpha > 0 条件 ──
+    val_alphas = [r.val_alpha for r in wf_rounds]
+    avg_val_alpha = sum(val_alphas) / len(val_alphas) if val_alphas else 0.0
+    min_val_alpha = min(val_alphas) if val_alphas else 0.0
+
+    # 单轮全过 AND 平均 alpha > 0（OOS 平均必须跑赢 SPY）
+    all_rounds_passed = all(r.passed for r in wf_rounds) if wf_rounds else False
+    avg_alpha_positive = avg_val_alpha > 0
+    pass_all = all_rounds_passed and avg_alpha_positive
 
     report = WalkForwardReport(
         rounds=wf_rounds,
-        pass_all_rounds=all(r.passed for r in wf_rounds) if wf_rounds else False,
+        pass_all_rounds=pass_all,
         max_val_dd=max((r.val_max_dd for r in wf_rounds), default=0.0),
+        avg_val_alpha=avg_val_alpha,
+        min_val_alpha=min_val_alpha,
     )
     logger.info(
         f"[WalkForward] done: {len(wf_rounds)} rounds, "
         f"pass_all_rounds={report.pass_all_rounds}, "
-        f"max_val_dd={report.max_val_dd:.4f}%"
+        f"max_val_dd={report.max_val_dd:.4f}%, "
+        f"avg_val_alpha={report.avg_val_alpha:.4f}%, "
+        f"min_val_alpha={report.min_val_alpha:.4f}%"
     )
     return report
 

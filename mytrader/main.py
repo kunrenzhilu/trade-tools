@@ -381,16 +381,20 @@ def _run_reoptimize(config: "Any", logger: "Any") -> None:
                 f"val={r.val_start}~{r.val_end}, "
                 f"sortino={r.val_sortino:.4f}, "
                 f"dd={r.val_max_dd:.4f}%, "
+                f"alpha={r.val_alpha:.4f}%, "
                 f"passed={r.passed}"
             )
         logger.info(
             f"[WalkForward] Summary: pass_all_rounds={wf_report.pass_all_rounds}, "
-            f"max_val_dd={wf_report.max_val_dd:.4f}%"
+            f"max_val_dd={wf_report.max_val_dd:.4f}%, "
+            f"avg_val_alpha={wf_report.avg_val_alpha:.4f}%, "
+            f"min_val_alpha={wf_report.min_val_alpha:.4f}%"
         )
         if not wf_report.pass_all_rounds:
             logger.warning(
                 "[WalkForward] NOT all rounds passed — "
-                "Constitution L7 requires all 4 rounds DD<=15% before paper trading."
+                "Constitution L7 requires all 4 rounds DD<=15% AND avg alpha>0 "
+                "before paper trading."
             )
     except Exception as exc:
         logger.error(f"[WalkForward] failed: {exc}", exc_info=True)

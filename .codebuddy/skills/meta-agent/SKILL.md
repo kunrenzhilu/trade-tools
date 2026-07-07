@@ -38,6 +38,11 @@ CodeBuddy → Code writing, testing, documentation
 
 Before assigning any task, answer these questions:
 
+0. **Clean git state**（版本解耦前置）：
+   - 检查 `git status --short` 是否有上一轮迭代遗留的 orchestrator snapshot 文件
+   - 如有，先 `git add` + `git commit "chore: add Iter #N snapshot files (generated post-timeout)"` + `git push`
+   - 确保每轮迭代从干净的 git 状态开始
+
 1. **What is the current system's actual trading performance?**
    - Has `--reoptimize` been run recently? What does `strategy_weights.json` show?
    - What are the actual Sortino/Sharpe/DD numbers from the last backtest?
@@ -202,6 +207,16 @@ Monitor via heartbeat log. If ACP buffer overflow occurs, the orchestrator will 
    - `reports/` 目录不 commit（.gitignore 已排除）
    - `experience.md` 和 `SKILL.md` 的手动编辑（非 CodeBuddy 产出）也应包含在 commit 中，因为它们是迭代的一部分
    - commit 后 `git status` 应该 clean（除 .gitignore 文件外）—— 这是下一轮迭代干净起点的保证
+
+   **Orchestrator snapshot 时序问题**：
+   orchestrator 在 CodeBuddy 退出后仍会等 timeout（~2h）才生成 snapshot 文件（`result.json`、`full_response.md`、`code_diff.patch`、`tool_calls.json` 等）。meta-agent commit 时这些文件可能还不存在。处理方式：
+   - commit 时不等待 snapshot——spec + summary + 代码 + 文档是核心产出，snapshot 是辅助记录
+   - **下一轮迭代开始时（Phase 0），先检查并 commit 上一轮遗留的 snapshot 文件**：
+     ```bash
+     git status --short | grep iterations/iteration_  # 检查是否有遗留 snapshot
+     # 如有，git add + commit "chore: add Iter #N snapshot files (generated post-timeout)"
+     ```
+   - 这确保每轮迭代开始时 git status 是 clean 的
 
 #### Summary template
 

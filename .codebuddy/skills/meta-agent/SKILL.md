@@ -208,15 +208,8 @@ Monitor via heartbeat log. If ACP buffer overflow occurs, the orchestrator will 
    - `experience.md` 和 `SKILL.md` 的手动编辑（非 CodeBuddy 产出）也应包含在 commit 中，因为它们是迭代的一部分
    - commit 后 `git status` 应该 clean（除 .gitignore 文件外）—— 这是下一轮迭代干净起点的保证
 
-   **Orchestrator snapshot 时序问题**：
-   orchestrator 在 CodeBuddy 退出后仍会等 timeout（~2h）才生成 snapshot 文件（`result.json`、`full_response.md`、`code_diff.patch`、`tool_calls.json` 等）。meta-agent commit 时这些文件可能还不存在。处理方式：
-   - commit 时不等待 snapshot——spec + summary + 代码 + 文档是核心产出，snapshot 是辅助记录
-   - **下一轮迭代开始时（Phase 0），先检查并 commit 上一轮遗留的 snapshot 文件**：
-     ```bash
-     git status --short | grep iterations/iteration_  # 检查是否有遗留 snapshot
-     # 如有，git add + commit "chore: add Iter #N snapshot files (generated post-timeout)"
-     ```
-   - 这确保每轮迭代开始时 git status 是 clean 的
+   **Orchestrator snapshot 时序说明**：
+   orchestrator 在 `conn.prompt()` 返回后（CodeBuddy 完成任务）立即终止 CLI 进程并进入后验证，snapshot 文件（`result.json`、`full_response.md`、`code_diff.patch`、`tool_calls.json` 等）在后验证阶段生成。meta-agent commit 时这些文件应该已经存在。如果 orchestrator 进程仍在运行（如后验证阶段耗时），commit 时不等待——spec + summary + 代码 + 文档是核心产出，snapshot 是辅助记录，可在下一轮 Phase 0 补 commit。
 
 #### Summary template
 

@@ -1382,29 +1382,18 @@ async def run_iteration(
             )
             heartbeat_log(f"prompt 已发送, stop_reason={prompt_response.stop_reason}")
 
-            # process-based 等待（CodeBuddy 进程退出即结束）
-            check_interval = 5
-            heartbeat_interval = 30
-            last_heartbeat = time.time()
-            start = time.time()
-
-            while True:
-                # CodeBuddy 进程已退出？
-                if proc.returncode is not None:
-                    elapsed = time.time() - start
-                    heartbeat_log(f"CodeBuddy 进程已退出 (rc={proc.returncode}, elapsed={elapsed:.0f}s)")
-                    break
-
-                elapsed = time.time() - start
-                if elapsed > timeout_seconds:
-                    heartbeat_log(f"timeout 到达 ({timeout_seconds}s)，强制退出")
-                    break
-
-                await asyncio.sleep(check_interval)
-
-                if time.time() - last_heartbeat > heartbeat_interval:
-                    heartbeat_log("心跳")
-                    last_heartbeat = time.time()
+            # conn.prompt() 返回 = CodeBuddy 已完成任务（stop_reason="end_turn"）
+            # CodeBuddy CLI 进程不会自己退出（保持活着等待更多输入），
+            # 所以不需要等 proc.returncode — 直接终止进程，进入后验证。
+            # 旧代码在此 while True 等 proc.returncode，白等 ~2h 直到 timeout。
+            if proc.returncode is None:
+                heartbeat_log("CodeBuddy 任务完成，终止 CLI 进程")
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    heartbeat_log("CodeBuddy CLI 进程 10s 未退出，强制 kill")
 
     except ValueError as e:
         # ACP _receive_loop 中 readline() 超限时，acp 库将 LimitOverrunError

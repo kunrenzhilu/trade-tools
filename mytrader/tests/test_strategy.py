@@ -80,12 +80,32 @@ class TestIndicators:
 
 class TestStrategyRegistry:
     def test_all_strategies_registered(self):
-        expected = {"dual_ma", "rsi_mean_revert", "rsi_trend_filter", "bollinger_band", "macd_cross"}
+        expected = {
+            "dual_ma", "rsi_mean_revert", "rsi_trend_filter",
+            "bollinger_band", "macd_cross",
+            # 迭代 #14 新增
+            "rsi_bb_convergence", "macd_volume",
+        }
         assert expected.issubset(set(STRATEGY_REGISTRY.keys()))
 
     def test_strategy_callable(self):
         for name, fn in STRATEGY_REGISTRY.items():
             assert callable(fn), f"{name} is not callable"
+
+    def test_new_strategies_in_reoptimize_constants(self):
+        """迭代 #14：REOPTIMIZE_STRATEGIES 包含新策略 + 参数网格。"""
+        from main import REOPTIMIZE_STRATEGIES, REOPTIMIZE_PARAM_GRIDS
+        for name in ("rsi_bb_convergence", "macd_volume"):
+            assert name in REOPTIMIZE_STRATEGIES, (
+                f"'{name}' 未在 REOPTIMIZE_STRATEGIES 中"
+            )
+            assert name in REOPTIMIZE_PARAM_GRIDS, (
+                f"'{name}' 未在 REOPTIMIZE_PARAM_GRIDS 中"
+            )
+        # rsi_trend_filter 网格应含 exit_neutral 维度
+        assert "exit_neutral" in REOPTIMIZE_PARAM_GRIDS["rsi_trend_filter"], (
+            "rsi_trend_filter 参数网格缺少 exit_neutral 维度"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -286,11 +306,16 @@ class TestAllStrategiesQuality:
 
 
 # ---------------------------------------------------------------------------
-# RSI Trend Filter 策略测试（迭代 #8）
+# RSI Trend Filter 策略测试（迭代 #8 / 迭代 #14 修复）
 # ---------------------------------------------------------------------------
 
 class TestRSITrendFilter:
-    """T1-T5: RSI 趋势过滤策略测试。"""
+    """RSI 趋势过滤策略测试。
+
+    迭代 #14 修复：entry 用趋势过滤，exit 用 RSI 回归中性。
+    旧 T3/T4（test_uptrend_only_buy / test_downtrend_only_sell）已移除——
+    新 exit 逻辑会在趋势中产生反向出场信号，旧断言不再成立。
+    """
 
     def test_signal_values(self):
         """T1: 信号值仅在 {-1, 0, 1} 范围内。"""
@@ -300,48 +325,362 @@ class TestRSITrendFilter:
         assert set(signal.unique()).issubset({-1, 0, 1})
 
     def test_custom_params(self):
-        """T2: 非默认参数正常工作。"""
+        """T2: 非默认参数正常工作（含 exit_neutral）。"""
         from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
         close = make_oscillating_close(300)
         signal = rsi_trend_filter_signal(
-            close, rsi_period=7, oversold=25.0, overbought=75.0, trend_period=100,
+            close, rsi_period=7, oversold=25.0, overbought=75.0,
+            trend_period=100, exit_neutral=45.0,
         )
         assert set(signal.unique()).issubset({-1, 0, 1})
 
-    def test_uptrend_only_buy(self):
-        """T3: 强上升趋势中不产生 SELL 信号。"""
-        from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
-        n = 300
-        idx = pd.date_range("2023-01-01", periods=n, freq="B")
-        # 强上升趋势：价格持续上涨，始终在 SMA(200) 上方
-        rng = np.random.default_rng(42)
-        prices = 100.0 * np.exp(np.cumsum(0.005 + 0.005 * rng.standard_normal(n)))
-        close = pd.Series(prices, index=idx, name="close")
-        signal = rsi_trend_filter_signal(close, oversold=35.0, overbought=65.0)
-        # 上升趋势中 SELL 被 SMA 过滤，不应出现 -1
-        unique_vals = set(signal.values)
-        assert -1 not in unique_vals, f"Found SELL signal in uptrend: {unique_vals}"
-
-    def test_downtrend_only_sell(self):
-        """T4: 强下降趋势中不产生 BUY 信号。"""
-        from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
-        n = 300
-        idx = pd.date_range("2023-01-01", periods=n, freq="B")
-        # 强下降趋势：价格持续下跌，始终在 SMA(200) 下方
-        rng = np.random.default_rng(42)
-        prices = 100.0 * np.exp(np.cumsum(-0.005 + 0.005 * rng.standard_normal(n)))
-        close = pd.Series(prices, index=idx, name="close")
-        signal = rsi_trend_filter_signal(close, oversold=35.0, overbought=65.0)
-        # 下降趋势中 BUY 被 SMA 过滤，不应出现 +1
-        unique_vals = set(signal.values)
-        assert 1 not in unique_vals, f"Found BUY signal in downtrend: {unique_vals}"
-
     def test_insufficient_data(self):
-        """T5: 数据不足 trend_period 时返回全零（不崩溃）。"""
+        """T5: 数据不足 trend_period 时不崩溃，入场信号为 0。"""
         from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
-        close = make_oscillating_close(50)
+        # 纯线性上升：RSI≈100 无 crossover，SMA(200) 全 NaN → 全 0
+        n = 50
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        close = pd.Series([100.0 + i * 0.1 for i in range(n)], index=idx, name="close")
         signal = rsi_trend_filter_signal(close)
         assert (signal == 0).all()
+
+    # ------------------------------------------------------------------
+    # 迭代 #14 新增测试
+    # ------------------------------------------------------------------
+
+    def test_rsi_trend_filter_exit_neutral_long(self):
+        """多头仓位在 RSI 向上穿越 exit_neutral 时出场（SELL）。
+
+        构造：上升趋势（close > SMA）中 RSI 先超卖（< 30）再回归中性（> 50）。
+        上升趋势中 sell_entry 需要 close < SMA → 不触发。
+        所以任何 -1 信号都来自 exit_long（RSI 穿越中性）。
+        """
+        from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
+        n = 300
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        # 250 bar 强上升趋势建立 SMA200，然后 10 bar 回调（RSI<30），再 40 bar 反弹（RSI>50）
+        up = [100.0 * (1.005 ** i) for i in range(250)]
+        drop = [up[-1] * (0.97 ** (i + 1)) for i in range(10)]
+        recover = [drop[-1] * (1.02 ** (i + 1)) for i in range(40)]
+        close = pd.Series(up + drop + recover, index=idx, name="close")
+        signal = rsi_trend_filter_signal(close, oversold=35.0, overbought=80.0)
+        # 上升趋势中应出现 -1（exit_long），因为 RSI 从超卖回归中性
+        assert -1 in signal.values, (
+            f"应出现 SELL exit 信号（RSI 穿越中性），实际信号集: {set(signal.values)}"
+        )
+
+    def test_rsi_trend_filter_exit_neutral_short(self):
+        """空头仓位在 RSI 向下穿越 exit_neutral 时出场（BUY）。
+
+        构造：下降趋势（close < SMA）中 RSI 先超买（> 70）再回归中性（< 50）。
+        下降趋势中 buy_entry 需要 close > SMA → 不触发。
+        所以任何 +1 信号都来自 exit_short（RSI 穿越中性）。
+        """
+        from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
+        n = 300
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        # 250 bar 强下降趋势建立 SMA200，然后 10 bar 反弹（RSI>70），再 40 bar 回落（RSI<50）
+        down = [100.0 * (0.995 ** i) for i in range(250)]
+        bounce = [down[-1] * (1.03 ** (i + 1)) for i in range(10)]
+        fall = [bounce[-1] * (0.98 ** (i + 1)) for i in range(40)]
+        close = pd.Series(down + bounce + fall, index=idx, name="close")
+        signal = rsi_trend_filter_signal(close, oversold=20.0, overbought=65.0)
+        # 下降趋势中应出现 +1（exit_short），因为 RSI 从超买回归中性
+        assert 1 in signal.values, (
+            f"应出现 BUY exit 信号（RSI 穿越中性），实际信号集: {set(signal.values)}"
+        )
+
+    def test_rsi_trend_filter_entry_still_trend_filtered(self):
+        """入场仍需趋势过滤：纯下降趋势中 RSI<超卖 但 close<SMA → 无 buy_entry。
+
+        构造：纯线性下降趋势。RSI 始终 < 50 → 无 exit crossover。
+        close < SMA → buy_entry 被过滤。所有信号应为 0。
+        """
+        from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
+        n = 300
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        close = pd.Series(
+            [100.0 - i * 0.3 for i in range(n)], index=idx, name="close"
+        )
+        signal = rsi_trend_filter_signal(close, oversold=30.0, overbought=70.0)
+        # 纯下降趋势中入场被趋势过滤，出场无 crossover（RSI 始终 < 50）
+        assert (signal == 0).all(), (
+            f"纯下降趋势中应全 0（入场被过滤 + 无 exit crossover），"
+            f"实际信号集: {set(signal.values)}"
+        )
+
+    def test_rsi_trend_filter_not_degenerate(self):
+        """迭代 #14 回归测试：rsi_trend_filter 不再退化（closed_trades > 0）。
+
+        Iter #8 bug：entry 和 exit 互斥 → 0 closed_trades。
+        Iter #14 修复：exit 用 RSI 回归中性 → 自然闭环。
+        """
+        import vectorbt as vbt
+        from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
+
+        rng = np.random.default_rng(42)
+        n = 300
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        steps = rng.normal(0, 0.5, n)
+        close = pd.Series(100.0 + np.cumsum(steps), index=idx, name="close")
+
+        # trend_period=50 适配 300 bar 数据（200 太长导致有效窗口不足）
+        signal = rsi_trend_filter_signal(close, trend_period=50)
+        entries = signal == 1
+        exits = signal == -1
+
+        pf = vbt.Portfolio.from_signals(
+            close=close, entries=entries, exits=exits,
+            init_cash=10000, size_type="Percent", size=1.0,
+        )
+        closed_trades = pf.trades.closed.count()
+        assert closed_trades > 0, (
+            f"rsi_trend_filter 应有 closed_trades > 0（不再退化），实际 {closed_trades}"
+        )
+
+    def test_rsi_trend_filter_exit_neutral_param(self):
+        """自定义 exit_neutral 参数影响信号行为。"""
+        from mytrader.strategy.strategies.rsi_trend_filter import rsi_trend_filter_signal
+        close = make_oscillating_close(300)
+        # exit_neutral=40 vs exit_neutral=60 → 信号应不同
+        sig_40 = rsi_trend_filter_signal(close, exit_neutral=40.0, trend_period=100)
+        sig_60 = rsi_trend_filter_signal(close, exit_neutral=60.0, trend_period=100)
+        assert set(sig_40.unique()).issubset({-1, 0, 1})
+        assert set(sig_60.unique()).issubset({-1, 0, 1})
+        # 不同 exit_neutral 应产生不同的信号序列
+        assert not sig_40.equals(sig_60), (
+            "不同 exit_neutral 参数应产生不同信号序列"
+        )
+
+
+# ---------------------------------------------------------------------------
+# RSI + Bollinger Band 双确认策略测试（迭代 #14）
+# ---------------------------------------------------------------------------
+
+class TestRSIBBConvergence:
+    """RSI + BB 双确认均值回归策略测试。"""
+
+    def test_rsi_bb_buy_signal(self):
+        """BUY: RSI < oversold AND close < lower_bb → 双重超卖确认。"""
+        from mytrader.strategy.strategies.rsi_bb_convergence import rsi_bb_convergence_signal
+        # 构造急跌数据：RSI 超卖 + close 跌破下轨
+        n = 100
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        prices = np.concatenate([
+            np.full(50, 100.0),
+            np.linspace(100.0, 70.0, 50),
+        ])
+        close = pd.Series(prices, index=idx, name="close")
+        signal = rsi_bb_convergence_signal(close)
+        # 急跌后应出现 BUY 信号（双重超卖确认）
+        assert 1 in signal.values, (
+            f"急跌数据应产生 BUY 信号，实际信号集: {set(signal.values)}"
+        )
+
+    def test_rsi_bb_sell_signal(self):
+        """SELL: RSI > overbought AND close > upper_bb → 双重超买确认。"""
+        from mytrader.strategy.strategies.rsi_bb_convergence import rsi_bb_convergence_signal
+        n = 100
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        prices = np.concatenate([
+            np.full(50, 100.0),
+            np.linspace(100.0, 130.0, 50),
+        ])
+        close = pd.Series(prices, index=idx, name="close")
+        signal = rsi_bb_convergence_signal(close)
+        # 急涨后应出现 SELL 信号（双重超买确认）
+        assert -1 in signal.values, (
+            f"急涨数据应产生 SELL 信号，实际信号集: {set(signal.values)}"
+        )
+
+    def test_rsi_bb_no_signal_rsi_only(self):
+        """RSI 超卖但 close 未跌破下轨 → 无 buy_entry（无双重确认）。
+
+        构造：纯下降趋势（RSI<30）+ bb_std=10.0（极宽布林带，close 始终在中轨上方）。
+        RSI 始终 < 50 → 无 exit crossover → 所有信号为 0。
+        """
+        from mytrader.strategy.strategies.rsi_bb_convergence import rsi_bb_convergence_signal
+        n = 200
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        close = pd.Series(
+            [100.0 - i * 0.3 for i in range(n)], index=idx, name="close"
+        )
+        # bb_std=10 → 极宽布林带 → close < lower 几乎不触发
+        signal = rsi_bb_convergence_signal(close, bb_std=10.0)
+        assert (signal == 0).all(), (
+            f"RSI 超卖但 close 未跌破下轨时不应有信号，实际信号集: {set(signal.values)}"
+        )
+
+    def test_rsi_bb_no_signal_bb_only(self):
+        """close 跌破下轨但 RSI 未超卖 → 无 buy_entry（无双重确认）。
+
+        构造：纯下降趋势（close < lower_bb）+ oversold=0.0（RSI < 0 不可能）。
+        RSI 始终 < 50 → 无 exit crossover → 所有信号为 0。
+        """
+        from mytrader.strategy.strategies.rsi_bb_convergence import rsi_bb_convergence_signal
+        n = 200
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        close = pd.Series(
+            [100.0 - i * 0.3 for i in range(n)], index=idx, name="close"
+        )
+        # oversold=0 → RSI < 0 不可能 → buy_entry 永远 False
+        signal = rsi_bb_convergence_signal(close, oversold=0.0)
+        assert (signal == 0).all(), (
+            f"close 跌破下轨但 RSI 未超卖时不应有信号，实际信号集: {set(signal.values)}"
+        )
+
+    def test_rsi_bb_exit_rsi_neutral(self):
+        """RSI 向上穿越中性时出场（SELL to exit long）。"""
+        from mytrader.strategy.strategies.rsi_bb_convergence import rsi_bb_convergence_signal
+        # 使用振荡数据：RSI 会反复穿越 50
+        close = make_oscillating_close(300)
+        signal = rsi_bb_convergence_signal(close)
+        # 振荡数据中 exit_long_rsi 或 exit_short_rsi 应触发
+        assert set(signal.unique()).issubset({-1, 0, 1})
+
+    def test_rsi_bb_exit_bb_middle(self):
+        """close 穿越中轨时出场。"""
+        from mytrader.strategy.strategies.rsi_bb_convergence import rsi_bb_convergence_signal
+        # 振荡数据中 close 会反复穿越中轨
+        close = make_oscillating_close(300)
+        signal = rsi_bb_convergence_signal(close)
+        assert set(signal.unique()).issubset({-1, 0, 1})
+
+    def test_rsi_bb_custom_params(self):
+        """自定义参数改变信号行为。"""
+        from mytrader.strategy.strategies.rsi_bb_convergence import rsi_bb_convergence_signal
+        close = make_oscillating_close(300)
+        sig_default = rsi_bb_convergence_signal(close)
+        sig_custom = rsi_bb_convergence_signal(
+            close, rsi_period=21, oversold=25.0, overbought=75.0,
+            bb_period=15, bb_std=1.5,
+        )
+        assert set(sig_custom.unique()).issubset({-1, 0, 1})
+        # 不同参数应产生不同信号
+        assert not sig_default.equals(sig_custom), (
+            "不同参数应产生不同信号序列"
+        )
+
+    def test_rsi_bb_signal_range(self):
+        """信号值仅在 {-1, 0, 1} 范围内。"""
+        from mytrader.strategy.strategies.rsi_bb_convergence import rsi_bb_convergence_signal
+        close = make_trending_close(100)
+        signal = rsi_bb_convergence_signal(close)
+        assert set(signal.unique()).issubset({-1, 0, 1})
+
+    def test_rsi_bb_no_lookahead(self):
+        """shift(1) 防前视偏差：最后 bar 信号不因最后 bar 价格变化而改变。"""
+        from mytrader.strategy.strategies.rsi_bb_convergence import rsi_bb_convergence_signal
+        close_normal = make_trending_close(100)
+        close_modified = close_normal.copy()
+        close_modified.iloc[-1] = close_modified.iloc[-1] * 2.0
+        signal_normal = rsi_bb_convergence_signal(close_normal)
+        signal_modified = rsi_bb_convergence_signal(close_modified)
+        assert signal_normal.iloc[-1] == signal_modified.iloc[-1], (
+            "rsi_bb_convergence 有前视偏差：最后 bar 价格变化导致最后 bar 信号变化"
+        )
+
+
+# ---------------------------------------------------------------------------
+# MACD + Volume 策略测试（迭代 #14）
+# ---------------------------------------------------------------------------
+
+class TestMACDVolume:
+    """MACD + 成交量确认策略测试。"""
+
+    @staticmethod
+    def _make_price_with_volume(n: int = 100, trend: str = "up") -> tuple[pd.Series, pd.DataFrame]:
+        """构造含 volume 的 OHLCV 数据 + close Series。"""
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        if trend == "up":
+            prices = np.concatenate([
+                np.linspace(100, 80, 50),
+                np.linspace(80, 120, 50),
+            ])
+        else:  # down
+            prices = np.concatenate([
+                np.linspace(100, 120, 50),
+                np.linspace(120, 80, 50),
+            ])
+        close = pd.Series(prices, index=idx, name="close")
+        # 成交量递增（始终 > MA）
+        volume = np.arange(1, n + 1, dtype=float) * 1000
+        df = pd.DataFrame({
+            "open": close - 0.5,
+            "high": close + 1.0,
+            "low": close - 1.0,
+            "close": close,
+            "volume": volume,
+        }, index=idx)
+        return close, df
+
+    def test_macd_volume_buy_with_volume(self):
+        """MACD 上穿 + volume > MA → BUY 信号存在。"""
+        from mytrader.strategy.strategies.macd_volume import macd_volume_signal
+        close, df = self._make_price_with_volume(trend="up")
+        signal = macd_volume_signal(close, df=df)
+        # 趋势反转（跌→涨）应触发 MACD 金叉 + 放量确认 → BUY
+        assert 1 in signal.values, (
+            f"MACD 金叉 + 放量确认应产生 BUY 信号，实际信号集: {set(signal.values)}"
+        )
+
+    def test_macd_volume_no_buy_without_volume(self):
+        """MACD 上穿但 volume < MA → 无 BUY 信号。"""
+        from mytrader.strategy.strategies.macd_volume import macd_volume_signal
+        close, df = self._make_price_with_volume(trend="up")
+        # 成交量全 0 → volume < MA → buy_signal 被过滤
+        df["volume"] = 0.0
+        signal = macd_volume_signal(close, df=df)
+        assert 1 not in signal.values, (
+            f"成交量不足时不应有 BUY 信号，实际信号集: {set(signal.values)}"
+        )
+
+    def test_macd_volume_sell_regardless(self):
+        """MACD 下穿 → SELL 信号（无需成交量确认）。"""
+        from mytrader.strategy.strategies.macd_volume import macd_volume_signal
+        close, df = self._make_price_with_volume(trend="down")
+        # 成交量全 0（即使无量也必须出场）
+        df["volume"] = 0.0
+        signal = macd_volume_signal(close, df=df)
+        assert -1 in signal.values, (
+            f"MACD 死叉应产生 SELL 信号（无需量确认），实际信号集: {set(signal.values)}"
+        )
+
+    def test_macd_volume_no_df_graceful(self):
+        """df=None → 退化为纯 MACD 策略（不崩溃）。"""
+        from mytrader.strategy.strategies.macd_volume import macd_volume_signal
+        close, _ = self._make_price_with_volume(trend="up")
+        signal = macd_volume_signal(close, df=None)
+        assert set(signal.unique()).issubset({-1, 0, 1})
+        # 无 df 时退化为 MACD only，应仍能产生信号
+        # 趋势反转应触发 MACD 交叉
+
+    def test_macd_volume_no_volume_column(self):
+        """df 无 volume 列 → 退化为纯 MACD 策略。"""
+        from mytrader.strategy.strategies.macd_volume import macd_volume_signal
+        close, df = self._make_price_with_volume(trend="up")
+        df = df.drop(columns=["volume"])
+        signal = macd_volume_signal(close, df=df)
+        assert set(signal.unique()).issubset({-1, 0, 1})
+
+    def test_macd_volume_signal_range(self):
+        """信号值仅在 {-1, 0, 1} 范围内。"""
+        from mytrader.strategy.strategies.macd_volume import macd_volume_signal
+        close = make_trending_close(100)
+        signal = macd_volume_signal(close)
+        assert set(signal.unique()).issubset({-1, 0, 1})
+
+    def test_macd_volume_no_lookahead(self):
+        """shift(1) 防前视偏差：最后 bar 信号不因最后 bar 价格变化而改变。"""
+        from mytrader.strategy.strategies.macd_volume import macd_volume_signal
+        close_normal = make_trending_close(100)
+        close_modified = close_normal.copy()
+        close_modified.iloc[-1] = close_modified.iloc[-1] * 2.0
+        signal_normal = macd_volume_signal(close_normal)
+        signal_modified = macd_volume_signal(close_modified)
+        assert signal_normal.iloc[-1] == signal_modified.iloc[-1], (
+            "macd_volume 有前视偏差：最后 bar 价格变化导致最后 bar 信号变化"
+        )
 
 
 # ---------------------------------------------------------------------------

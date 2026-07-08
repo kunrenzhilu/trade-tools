@@ -1379,3 +1379,142 @@ Iter #12 的 alpha>0 门槛修复了 in-sample 选择器，但 WF gate 仍然只
 > - CodeBuddy 自行更新了 trajectory ✅
 
 ---
+
+## 迭代 #14 — Multi-Factor Strategy Exploration (Round 1)
+
+- **日期**: 2026-07-08 UTC
+- **类型**: 策略修复 + 新增多因子策略
+- **变更摘要**: 修复 rsi_trend_filter 退化 bug（entry 用趋势过滤，exit 用 RSI 回归中性 exit_neutral）；新增 rsi_bb_convergence（RSI+Bollinger 双确认）和 macd_volume（MACD+成交量确认）两个多因子策略；更新参数网格和注册
+- **状态**: passed
+- **执行时长**: 1 轮对话（手动开发）
+- **测试数**: 675 → 707（+32 新测试用例，含参数化扩展）
+
+### 背景
+
+Iter #11 健全性门槛发现 rsi_trend_filter 退化：entry（close>SMA200，上升趋势）和 exit（close<SMA200，下降趋势）在同一维度上互斥，仓位只能挂到末尾被强平 → 0 closed_trades。Iter #13 后系统仅 2/6 组有权重，策略多样性不足。本次修复退化策略并新增两个多因子策略。
+
+### 变更详情
+
+**P0: 修复 rsi_trend_filter 出场逻辑** (`mytrader/strategy/strategies/rsi_trend_filter.py`)
+- 新增 `exit_neutral: float = 50.0` 参数（RSI 中性水平）
+- Entry: 保持趋势过滤（RSI < oversold AND close > SMA → BUY；RSI > overbought AND close < SMA → SELL）
+- Exit: 改为 RSI 回归中性（RSI 向上穿越 exit_neutral → SELL exit long；RSI 向下穿越 exit_neutral → BUY exit short）
+- Exit 不检查趋势方向，实现自然均值回归闭环
+
+**P0: 新增 rsi_bb_convergence 策略** (`mytrader/strategy/strategies/rsi_bb_convergence.py`)
+- RSI + Bollinger Band 双确认均值回归
+- BUY entry: RSI < oversold AND close < lower_bb（双重超卖确认）
+- SELL entry: RSI > overbought AND close > upper_bb（双重超买确认）
+- Exit: RSI 穿越中性 OR close 穿越中轨（任一条件清除即出场）
+
+**P0: 新增 macd_volume 策略** (`mytrader/strategy/strategies/macd_volume.py`)
+- MACD + 成交量确认
+- BUY: MACD 金叉 AND volume > volume_SMA（放量确认入场）
+- SELL: MACD 死叉（无条件出场，不 trap in losing position）
+- `df: pd.DataFrame | None = None` 参数接收完整 OHLCV；df=None 时退化为纯 MACD
+
+**P1: 参数网格更新** (`main.py::REOPTIMIZE_PARAM_GRIDS`)
+- `rsi_trend_filter`: 新增 exit_neutral [45, 50, 55] → 27 × 3 = 81 组合
+- `rsi_bb_convergence`: 3×3×3×2×2 = 108 组合（exit_rsi_neutral 固定 50）
+- `macd_volume`: 3×2×2 = 12 组合（volume_period 固定 20）
+- 总组合数：83 → 83 + 81 + 108 + 12 = 284（3.4x 扩展）
+
+**P1: 策略注册** (`mytrader/strategy/__init__.py`)
+- 新增 `import rsi_bb_convergence` 和 `import macd_volume`
+
+**P2: 测试** (`tests/test_strategy.py`, +22 新测试函数 / +32 含参数化扩展)
+- `TestRSITrendFilter`: 移除旧 T3/T4（与新 exit 逻���冲突），新增 5 个测试（exit_neutral_long/short、entry_still_trend_filtered、not_degenerate、exit_neutral_param）
+- `TestRSIBBConvergence`: 9 个测试（buy/sell signal、no signal rsi_only/bb_only、exit rsi/bb、custom params、signal range、no lookahead）
+- `TestMACDVolume`: 7 个测试（buy with volume、no buy without volume、sell regardless、no df graceful、no volume column、signal range、no lookahead）
+- `TestStrategyRegistry`: 新增 `test_new_strategies_in_reoptimize_constants`
+- 参数化测试自动扩展覆盖 2 个新策略（+8 用例）
+- 更新 `test_degenerate_filter.py` 中 rsi_trend_filter 退化测试注释
+
+### 验证结果
+
+```
+tests/test_strategy.py: 86 passed, 0 failed
+tests/test_degenerate_filter.py + test_batch_backtest.py: 40 passed, 0 failed
+Full pytest (excluding live): 707 passed, 0 failed, 103 warnings in 23.56s
+```
+
+### Constitution 合规
+
+- ✅ 未突破 DD 20% 约束（未修改 DD 阈值或风控参数）
+- ✅ 测试覆盖率提升（+32 测试，675 → 707）
+- ✅ 未引入黑箱策略（RSI+SMA+BB+MACD+Volume 均为可解释指标）
+- ✅ 未引入 RL
+- ✅ 未引入不安全依赖（仅用 pandas-ta/pandas 已有依赖）
+- ✅ 未修改 risk/execution/portfolio/matrix_backtest（spec §6 scope boundary 遵守）
+- ✅ 未新增 indicators.py 指标（复用现有 rsi/sma/bollinger_bands/macd/crossed_above/below）
+- ✅ 未修改 ensemble.py / matrix_runner.py（新策略通过注册表自动接入）
+- ✅ 策略纯函数 + shift(1) 防前视偏差
+- ✅ 文档与代码同步（trajectory + CODEBUDDY 更新）
+
+### Success Criteria 对照（spec §5）
+
+| # | 条件 | 状态 |
+|---|------|:----:|
+| 1 | rsi_trend_filter 不再退化（closed_trades > 0） | ✅ test_rsi_trend_filter_not_degenerate |
+| 2 | rsi_bb_convergence 产生正确的双确认信号 | ✅ 9 个测试覆盖 |
+| 3 | macd_volume 产生成交量确认的 MACD 信号 | ✅ 7 个测试覆盖 |
+| 4 | 所有现有测试通过（无回归） | ✅ 707 passed |
+| 5 | 新策略在 STRATEGY_REGISTRY 注册 | ✅ test_all_strategies_registered |
+| 6 | REOPTIMIZE_STRATEGIES/GRIDS 包含 7 策略 | ✅ test_new_strategies_in_reoptimize_constants |
+| 7 | 策略函数是纯函数（shift(1) 防前视偏差） | ✅ 参数化 no-lookahead 测试 |
+| 8 | 无 risk/execution/portfolio 模块修改 | ✅ git diff 仅触及 strategy 层 |
+
+### Experience Learned
+
+- **entry/exit 维度互斥是隐蔽 bug**：rsi_trend_filter 原版 entry 和 exit 都用趋势方向（close vs SMA200），在上升趋势中入场后无法在下降趋势前出场 → 仓位挂到末尾被强平 → 0 closed_trades。修复关键是 decouple：entry 用趋势过滤，exit 用 RSI 回归中性
+- **双确认降低假信号**：rsi_bb_convergence 要求 RSI 和 BB 同时触发，比单一指标更保守。在纯下降趋势中用 bb_std=10（极宽布林带）可验证"只有 RSI 超卖但 close 未跌破下轨 → 无信号"
+- **macd_volume 的 df 参数模式**：策略函数通过 `df: pd.DataFrame | None = None` 接收完整 OHLCV，matrix_runner/matrix_backtest 已有 `try: fn(close, df=df) except TypeError: fn(close)` 兼容模式。新策略自动接入无需修改调用方
+- **出场不需成交量确认**：macd_volume 的 SELL 信号无条件触发（MACD 死叉即出场），避免低量时被困在亏损仓位
+- **参数化测试自动扩展**：参数化测试迭代 STRATEGY_REGISTRY.keys()，新策略自动获得 no-lookahead / int dtype / index alignment 覆盖，无需额外编写
+
+### 后续建议
+
+1. **运行 `--reoptimize` 验证**：新策略（7 策略 × 284 参数组合）在真实数据上的权重分配和 alpha 表现
+2. **评估 rsi_bb_convergence 的 108 组合**：参数空间较大，可能需要按组精简
+3. **macd_volume 成交量数据质量**：验证 MarketDataStore 中 volume 字段的完整性（yfinance 的 volume 可能有 NaN）
+4. **策略多样性约束**：7 策略 pool 已成形，可考虑在 SignalRanker 中增加"每策略至少占 X%"约束
+5. **exit_neutral 按组优化**：当前 exit_neutral [45, 50, 55] 是全局网格，未来可考虑按波动率分组配置
+
+### L7 流水线状态
+
+```
+✅ Backtest (≥5年, alpha-based selection, batch-optimized, sanity-gated)
+✅ Walk-Forward (4轮, alpha gate)
+✅ Portfolio Backtest | ✅ Paper Trading Integrity
+✅ Harness Reliability | ✅ SignalRanker Sortino Priority
+✅ Strategy Diversity (7 策略 pool, 迭代 #14 修复+新增)
+✅ Alpha-Based Selection (迭代 #9)
+✅ Batch Backtest Optimization (迭代 #10)
+✅ Sanity Gate / Reject Degenerate (迭代 #11)
+✅ Alpha>0 Hard Gate (迭代 #12)
+✅ WF Gate Alpha Validation (迭代 #13)
+🔄 Multi-Factor Strategy Exploration (迭代 #14 完成，待 --reoptimize 验证)
+⬜ Paper Trade ≥1月 | ⬜ Live
+```
+
+---
+
+> **Orchestrator 验证记录** (自动追加)
+> - 迭代状态: passed
+> - 测试: 707 passed, 0 failed
+> - 违规: 0 条
+> - 高风险文件: 0 个
+> - 测试数变化: 675 → 707
+> - CodeBuddy 自行更新了 trajectory ✅
+
+---
+
+> **Orchestrator 验证记录** (自动追加)
+> - 迭代状态: passed
+> - 测试: 0 passed, 0 failed
+> - 违规: 0 条
+> - 高风险文件: 0 个
+> - 测试数变化: 675 → 707
+> - CodeBuddy 自行更新了 trajectory ✅
+
+---

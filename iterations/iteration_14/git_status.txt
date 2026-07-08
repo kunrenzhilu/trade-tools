@@ -1,0 +1,10 @@
+ M .codebuddy/CODEBUDDY.md
+ M alignment/iteration_trajectory.md
+ M mytrader/main.py
+ M mytrader/mytrader/strategy/__init__.py
+ M mytrader/mytrader/strategy/strategies/rsi_trend_filter.py
+ M mytrader/tests/test_degenerate_filter.py
+ M mytrader/tests/test_strategy.py
+?? iterations/iteration_14/
+?? mytrader/mytrader/strategy/strategies/macd_volume.py
+?? mytrader/mytrader/strategy/strategies/rsi_bb_convergence.py

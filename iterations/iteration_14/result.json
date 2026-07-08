@@ -1,0 +1,50 @@
+{
+  "iteration_id": "467868fa",
+  "task": "按 iterations/iteration_14/spec.md 进行开发。先读 spec 文件理解完整需求，然后按 Implementation Order（§7）逐步实施：1) 修复 rsi_trend_filter_signal 的出场逻辑（entry用趋势过滤，exit用RSI回归中性）；2) 更新 rsi_trend_filter 参数网格（加 exit_neutral）；3) 新建 rsi_bb_convergence 策略（RSI+Bollinger双确认）；4) 新建 macd_volume 策略（MACD+成交量确认）；5) 更新 __init__.py 注册 + main.py REOPTIMIZE 常量；6) 写 ~23 个测试（spec §4）；7) 运行测试验证全部通过；8) 更新 trajectory + CODEBUDDY。严格遵守 spec §6 scope boundary：不修改 risk/execution/portfolio/matrix_backtest，不新增 indicators.py 指标。",
+  "status": "passed",
+  "start_time": 1783479580.538999,
+  "end_time": 1783480948.852594,
+  "duration_seconds": 1368.3135948181152,
+  "updates_count": 12932,
+  "tool_calls_count": 356,
+  "team_events_count": 0,
+  "permission_requests_count": 0,
+  "changed_files": [
+    ".codebuddy/CODEBUDDY.md",
+    "alignment/iteration_trajectory.md",
+    "mytrader/main.py",
+    "mytrader/mytrader/strategy/__init__.py",
+    "mytrader/mytrader/strategy/strategies/rsi_trend_filter.py",
+    "mytrader/tests/test_degenerate_filter.py",
+    "mytrader/tests/test_strategy.py",
+    "iterations/iteration_14/",
+    "mytrader/mytrader/strategy/strategies/macd_volume.py",
+    "mytrader/mytrader/strategy/strategies/rsi_bb_convergence.py"
+  ],
+  "violations": [],
+  "high_risk_files_touched": [],
+  "test_count_before": 675,
+  "test_count_after": 707,
+  "test_result": {
+    "passed": 0,
+    "failed": 0,
+    "errors": 0,
+    "warnings": 11,
+    "exit_code": 0,
+    "summary": "tests/test_risk_manager.py: 11 warnings",
+    "stdout_tail": "_filter_by_symbol\ntests/test_portfolio.py::TestPersistence::test_filter_by_symbol\n  /Users/rickouyang/Github/trade-tools/mytrader/tests/test_portfolio.py:281: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).\n    filled_at=datetime.utcnow(),\n\ntests/test_portfolio.py::TestPersistenceAdvanced::test_connection_failure_graceful\n  /Users/rickouyang/Github/trade-tools/mytrader/tests/test_portfolio.py:478: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).\n    filled_at=datetime.utcnow(),\n\ntests/test_risk_manager.py: 11 warnings\n  /Users/rickouyang/Github/trade-tools/mytrader/mytrader/risk/circuit_breaker.py:66: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).\n    now = datetime.utcnow()\n\ntests/test_risk_manager.py::TestOrderIntent::test_auto_client_order_id\n  /Users/rickouyang/Github/trade-tools/mytrader/tests/test_risk_manager.py:393: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).\n    timestamp=datetime.utcnow(),\n\ntests/test_risk_manager.py::TestOrderIntent::test_custom_client_order_id\n  /Users/rickouyang/Github/trade-tools/mytrader/tests/test_risk_manager.py:408: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).\n    timestamp=datetime.utcnow(),\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n",
+    "stderr_tail": "",
+    "command": [
+      "/Users/rickouyang/miniforge3/envs/py312trade/bin/python",
+      "-m",
+      "pytest",
+      "--tb=short",
+      "-q"
+    ]
+  },
+  "trajectory_updated_by_codebuddy": true,
+  "decision_log_updated_by_codebuddy": false,
+  "buffer_overflow_count": 0,
+  "buffer_overflow_errors": [],
+  "error": null
+}

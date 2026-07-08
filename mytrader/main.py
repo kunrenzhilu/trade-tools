@@ -38,6 +38,9 @@ REOPTIMIZE_STRATEGIES: list[str] = [
     "rsi_trend_filter",
     "macd_cross",
     "bollinger_band",
+    # 迭代 #14：新增多因子策略
+    "rsi_bb_convergence",
+    "macd_volume",
 ]
 
 REOPTIMIZE_PARAM_GRIDS: dict[str, dict[str, list]] = {
@@ -51,9 +54,19 @@ REOPTIMIZE_PARAM_GRIDS: dict[str, dict[str, list]] = {
     "macd_cross":      {"fast": [8, 12, 16], "slow": [21, 26, 32], "signal_period": [5, 9, 12]},
     # 迭代 #2：布林带 3×3=9 个组合，覆盖常用 std_dev 范围 [1.5, 2.0, 2.5]。
     "bollinger_band":  {"period": [15, 20, 25], "std_dev": [1.5, 2.0, 2.5]},
-    # 迭代 #8：RSI 趋势过滤 3×3×3×1=27 个组合，trend_period 固定 200（经典长周期趋势线）。
+    # 迭代 #8：RSI 趋势过滤 3×3×3×1=27 个组合，trend_period 固定 200。
+    # 迭代 #14：新增 exit_neutral 维度 → 3×3×3×1×3=81 个组合。
     "rsi_trend_filter": {"rsi_period": [7, 14, 21], "oversold": [25, 30, 35],
-                         "overbought": [65, 70, 75], "trend_period": [200]},
+                         "overbought": [65, 70, 75], "trend_period": [200],
+                         "exit_neutral": [45, 50, 55]},
+    # 迭代 #14：RSI+Bollinger 双确认 → 3×3×3×2×2=108 个组合。
+    # exit_rsi_neutral 固定 50（不纳入搜索，保持简单）。
+    "rsi_bb_convergence": {"rsi_period": [7, 14, 21], "oversold": [25, 30, 35],
+                           "overbought": [65, 70, 75], "bb_period": [15, 20],
+                           "bb_std": [1.5, 2.0]},
+    # 迭代 #14：MACD+成交量确认 → 3×2×2=12 个组合。
+    # volume_period 固定 20（不纳入搜索）。
+    "macd_volume": {"fast": [8, 12, 16], "slow": [21, 26], "signal_period": [7, 9]},
 }
 
 

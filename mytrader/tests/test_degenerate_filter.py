@@ -136,22 +136,23 @@ class TestClosedTradesPopulated:
     def test_closed_trades_zero_for_entries_only_strategy(self):
         """只有 entry 信号没有 exit 信号的策略 closed_trades=0。
 
-        构造方法：用 rsi_trend_filter 在强趋势上涨数据上跑 —— 趋势过滤锁死
-        出场条件，仓位只能挂到末尾被 vbt 强平。
+        构造方法：用 rsi_trend_filter 在强趋势上涨数据上跑。
+        迭代 #14 修复后：exit 用 RSI 回归中性，不再退化。
+        但在纯线性上升趋势中 RSI 始终≈100（不超卖）→ 0 entries → 0 trades。
+        此测试验证"无入场即无交易"的边界行为。
         """
-        # 强趋势上涨数据：close > SMA200 全程成立 → SELL 信号几乎不触发
+        # 强趋势上涨数据：close > SMA200 全程成立，RSI≈100
         df = _make_ohlcv(400, trend="up")
         df.index.name = "UPTREND"
         r = _backtest_one(
             df, "rsi_trend_filter",
             {"rsi_period": 14, "oversold": 30, "overbought": 70, "trend_period": 200},
         )
-        # rsi_trend_filter 在强上涨趋势中可能 rsi 一直不超卖 → 0 entries → 0 trades
-        # 或者偶尔超卖买入但无法触发 SELL（出场需 close<SMA200）→ 0 closed_trades
+        # 纯线性上升趋势中 RSI 始终≈100（不超卖）→ 0 entries → 0 trades
+        # （迭代 #14 修复后 exit 逻辑不再退化，但此数据不触发入场）
         if r is not None:
-            # 退化情形：closed_trades 应为 0（无法完成交易闭环）
             assert r.closed_trades == 0, (
-                f"rsi_trend_filter 在强上涨趋势上 closed_trades 应为 0（退化），"
+                f"rsi_trend_filter 在纯线性上升趋势上（无入场）closed_trades 应为 0，"
                 f"实际 {r.closed_trades}"
             )
 

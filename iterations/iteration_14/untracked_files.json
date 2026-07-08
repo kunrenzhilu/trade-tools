@@ -1,0 +1,14 @@
+[
+  {
+    "path": "mytrader/mytrader/strategy/strategies/macd_volume.py",
+    "size": 2110,
+    "sha256": "5edc47b6fa99c0893a60191b35b5744c07dc65c798c6e05d177282730c100baa",
+    "sensitive": false
+  },
+  {
+    "path": "mytrader/mytrader/strategy/strategies/rsi_bb_convergence.py",
+    "size": 2640,
+    "sha256": "7b23b75292078ce66a2c35b47b8077acc55fec13bc4a7d181e13b964232c35f6",
+    "sensitive": false
+  }
+]

@@ -1,14 +1,17 @@
 """RSI 趋势过滤均值回归策略（Trend-Filtered Mean Reversion）。
 
+迭代 #14 修复：entry 用趋势过滤，exit 用 RSI 回归中性（exit_neutral）。
+- 迭代 #8 原版：entry 和 exit 都用趋势方向 → 互斥，0 closed_trades（退化）
+- 迭代 #14：entry 用趋势过滤，exit 用 RSI 回归中性 → 自然闭环
+
 信号规则：
-    - RSI < oversold AND close > SMA(200)  → BUY  (+1)  上升趋势中的超卖
-    - RSI > overbought AND close < SMA(200) → SELL (-1)  下降趋势中的超买
-    - 否则                                → HOLD  (0)
+    - BUY entry:  RSI < oversold AND close > SMA(trend_period)  → +1
+    - SELL entry: RSI > overbought AND close < SMA(trend_period) → -1
+    - Exit long:  RSI 向上穿越 exit_neutral → SELL (-1)
+    - Exit short: RSI 向下穿越 exit_neutral → BUY (+1)
 
 设计动机：经典 RSI 均值回归在震荡市有效，但单边趋势中会频繁逆势。
-通过 200 日 SMA 趋势过滤：
-    - 上升趋势中只做多（超卖反弹），不做空
-    - 下降趋势中只做空（超买回落），不做多
+通过 SMA 趋势过滤入场方向，出场用 RSI 回归中性实现自然闭环。
 """
 
 from __future__ import annotations
@@ -26,8 +29,9 @@ def rsi_trend_filter_signal(
     oversold: float = 30.0,
     overbought: float = 70.0,
     trend_period: int = 200,
+    exit_neutral: float = 50.0,
 ) -> pd.Series:
-    """RSI 超买超卖信号 + 200 日 SMA 趋势过滤。
+    """RSI 超买超卖信号 + 趋势过滤入场 + RSI 回归中性出场。
 
     Args:
         close:        收盘价 Series
@@ -35,6 +39,7 @@ def rsi_trend_filter_signal(
         oversold:     超卖阈值，低于此值发出潜在 BUY（默认 30）
         overbought:   超买阈值，高于此值发出潜在 SELL（默认 70）
         trend_period: SMA 趋势过滤周期（默认 200）
+        exit_neutral: RSI 中性水平，RSI 回归此值时出场（默认 50）
 
     Returns:
         信号 Series：1=BUY, -1=SELL, 0=HOLD
@@ -42,16 +47,21 @@ def rsi_trend_filter_signal(
     rsi_values = rsi(close, rsi_period)
     trend_ma = sma(close, trend_period)
 
-    # 趋势条件
+    # Entry: 趋势过滤（仅在趋势方向一致时入场）
     above_trend = close > trend_ma   # 上升趋势
     below_trend = close < trend_ma   # 下降趋势
+    buy_entry = (rsi_values < oversold) & above_trend
+    sell_entry = (rsi_values > overbought) & below_trend
+
+    # Exit: RSI 回归中性（不检查趋势，自然均值回归出场）
+    exit_long = (rsi_values > exit_neutral) & (rsi_values.shift(1) <= exit_neutral)
+    exit_short = (rsi_values < exit_neutral) & (rsi_values.shift(1) >= exit_neutral)
 
     signal = pd.Series(0, index=close.index, dtype=int)
-    # BUY: 超卖 (RSI < oversold) 且 上升趋势 (close > SMA)
-    signal[(rsi_values < oversold) & above_trend] = 1
-    # SELL: 超买 (RSI > overbought) 且 下降趋势 (close < SMA)
-    signal[(rsi_values > overbought) & below_trend] = -1
+    signal[buy_entry] = 1
+    signal[sell_entry] = -1
+    signal[exit_long] = -1   # SELL to exit long
+    signal[exit_short] = 1  # BUY to exit short
 
-    # shift(1) 避免前视偏差
-    # 使用前一根 K 线的指标值做决策，在当前 K 线开盘时执行
+    # shift(1) 避免前视偏差：用前一根 K 线的指标值做决策，在当前 K 线开盘时执行
     return signal.shift(1).fillna(0).astype(int)

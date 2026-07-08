@@ -1,6 +1,6 @@
 # Trade-Tools 项目核心参考文档
 
-> 最后更新：2026-07-08 (Iter #13: WF Gate Alpha Validation / Target Consistency Fix)  
+> 最后更新：2026-07-08 (Iter #14: Multi-Factor Strategy Exploration / rsi_trend_filter Fix)  
 > 本文是项目规范 + 关键索引，供 AI 助手快速建立项目上下文。  
 > **各阶段开发详情见** → [`.codebuddy/notes/dev_records.md`](.codebuddy/notes/dev_records.md)
 
@@ -119,7 +119,7 @@ mytrader/
     │   ├── constituents.py             # 成分股抓取
     │   └── grouping.py                 # 波动率分层
     ├── strategy/               # Module 02 — Strategy Engine ✅
-    │   ├── strategies/         # dual_ma / rsi / rsi_trend_filter / macd / bollinger
+    │   ├── strategies/         # dual_ma / rsi_mean_revert / rsi_trend_filter / macd_cross / bollinger_band / rsi_bb_convergence [Iter #14] / macd_volume [Iter #14]
     │   ├── ensemble.py
     │   └── matrix_runner.py    # [Phase 5] StrategyMatrixRunner
     │                           # [迭代 #5] build_matrix_signal_indicators 共享 helper
@@ -200,9 +200,10 @@ mytrader/
 | **Iter #11** | ✅ 完成 | 20 | Sanity Gate / Reject Degenerate Strategies（`SingleBacktestResult.closed_trades` 字段 + `_is_degenerate_strategy` + `_run_group` 排序前剔除退化策略 + 全退化组空仓 `no_valid_strategy` 标记） |
 | **Iter #12** | ✅ 完成 | 13 | Alpha>0 Hard Gate（`_run_group` Tier 1 前加 alpha>0 过滤 + 全负 alpha 组空仓 `no_positive_alpha` + `_optimize_ensemble_weights` 修 `max(alpha,0.01)` 归一化 bug） |
 | **Iter #13** | ✅ 完成 | 16 | WF Gate Alpha Validation（`WALK_FORWARD_VAL_ALPHA_FLOOR=-5.0` + `WalkForwardRound.val_alpha` + `WalkForwardReport.avg/min_val_alpha` + WF gate 加 alpha 校验 + `main.py` WF 日志增加 alpha） |
+| **Iter #14** | ✅ 完成 | 32 | Multi-Factor Strategy Exploration（rsi_trend_filter 修复 exit_neutral + rsi_bb_convergence 新策略 + macd_volume 新策略 + 7 策略 pool + 284 参数组合） |
 | **Phase 6** | 🔲 待开发 | — | AlpacaBroker auto 端到端验证 + 对账真实集成 + 港股支持 |
 
-**当前总测试数：675 passed，0 failed**（live 测试默认隔离，迭代 #13 后；harness 测试 38 个在 `alignment/tests/`）
+**当前总测试数：707 passed，0 failed**（live 测试默认隔离，迭代 #14 后；harness 测试 38 个在 `alignment/tests/`）
 
 > 各阶段详细实现见 **[dev_records.md](.codebuddy/notes/dev_records.md)**
 

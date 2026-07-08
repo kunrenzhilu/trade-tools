@@ -1,0 +1,138 @@
+diff --git a/mytrader/mytrader/strategy/strategies/macd_volume.py b/mytrader/mytrader/strategy/strategies/macd_volume.py
+new file mode 100644
+--- /dev/null
++++ b/mytrader/mytrader/strategy/strategies/macd_volume.py
+@@ -0,0 +1,58 @@
++"""MACD + 成交量确认策略（MACD + Volume Confirmation）。
++
++信号规则：
++    - BUY: MACD 上穿信号线 AND 成交量 > 成交量均线 → 放量确认 → +1
++    - SELL: MACD 下穿信号线 → 无需成交量确认（不 trap in losing position）→ -1
++
++设计动机：MACD 交叉信号噪音大，加入成交量确认可过滤低量假突破。
++出场不需成交量确认——亏损时必须无条件出场，不被低量困住。
++"""
++
++from __future__ import annotations
++
++import pandas as pd
++
++from mytrader.strategy.indicators import macd, sma, crossed_above, crossed_below
++from mytrader.strategy.registry import register_strategy
++
++
++@register_strategy("macd_volume")
++def macd_volume_signal(
++    close: pd.Series,
++    fast: int = 12,
++    slow: int = 26,
++    signal_period: int = 9,
++    volume_period: int = 20,
++    df: pd.DataFrame | None = None,
++) -> pd.Series:
++    """MACD 交叉 + 成交量确认信号。
++
++    Args:
++        close:         收盘价 Series
++        fast:          快线 EMA 周期（默认 12）
++        slow:          慢线 EMA 周期（默认 26）
++        signal_period: 信号线 EMA 周期（默认 9）
++        volume_period: 成交量均线周期（默认 20）
++        df:            完整 OHLCV DataFrame（用于读取 volume 列）；
++                       None 时退化为纯 MACD 策略
++
++    Returns:
++        信号 Series：1=BUY, -1=SELL, 0=HOLD
++    """
++    macd_line, signal_line, _ = macd(close, fast=fast, slow=slow, signal_period=signal_period)
++
++    buy_signal = crossed_above(macd_line, signal_line)
++    sell_signal = crossed_below(macd_line, signal_line)
++
++    # 成交量确认（仅入场需要，出场无条件）
++    if df is not None and "volume" in df.columns and len(df) > volume_period:
++        volume_ma = sma(df["volume"], period=volume_period)
++        vol_confirm = df["volume"] > volume_ma
++        buy_signal = buy_signal & vol_confirm
++
++    signal = pd.Series(0, index=close.index, dtype=int)
++    signal[buy_signal] = 1
++    signal[sell_signal] = -1
++
++    # shift(1) 避免前视偏差
++    return signal.shift(1).fillna(0).astype(int)
+diff --git a/mytrader/mytrader/strategy/strategies/rsi_bb_convergence.py b/mytrader/mytrader/strategy/strategies/rsi_bb_convergence.py
+new file mode 100644
+--- /dev/null
++++ b/mytrader/mytrader/strategy/strategies/rsi_bb_convergence.py
+@@ -0,0 +1,70 @@
++"""RSI + Bollinger Band 双确认均值回归策略（RSI + BB Convergence）。
++
++信号规则：
++    - BUY entry:  RSI < oversold AND close < lower_bb → 双重超卖确认 → +1
++    - SELL entry: RSI > overbought AND close > upper_bb → 双重超买确认 → -1
++    - Exit long:  RSI 向上穿越中性 OR close 向上穿越中轨 → SELL (-1)
++    - Exit short: RSI 向下穿越中性 OR close 向下穿越中轨 → BUY (+1)
++
++设计动机：单一 RSI 或单一布林带信号假阳性率高。双重确认要求两个独立
++均值回归指标同时触发，降低假信号。出场条件也放宽为任一指标回归即出场。
++"""
++
++from __future__ import annotations
++
++import pandas as pd
++
++from mytrader.strategy.indicators import (
++    rsi,
++    bollinger_bands,
++    crossed_above,
++    crossed_below,
++)
++from mytrader.strategy.registry import register_strategy
++
++
++@register_strategy("rsi_bb_convergence")
++def rsi_bb_convergence_signal(
++    close: pd.Series,
++    rsi_period: int = 14,
++    oversold: float = 30.0,
++    overbought: float = 70.0,
++    bb_period: int = 20,
++    bb_std: float = 2.0,
++    exit_rsi_neutral: float = 50.0,
++) -> pd.Series:
++    """RSI + Bollinger Band 双确认均值回归信号。
++
++    Args:
++        close:            收盘价 Series
++        rsi_period:       RSI 计算周期（默认 14）
++        oversold:         RSI 超卖阈值（默认 30）
++        overbought:       RSI 超买阈值（默认 70）
++        bb_period:        布林带周期（默认 20）
++        bb_std:           布林带标准差倍数（默认 2.0）
++        exit_rsi_neutral: RSI 中性水平，RSI 回归此值时出场（默认 50）
++
++    Returns:
++        信号 Series：1=BUY, -1=SELL, 0=HOLD
++    """
++    rsi_values = rsi(close, rsi_period)
++    upper, middle, lower = bollinger_bands(close, period=bb_period, std_dev=bb_std)
++
++    # Entry: 双确认
++    buy_entry = (rsi_values < oversold) & (close < lower)
++    sell_entry = (rsi_values > overbought) & (close > upper)
++
++    # Exit: 任一条件清除（RSI 回归中性 OR 价格穿越中轨）
++    exit_long_rsi = (rsi_values > exit_rsi_neutral) & (rsi_values.shift(1) <= exit_rsi_neutral)
++    exit_long_bb = crossed_above(close, middle)
++    exit_short_rsi = (rsi_values < exit_rsi_neutral) & (rsi_values.shift(1) >= exit_rsi_neutral)
++    exit_short_bb = crossed_below(close, middle)
++
++    signal = pd.Series(0, index=close.index, dtype=int)
++    signal[buy_entry] = 1
++    signal[sell_entry] = -1
++    signal[exit_long_rsi | exit_long_bb] = -1
++    signal[exit_short_rsi | exit_short_bb] = 1
++
++    # shift(1) 避免前视偏差
++    return signal.shift(1).fillna(0).astype(int)

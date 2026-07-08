@@ -10,6 +10,8 @@ import mytrader.strategy.strategies.rsi_mean_revert     # noqa: F401
 import mytrader.strategy.strategies.rsi_trend_filter    # noqa: F401  [迭代 #8]
 import mytrader.strategy.strategies.bollinger_band      # noqa: F401
 import mytrader.strategy.strategies.macd_cross          # noqa: F401
+import mytrader.strategy.strategies.rsi_bb_convergence  # noqa: F401  [迭代 #14]
+import mytrader.strategy.strategies.macd_volume         # noqa: F401  [迭代 #14]
 
 __all__ = [
     "Signal",

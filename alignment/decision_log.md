@@ -488,9 +488,39 @@
   - SPY 不可用时保守拒绝（pass_all_rounds=False）
   - 675 测试通过
 
-- **经验教训**:
+  - **经验教训**:
   - **spec 的字段顺序建议可能有 dataclass 兼容性问题**：spec 原文画了 `val_alpha` 在 `passed` 之前，但 Python dataclass 要求有默认值的字段在无默认值的之后。实现时需要判断 spec 的意图（加 alpha 字段）而非字面照搬
   - **两层 gate 比单层更鲁棒**：单轮 floor 拦截灾难，汇总 avg 拦截系统性问题。这比"每轮都必须 > 0"更容错，避免因单轮市场噪音误杀
   - **benchmark 缺失时保守拒绝**：比"跳过 gate"更安全。迫使系统确保 benchmark 数据可用，而不是在数据缺失时静默放行
+
+---
+
+## 决策 #16 — Iter #16: alpha gate 阈值放宽设计
+
+**日期**: 2026-07-08
+**触发**: Iter #15 reoptimize 发现 4/6 组空仓，alpha>0 门槛过于严格
+
+### 决策点
+
+**决策 1: ALPHA_GATE_THRESHOLD 取 -2.0 还是其他值？**
+- 选项 A：-1.0%（更保守，仅允许极小幅跑输）
+- 选项 B：-2.0%（spec 建议，与 WF -5% floor 形成 3% 缓冲带）
+- 选项 C：-5.0%（与 WF floor 一致，最宽松）
+- 选 B：-2.0% 平衡了"过滤灾难性跑输"和"保留合理候选"。3% 缓冲带让 in-sample gate 比 OOS gate 宽松，符合"in-sample 放宽让候选进入 OOS 验证"的分层设计。选 C 会让 in-sample 和 OOS gate 一样宽松，失去分层意义
+
+**决策 2: 是否同时更新 `_optimize_ensemble_weights`？**
+- 选项 A：同时更新，用 `max(a - ALPHA_GATE_THRESHOLD, 0.0)` 替代 `max(a, 0.0)`，让小幅负 alpha 也贡献权重
+- 选项 B：只更新 gate 阈值，ensemble weights 逻辑不变（spec 建议"fine for now"）
+- 选 B：保守设计——多策略 ensemble 中正 alpha 策略应主导权重，负 alpha（即使 > -2%）权重为 0 是合理的。单策略场景由 `len == 1` 早返回得到 weight=1.0，不受影响。若未来需要让小幅负 alpha 贡献权重，可单独迭代
+
+**决策 3: `no_positive_alpha` 字段名是否重命名？**
+- 选项 A：重命名为 `no_qualified_alpha`（语义更准确，因为现在接受小幅负 alpha）
+- 选项 B：保留 `no_positive_alpha`（向下兼容下游消费方）
+- 选 B：字段名是下游消费方（PortfolioBacktester / 风控观测）的接口契约，重命名会破坏兼容性。语义已通过注释说明清楚（"字段名保留 no_positive_alpha，语义为无合格 alpha 候选"）
+
+### 经验教训
+- **in-sample 与 OOS 阈值应分层**：in-sample gate 应比 OOS gate 宽松，让更多候选进入 OOS 验证。Iter #16 的 -2% in-sample vs Iter #13 的 -5% OOS floor + avg>0 汇总门槛，形成"宽松入选 + 严格验证"的分层设计
+- **字段名是接口契约**：即使语义变化（alpha>0 → alpha>-2%），也不应重命名已有字段，避免破坏下游兼容性。通过注释说明语义变化即可
+- **spec 假设需要实际验证**：spec §1 假设"SPX 成分股 alpha 在 -1% ~ 0%"，但实际 SPX_mid_vol 的 alpha 范围为 -4.69% ~ -13.84%。spec 的假设可能基于直觉而非数据，实际运行后需要修正
 
 ---

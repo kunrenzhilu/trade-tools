@@ -72,6 +72,16 @@
 - 验收 gate（无论 WF 还是 paper 准入）必须校验**跑赢 benchmark（正 alpha）**，DD/Sortino 达标 ≠ 有正 alpha
 - 归一化权重时，负分不能用 `max(x, ε)` 掩盖——那会把"都不好"变成"等权都要"
 
+## 9. spec 的根因假设需要用数据验证，不能照单全收
+
+**背景**：Iter #16 spec 假设"SPX 成分股 vs SPY 存在结构性近零 alpha（-1% ~ 0%）"，理由是"SPY 即 S&P 500 本身，交易 SPX 组件 vs SPY 相当于和自己赛跑"。基于此假设，将 alpha gate 从 alpha>0 放宽至 alpha>-2%。但实际 reoptimize 结果显示 SPX_mid_vol 的 9 策略 alpha 范围为 -4.69% ~ -13.84%，SPX_high_vol 为 -3.61% ~ -13.40%。-2% 阈值对 SPX 组完全不够。
+
+**原则**：
+- spec 的根因分析是基于直觉/经验，不一定准确。实施前应先用数据验证："当前 SPX 组的 alpha 分布到底是什么范围？"
+- 阈值选择应基于实际 alpha 分布，而非理论假设。如果 SPX 组的 alpha 中位数是 -6%，-2% 阈值就是无效的
+- 放宽阈值是"治标"，改进策略 alpha 才是"治本"。如果所有策略在 SPX 上都跑输 SPY 5-14%，问题不在 gate 阈值，而在策略逻辑不适配 SPX 成分股的低波动率特征
+- in-sample 与 OOS 阈值应分层：in-sample 宽松（让候选进入 OOS），OOS 严格（avg>0 汇总门槛）。Iter #16 的 -2% in-sample vs Iter #13 的 -5% OOS floor 设计是正确的分层，但 -2% 对 SPX 组来说仍然太严
+
 ---
 
 *持续更新。每犯一次新类型的错误，提炼一条原则。*

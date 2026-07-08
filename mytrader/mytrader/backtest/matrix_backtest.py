@@ -54,6 +54,17 @@ WALK_FORWARD_VAL_ALPHA_FLOOR: float = -5.0
 # fallback：若无候选通过此门槛，放宽过滤（仅保留 DD 硬约束）
 MIN_SORTINO_THRESHOLD: float = 0.5
 
+# 迭代 #16 新增：alpha gate 门槛（in-sample），用于 _run_group 排序前的硬门槛。
+# Iter #12 原值为 0（alpha>0 才入选），Iter #16 放宽至 -2%。
+# 设计动机：SPX 成分股 vs SPY benchmark 存在结构性近零 alpha —— SPY 即 S&P 500
+# 本身，交易 SPX 组件 vs SPY 相当于"和自己赛跑"。alpha=-1%（小幅跑输 SPY）的
+# 策略仍可能有出色的 Sortino / DD，不应被一刀切拒绝。
+# 与 WF OOS 校验的关系：Walk-Forward（Iter #13）仍用 -5% 单轮下限 + avg>0 汇总
+# 门槛，放宽 in-sample gate 不会削弱 OOS 验证强度。
+# 取 -2% 的理由：足以过滤"灾难性跑输"（如 -5% 以下），但保留"小幅跑输"的
+# 合理候选；阈值与 WALK_FORWARD_VAL_ALPHA_FLOOR=-5% 形成 3% 缓冲带。
+ALPHA_GATE_THRESHOLD: float = -2.0
+
 # 迭代 #11 新增：健全性门槛 —— 识别"退化策略"（几乎不平仓的伪 buy-and-hold）
 # 判定：组内"有效标的中，已平仓交易数为 0 的比例"超过此阈值 → 退化
 # 设计动机：真策略应在多数标的上完成买卖闭环；若近乎所有标的都从不平仓，
@@ -693,7 +704,14 @@ def _optimize_ensemble_weights(
     旧代码 `max(alpha, 0.01)` 把负 alpha 都变成 0.01，归一化后等权，
     掩盖"都不好"的事实（experience.md #8）。新逻辑：负 alpha 权重为 0，
     只有正 alpha 参与归一化；全负 alpha 时等权 fallback + WARNING
-    （上游 alpha>0 门槛应已拦截，此处为防御性设计）。
+    （上游 alpha gate 应已拦截，此处为防御性设计）。
+
+    迭代 #16 注：上游 alpha gate 从 alpha>0 放宽至 alpha > ALPHA_GATE_THRESHOLD (-2%)，
+    允许小幅负 alpha 候选进入 ensemble。本函数仍用 max(a, 0.0) 作为权重下限，
+    意味着 ensemble 内负 alpha 策略权重仍为 0（被正 alpha 策略"覆盖"）。
+    这是保守设计：在多策略 ensemble 中，正 alpha 策略应主导权重；
+    单策略场景由 `len == 1` 早返回得到 weight=1.0。
+    若未来需要让小幅负 alpha 也贡献权重，可改为 `max(a - ALPHA_GATE_THRESHOLD, 0.0)`。
 
     Args:
         group_results: [(strategy, params, [SingleBacktestResult]), ...]
@@ -709,8 +727,9 @@ def _optimize_ensemble_weights(
 
     # 迭代 #12：负 alpha 策略不参与 ensemble（experience.md #8：负分不能用 max(x, ε) 掩盖）
     # 只有正 alpha 的策略参与归一化；负 alpha 策略权重为 0。
-    # 上游 _run_group 的 alpha>0 门槛应已拦截全负 alpha 情形，
-    # 这里是防御性设计：即使上游漏过负 alpha，也不会被 max(0.01) 掩盖成等权。
+    # 上游 _run_group 的 alpha gate（Iter #16: alpha > ALPHA_GATE_THRESHOLD=-2%）
+    # 应已拦截严重跑输的候选，这里是防御性设计：即使上游漏过负 alpha，
+    # 也不会被 max(0.01) 掩盖成等权。
     raw_alphas = []
     for strategy, params, results in group_results:
         combined = _combine_daily_returns(results)
@@ -725,13 +744,13 @@ def _optimize_ensemble_weights(
         weights = [a / total for a in positive_alphas]
     else:
         # 防御性 fallback：全负 alpha 或全零时等权
-        # （上游 alpha>0 门槛应已拦截，此处不应到达）
+        # （上游 alpha gate 应已拦截，此处不应到达）
         n = len(group_results)
         weights = [1.0 / n] * n if n > 0 else []
         logger.warning(
             f"[ensemble_weights] all alphas <= 0 ({raw_alphas}), "
             f"falling back to equal weight. This should not happen if "
-            f"alpha>0 gate is active upstream."
+            f"alpha gate (threshold={ALPHA_GATE_THRESHOLD}%) is active upstream."
         )
 
     return [
@@ -1314,27 +1333,37 @@ class MatrixBacktest:
             alpha = _compute_alpha(_combine_daily_returns(results), spy_returns)
             candidates.append((strategy, params, results, pso, pdd, alpha))
 
-        # 迭代 #12：alpha>0 硬门槛（experience.md #8：正超额是排序前的硬门槛）
-        # 在 Tier 1/2/3 fallback 之前，剔除 alpha≤0 的候选。
-        # 理由：跑不赢 SPY 的策略不应进入权重，无论 DD/Sortino 多好。
-        # 顺序：健全性（Iter #11）→ 风险（DD，Tier 1/2/3）→ 正超额（alpha>0，本步）→ 排序
+        # 迭代 #12：alpha 硬门槛（experience.md #8：正超额是排序前的硬门槛）
+        # 迭代 #16：阈值从 alpha>0 放宽至 alpha > ALPHA_GATE_THRESHOLD (-2%)。
+        #   动机：SPX 成分股 vs SPY 存在结构性近零 alpha，严格 alpha>0 门槛导致
+        #   4/6 组空仓（Iter #15 reoptimize 实证）。-2% 仍过滤"灾难性跑输"，
+        #   同时保留"小幅跑输 SPY 但 Sortino/DD 优秀"的候选。
+        #   Walk-Forward（Iter #13）仍用 -5% 单轮下限 + avg>0 汇总门槛作 OOS 校验，
+        #   放宽 in-sample gate 不削弱 OOS 验证强度。
+        # 顺序：健全性（Iter #11）→ 风险（DD，Tier 1/2/3）→ alpha 门槛（本步）→ 排序
         #
-        # 注意：这一步在 candidates 构建后、Tier 1 前，确保 Tier 1/2/3 只在正 alpha 候选中进行。
-        # 如果某组所有候选 alpha≤0，该组空仓（hold cash），不强行选负 alpha 策略
+        # 注意：这一步在 candidates 构建后、Tier 1 前，确保 Tier 1/2/3 只在合格 alpha 候选中进行。
+        # 如果某组所有候选 alpha ≤ ALPHA_GATE_THRESHOLD，该组空仓（hold cash），
+        # 不强行选严重跑输 SPY 的策略
         # （experience.md #8："没有候选满足门槛时，正确动作是空仓/降现金/回退 benchmark，
         #   不是矬子里拔将军"）。
-        positive_alpha_candidates = [c for c in candidates if c[5] > 0]
+        alpha_qualified_candidates = [
+            c for c in candidates if c[5] > ALPHA_GATE_THRESHOLD
+        ]
 
-        if not positive_alpha_candidates:
-            # 全组 alpha≤0 → 空权重（持仓现金），标记 no_positive_alpha
+        if not alpha_qualified_candidates:
+            # 全组 alpha ≤ threshold → 空权重（持仓现金），标记 no_positive_alpha
+            # 字段名保留 no_positive_alpha（向下兼容下游消费方），语义为"无合格 alpha 候选"
             alpha_strs = [f"{c[0]}({c[5]:.2f}%)" for c in candidates]
             logger.warning(
                 f"[MatrixBacktest] {group_id}: ALL {len(candidates)} candidates have "
-                f"alpha <= 0 (cannot beat SPY) — {alpha_strs}. "
+                f"alpha <= {ALPHA_GATE_THRESHOLD}% (cannot beat SPY within tolerance) — "
+                f"{alpha_strs}. "
                 f"Group produces EMPTY weights (hold cash). Marked no_positive_alpha."
             )
             report.warnings.append(
-                f"{group_id}: no_positive_alpha (all {len(candidates)} candidates alpha <= 0)"
+                f"{group_id}: no_positive_alpha "
+                f"(all {len(candidates)} candidates alpha <= {ALPHA_GATE_THRESHOLD}%)"
             )
             # 标记已 append 的 GroupBacktestResult 条目（供审计追溯）
             for gr in report.group_results:
@@ -1342,8 +1371,8 @@ class MatrixBacktest:
                     gr.no_positive_alpha = True
             return []
 
-        # 后续 Tier 1/2/3 在正 alpha 候选中进行
-        candidates = positive_alpha_candidates
+        # 后续 Tier 1/2/3 在合格 alpha 候选中进行
+        candidates = alpha_qualified_candidates
 
         # Tier 1: DD ≤ 20% AND Sortino > 0.5
         compliant = [

@@ -1,15 +1,27 @@
 """迭代 #12：alpha>0 硬门槛测试（Reject Negative-Alpha Strategies）。
 
+迭代 #16 更新：alpha gate 从 alpha>0 放宽至 alpha > ALPHA_GATE_THRESHOLD (-2%)。
+动机：SPX 成分股 vs SPY benchmark 存在结构性近零 alpha，严格 alpha>0 门槛导致
+4/6 组空仓。放宽至 -2% 仍过滤"灾难性跑输"，但保留"小幅跑输 SPY 但 Sortino/DD
+优秀"的候选。WF OOS 校验仍用 -5% 单轮下限 + avg>0 汇总门槛，不削弱 OOS 验证。
+
 验证：
     1. `GroupBacktestResult.no_positive_alpha` 字段默认 False
-    2. `_run_group` 在 candidates 构建后、Tier 1 前剔除 alpha≤0 的候选
-    3. 全负 alpha 组返回空权重 + `no_positive_alpha=True` 标记
-    4. 混合 alpha 组只保留正 alpha 候选
+    2. `_run_group` 在 candidates 构建后、Tier 1 剔除 alpha ≤ ALPHA_GATE_THRESHOLD 的候选
+    3. 全负 alpha（< -2%）组返回空权重 + `no_positive_alpha=True` 标记
+    4. 混合 alpha 组只保留 alpha > -2% 的候选
     5. `_optimize_ensemble_weights` 负 alpha 策略权重为 0（不再 max(0.01) 掩盖）
     6. 全负 alpha ensemble 退化为等权 + WARNING（防御性 fallback）
-    7. 健全性门槛 + alpha>0 门槛协同工作
+    7. 健全性门槛 + alpha 门槛协同工作
+    8. [Iter #16] ALPHA_GATE_THRESHOLD 常量存在且等于 -2.0
+    9. [Iter #16] alpha=-1% 通过 gate（在 -2% 与 0% 之间）
+    10. [Iter #16] alpha=-5% 仍被拒绝
+    11. [Iter #16] alpha=-2.0% 边界值被拒绝（使用 > 严格比较）
+    12. [Iter #16] alpha=+1% 仍通过（无回归）
+    13. [Iter #16] 集成场景：SPX 组 alpha=-1.5% 策略入选 tier1
+    14. [Iter #16] 单策略 ensemble 负 alpha（> -2%）仍得 weight=1.0（早返回）
 
-背景见 `iterations/iteration_12/spec.md` + `.codebuddy/notes/experience.md` #8。
+背景见 `iterations/iteration_16/spec.md` + `.codebuddy/notes/experience.md` #8。
 """
 
 from __future__ import annotations
@@ -22,6 +34,7 @@ import pandas as pd
 import pytest
 
 from mytrader.backtest.matrix_backtest import (
+    ALPHA_GATE_THRESHOLD,
     GroupBacktestResult,
     MatrixBacktest,
     MatrixBacktestReport,
@@ -847,3 +860,389 @@ class TestEnsembleWeightsNegativeAlpha:
         assert len(weights) == 1
         assert weights[0][0] == "strat_a"
         assert weights[0][2] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Iter #16: Relaxed alpha gate (ALPHA_GATE_THRESHOLD = -2.0)
+# ---------------------------------------------------------------------------
+
+class TestAlphaGateRelaxedThreshold:
+    """迭代 #16：alpha gate 从 alpha>0 放宽至 alpha > ALPHA_GATE_THRESHOLD (-2%)。
+
+    动机见 spec §1：SPX 成分股 vs SPY 存在结构性近零 alpha，严格 alpha>0 门槛
+    导致 4/6 组空仓。放宽至 -2% 仍过滤"灾难性跑输"，但保留"小幅跑输"候选。
+    """
+
+    def test_alpha_gate_constant_exists(self):
+        """ALPHA_GATE_THRESHOLD 常量存在且等于 -2.0。"""
+        assert hasattr(
+            __import__("mytrader.backtest.matrix_backtest", fromlist=["matrix_backtest"]),
+            "ALPHA_GATE_THRESHOLD",
+        ), "matrix_backtest 必须导出 ALPHA_GATE_THRESHOLD 常量"
+        assert ALPHA_GATE_THRESHOLD == -2.0, (
+            f"ALPHA_GATE_THRESHOLD 应为 -2.0，实际 {ALPHA_GATE_THRESHOLD}"
+        )
+
+    def test_alpha_gate_relaxed_negative_alpha_passes(self):
+        """alpha=-1% 通过 gate（在 -2% 与 0% 之间，旧 gate 会拒绝，新 gate 通过）。
+
+        场景：单策略 alpha=-1%，健全性通过。
+        验证：权重正常产出（非空），no_positive_alpha=False。
+
+        实现注：用 patch _compute_alpha 返回精确 -1.0%，避免随机收益序列的方差干扰。
+        重点测试 gate 逻辑，不测试 alpha 计算本身（后者在 test_matrix_backtest 覆盖）。
+        """
+        n = 300
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        spy_df = _make_spy_df(n, annual_return=0.10)
+
+        # 用任意正收益序列（健全性门槛需要 closed_trades>0，已由 _make_result 默认值满足）
+        np.random.seed(42)
+        returns_a = pd.Series(np.random.normal(0.0004, 0.004, n), index=idx)
+
+        # 通过 mock 精确控制 alpha = -1.0%（在 -2% 与 0% 之间）
+        mock_alpha = -1.0
+        assert ALPHA_GATE_THRESHOLD < mock_alpha < 0, (
+            f"测试前提失败：mock alpha 应在 (-2%, 0) 之间"
+        )
+
+        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
+            results = []
+            for sym, df in data.items():
+                if df is None or df.empty or len(df) < 30:
+                    continue
+                results.append(_make_result(sym, strategy_name, returns_a, closed_trades=10))
+            return results
+
+        df_up = _make_ohlcv(n, trend="up")
+        store = _make_store_with_spy({"AAA": df_up, "BBB": df_up}, spy_df)
+        universe = _make_mock_universe({"test_group": ["AAA", "BBB"]})
+
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
+        report = MatrixBacktestReport(
+            generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
+            backtest_window="2021-01-01 ~ 2022-01-01",
+            groups={},
+        )
+
+        with patch(
+            "mytrader.backtest.matrix_backtest._backtest_batch",
+            side_effect=mock_backtest_batch,
+        ), patch(
+            "mytrader.backtest.matrix_backtest._compute_alpha",
+            return_value=mock_alpha,
+        ):
+            weights = mb._run_group(
+                group_id="test_group",
+                symbols=["AAA", "BBB"],
+                start=date(2021, 1, 1),
+                end=date(2022, 1, 1),
+                strategies=["dual_ma"],
+                param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+                report=report,
+            )
+
+        # 关键断言：alpha=-1% 应通过 gate（旧 gate 会拒绝）
+        assert len(weights) > 0, (
+            f"alpha=-1% 应通过 Iter #16 放宽后的 gate，实际 weights={weights}"
+        )
+        # no_positive_alpha 不应被标记
+        for gr in report.group_results:
+            if gr.group_id == "test_group":
+                assert gr.no_positive_alpha is False, (
+                    "alpha=-1% 组不应标记 no_positive_alpha=True（Iter #16 放宽后）"
+                )
+        warning_text = " ".join(report.warnings)
+        assert "no_positive_alpha" not in warning_text, (
+            f"alpha=-1% 组不应有 no_positive_alpha 警告，warnings={report.warnings}"
+        )
+
+    def test_alpha_gate_very_negative_fails(self):
+        """alpha=-5% 仍被拒绝（远低于 -2% 阈值）。
+
+        场景：单策略 alpha=-5%，健全性通过。
+        验证：返回空权重，no_positive_alpha=True。
+        """
+        n = 300
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        spy_df = _make_spy_df(n, annual_return=0.10)
+
+        np.random.seed(42)
+        returns_a = pd.Series(np.random.normal(0.0004, 0.004, n), index=idx)
+
+        # mock alpha = -5.0%（远低于 -2% 阈值）
+        mock_alpha = -5.0
+        assert mock_alpha < ALPHA_GATE_THRESHOLD, (
+            f"测试前提失败：mock alpha 应 < {ALPHA_GATE_THRESHOLD}%"
+        )
+
+        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
+            results = []
+            for sym, df in data.items():
+                if df is None or df.empty or len(df) < 30:
+                    continue
+                results.append(_make_result(sym, strategy_name, returns_a, closed_trades=10))
+            return results
+
+        df_up = _make_ohlcv(n, trend="up")
+        store = _make_store_with_spy({"AAA": df_up, "BBB": df_up}, spy_df)
+        universe = _make_mock_universe({"test_group": ["AAA", "BBB"]})
+
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
+        report = MatrixBacktestReport(
+            generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
+            backtest_window="2021-01-01 ~ 2022-01-01",
+            groups={},
+        )
+
+        with patch(
+            "mytrader.backtest.matrix_backtest._backtest_batch",
+            side_effect=mock_backtest_batch,
+        ), patch(
+            "mytrader.backtest.matrix_backtest._compute_alpha",
+            return_value=mock_alpha,
+        ):
+            weights = mb._run_group(
+                group_id="test_group",
+                symbols=["AAA", "BBB"],
+                start=date(2021, 1, 1),
+                end=date(2022, 1, 1),
+                strategies=["dual_ma"],
+                param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+                report=report,
+            )
+
+        # 关键断言：alpha=-5% 应被拒绝
+        assert weights == [], (
+            f"alpha={mock_alpha}% 应被拒绝（< {ALPHA_GATE_THRESHOLD}%），实际 weights={weights}"
+        )
+        warning_text = " ".join(report.warnings)
+        assert "no_positive_alpha" in warning_text
+        for gr in report.group_results:
+            if gr.group_id == "test_group":
+                assert gr.no_positive_alpha is True
+
+    def test_alpha_gate_threshold_boundary(self):
+        """alpha=-2.0% 恰好在阈值边界 → 被拒绝（使用 > 严格比较）。
+
+        场景：alpha 精确等于 -2.0%（边界值）。
+        验证：返回空权重（因为 `c[5] > ALPHA_GATE_THRESHOLD` 是严格大于）。
+        """
+        n = 300
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        spy_df = _make_spy_df(n, annual_return=0.10)
+
+        np.random.seed(42)
+        returns_a = pd.Series(np.random.normal(0.0004, 0.004, n), index=idx)
+
+        # mock alpha 精确等于阈值边界
+        mock_alpha = ALPHA_GATE_THRESHOLD  # -2.0
+
+        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
+            results = []
+            for sym, df in data.items():
+                if df is None or df.empty or len(df) < 30:
+                    continue
+                results.append(_make_result(sym, strategy_name, returns_a, closed_trades=10))
+            return results
+
+        df_up = _make_ohlcv(n, trend="up")
+        store = _make_store_with_spy({"AAA": df_up, "BBB": df_up}, spy_df)
+        universe = _make_mock_universe({"test_group": ["AAA", "BBB"]})
+
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
+        report = MatrixBacktestReport(
+            generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
+            backtest_window="2021-01-01 ~ 2022-01-01",
+            groups={},
+        )
+
+        # patch _compute_alpha 返回精确 -2.0%（边界值）
+        with patch(
+            "mytrader.backtest.matrix_backtest._backtest_batch",
+            side_effect=mock_backtest_batch,
+        ), patch(
+            "mytrader.backtest.matrix_backtest._compute_alpha",
+            return_value=mock_alpha,
+        ):
+            weights = mb._run_group(
+                group_id="test_group",
+                symbols=["AAA", "BBB"],
+                start=date(2021, 1, 1),
+                end=date(2022, 1, 1),
+                strategies=["dual_ma"],
+                param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+                report=report,
+            )
+
+        # 关键断言：alpha == threshold 应被拒绝（因为 c[5] > ALPHA_GATE_THRESHOLD 是严格大于）
+        assert weights == [], (
+            f"alpha == {ALPHA_GATE_THRESHOLD}% 应被拒绝（使用 > 严格比较），"
+            f"实际 weights={weights}"
+        )
+        warning_text = " ".join(report.warnings)
+        assert "no_positive_alpha" in warning_text
+
+    def test_alpha_gate_positive_alpha_passes(self):
+        """alpha=+1% 仍通过 gate（无回归，正 alpha 行为不变）。
+
+        场景：单策略 alpha=+1%（正 alpha）。
+        验证：权重正常产出，no_positive_alpha=False。
+        这是回归测试，确保 Iter #16 放宽不破坏正 alpha 行为。
+        """
+        n = 300
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        spy_df = _make_spy_df(n, annual_return=0.10)
+
+        np.random.seed(42)
+        returns_a = pd.Series(np.random.normal(0.0004, 0.004, n), index=idx)
+
+        # mock alpha = +1.0%（正 alpha）
+        mock_alpha = 1.0
+        assert mock_alpha > 0
+
+        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
+            results = []
+            for sym, df in data.items():
+                if df is None or df.empty or len(df) < 30:
+                    continue
+                results.append(_make_result(sym, strategy_name, returns_a, closed_trades=10))
+            return results
+
+        df_up = _make_ohlcv(n, trend="up")
+        store = _make_store_with_spy({"AAA": df_up, "BBB": df_up}, spy_df)
+        universe = _make_mock_universe({"test_group": ["AAA", "BBB"]})
+
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
+        report = MatrixBacktestReport(
+            generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
+            backtest_window="2021-01-01 ~ 2022-01-01",
+            groups={},
+        )
+
+        with patch(
+            "mytrader.backtest.matrix_backtest._backtest_batch",
+            side_effect=mock_backtest_batch,
+        ), patch(
+            "mytrader.backtest.matrix_backtest._compute_alpha",
+            return_value=mock_alpha,
+        ):
+            weights = mb._run_group(
+                group_id="test_group",
+                symbols=["AAA", "BBB"],
+                start=date(2021, 1, 1),
+                end=date(2022, 1, 1),
+                strategies=["dual_ma"],
+                param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+                report=report,
+            )
+
+        # 正 alpha 应���常通过
+        assert len(weights) > 0, (
+            f"正 alpha 应通过 gate（无回归），实际 weights={weights}"
+        )
+        for gr in report.group_results:
+            if gr.group_id == "test_group":
+                assert gr.no_positive_alpha is False
+
+    def test_alpha_gate_relaxed_unblocks_spx(self):
+        """集成场景：SPX 组 alpha=-1.5% 策略入选 tier1（旧 gate 会拒绝）。
+
+        场景：模拟 Iter #15 reoptimize 中 SPX 组的情况——
+        策略 alpha=-1.5%（在 -2% 与 0% 之间），DD ≤ 20%，Sortino > 0.5。
+        验证：
+          - 旧 gate（alpha>0）会拒绝 → 空权重
+          - 新 gate（alpha>-2%）通过 → 权重非空
+        """
+        n = 300
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        spy_df = _make_spy_df(n, annual_return=0.10)
+
+        np.random.seed(42)
+        returns_a = pd.Series(np.random.normal(0.0004, 0.004, n), index=idx)
+
+        # mock alpha = -1.5%（在 -2% 与 0% 之间，模拟 SPX near-zero alpha 场景）
+        mock_alpha = -1.5
+        assert ALPHA_GATE_THRESHOLD < mock_alpha < 0
+
+        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
+            results = []
+            for sym, df in data.items():
+                if df is None or df.empty or len(df) < 30:
+                    continue
+                results.append(_make_result(sym, strategy_name, returns_a, closed_trades=10))
+            return results
+
+        df_up = _make_ohlcv(n, trend="up")
+        store = _make_store_with_spy({"AAA": df_up, "BBB": df_up}, spy_df)
+        # 模拟 SPX 组名（仅用于语义清晰，不影响逻辑）
+        universe = _make_mock_universe({"SPX_mid_vol": ["AAA", "BBB"]})
+
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
+        report = MatrixBacktestReport(
+            generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
+            backtest_window="2021-01-01 ~ 2022-01-01",
+            groups={},
+        )
+
+        with patch(
+            "mytrader.backtest.matrix_backtest._backtest_batch",
+            side_effect=mock_backtest_batch,
+        ), patch(
+            "mytrader.backtest.matrix_backtest._compute_alpha",
+            return_value=mock_alpha,
+        ):
+            weights = mb._run_group(
+                group_id="SPX_mid_vol",
+                symbols=["AAA", "BBB"],
+                start=date(2021, 1, 1),
+                end=date(2022, 1, 1),
+                strategies=["dual_ma"],
+                param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+                report=report,
+            )
+
+        # 关键断言：SPX 组不再空仓
+        assert len(weights) > 0, (
+            f"SPX 组 alpha={mock_alpha}%（> {ALPHA_GATE_THRESHOLD}%）应通过 gate，"
+            f"实际 weights={weights}（Iter #15 此场景被 alpha>0 gate 阻塞）"
+        )
+        # backtest_alpha 字段应存在
+        for w in weights:
+            assert "backtest_alpha" in w
+        # no_positive_alpha 不应被标记
+        warning_text = " ".join(report.warnings)
+        assert "no_positive_alpha" not in warning_text
+
+    def test_ensemble_weights_with_negative_alpha_single_strategy(self):
+        """单策略 ensemble 负 alpha（> -2%）仍得 weight=1.0（早返回）。
+
+        场景：单策略 alpha=-1%（通过 Iter #16 gate），进入 ensemble。
+        验证：`_optimize_ensemble_weights` 的 `len == 1` 早返回路径给 weight=1.0。
+
+        注：多策略 ensemble 中负 alpha 权重仍为 0（max(a, 0.0)），
+        这是保守设计——正 alpha 策略应主导权重。单策略场景是特例。
+        """
+        n = 252
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        spy_returns = pd.Series(np.random.normal(0.0004, 0.001, n), index=idx)
+
+        # 策略收益序列（alpha 值由 mock 控制，这里只需要非空序列）
+        np.random.seed(42)
+        returns_a = pd.Series(np.random.normal(0.00035, 0.004, n), index=idx)
+
+        results_a = [_make_result("S1", "strat_a", returns_a)]
+
+        # 单策略 ensemble（早返回路径，不计算 alpha）
+        weights = _optimize_ensemble_weights(
+            [("strat_a", {}, results_a)],
+            spy_returns=spy_returns,
+        )
+
+        # 早返回路径 → weight=1.0
+        assert len(weights) == 1
+        assert weights[0][0] == "strat_a"
+        assert weights[0][2] == 1.0, (
+            f"单策略 ensemble 应早返回 weight=1.0（不依赖 alpha 值），"
+            f"实际 {weights[0][2]}"
+        )

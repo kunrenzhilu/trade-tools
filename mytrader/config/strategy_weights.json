@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "generated_at": "2026-07-08T04:07:45.893300+00:00",
+    "generated_at": "2026-07-08T08:27:38.608694+00:00",
     "backtest_window": "2021-07-09 ~ 2026-07-08",
     "reoptimize_freq": "monthly",
     "survivorship_bias_warning": "使用当前成分股回测，S&P 500 5年成分变动约100只(~20%)，均值回归组(SPX_low_vol)结果可能系统性偏高"
@@ -10,20 +10,20 @@
     "SPX_high_vol": [],
     "NDX_high_vol": [
       {
-        "strategy": "rsi_mean_revert",
+        "strategy": "momentum_roc",
         "params": {
-          "period": 14,
-          "oversold": 35,
-          "overbought": 75
+          "roc_period": 20,
+          "buy_threshold": 3,
+          "sell_threshold": -5
         },
         "weight": 1.0,
-        "backtest_sharpe": 0.7264,
-        "backtest_sortino": 1.078,
-        "backtest_max_drawdown": 29.8911,
-        "backtest_win_rate": 0.7779,
-        "backtest_alpha": 0.4035,
-        "dd_constrained": true,
-        "backtest_dd_status": "dd_constrained"
+        "backtest_sharpe": 1.2321,
+        "backtest_sortino": 1.803,
+        "backtest_max_drawdown": 9.5964,
+        "backtest_win_rate": 0.3796,
+        "backtest_alpha": -1.8369,
+        "dd_constrained": false,
+        "backtest_dd_status": "pass"
       }
     ],
     "SPX_low_vol": [],
@@ -41,6 +41,21 @@
         "backtest_max_drawdown": 13.6764,
         "backtest_win_rate": 0.8259,
         "backtest_alpha": 1.7674,
+        "dd_constrained": false,
+        "backtest_dd_status": "pass"
+      },
+      {
+        "strategy": "bollinger_band",
+        "params": {
+          "period": 25,
+          "std_dev": 1.5
+        },
+        "weight": 0.0,
+        "backtest_sharpe": 0.9954,
+        "backtest_sortino": 1.5838,
+        "backtest_max_drawdown": 14.9034,
+        "backtest_win_rate": 0.7453,
+        "backtest_alpha": -1.2414,
         "dd_constrained": false,
         "backtest_dd_status": "pass"
       }

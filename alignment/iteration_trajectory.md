@@ -1499,6 +1499,143 @@ Full pytest (excluding live): 707 passed, 0 failed, 103 warnings in 23.56s
 
 ---
 
+## 迭代 #16 — Relax Alpha Gate Threshold (Unblock SPX Groups)
+
+- **日期**: 2026-07-08 UTC
+- **类型**: Selection Gate Adjustment (Low Risk)
+- **变更摘要**: 将 `_run_group` 的 alpha gate 从 `alpha > 0` 放宽至 `alpha > ALPHA_GATE_THRESHOLD (-2.0)`，新增模块级常量 `ALPHA_GATE_THRESHOLD`；更新 `_optimize_ensemble_weights` 注释（逻辑不变）；新增 7 个 gate 测试覆盖边界/通过/拒绝/SPX 解锁场景
+- **状态**: passed
+- **执行时长**: 1 轮对话（手动开发）
+- **测试数**: 737 → 744（+7 新测试用例）
+
+### 背景
+
+Iter #12 引入 `alpha > 0` 硬门槛后，Iter #15 reoptimize 发现 4/6 组空仓（SPX_mid_vol / SPX_high_vol / SPX_low_vol / NDX_mid_vol）。spec 假设 SPX 成分股 vs SPY 存在结构性近零 alpha（-1% ~ 0%），alpha>0 门槛过于严格，应放宽至 -2%。
+
+### 变更详情
+
+**P0: 新增 `ALPHA_GATE_THRESHOLD` 常量** (`mytrader/backtest/matrix_backtest.py`)
+- 模块级常量 `ALPHA_GATE_THRESHOLD: float = -2.0`
+- 设计动机：SPX 成分股 vs SPY benchmark 存在结构性近零 alpha；-2% 过滤"灾难性跑输"但保留"小幅跑输 SPY 但 Sortino/DD 优秀"的候选
+- 与 WF OOS 校验的关系：Walk-Forward（Iter #13）仍用 -5% 单轮下限 + avg>0 汇总门槛，放宽 in-sample gate 不削弱 OOS 验证强度
+
+**P0: 放宽 `_run_group` alpha gate** (`matrix_backtest.py::_run_group`)
+- 旧：`positive_alpha_candidates = [c for c in candidates if c[5] > 0]`
+- 新：`alpha_qualified_candidates = [c for c in candidates if c[5] > ALPHA_GATE_THRESHOLD]`
+- 变量名从 `positive_alpha_candidates` 改为 `alpha_qualified_candidates`（语义更准确）
+- 警告信息更新：`alpha <= 0 (cannot beat SPY)` → `alpha <= {ALPHA_GATE_THRESHOLD}% (cannot beat SPY within tolerance)`
+- `no_positive_alpha` 字段名保留（向下兼容下游消费方），语义为"无合格 alpha 候选"
+
+**P1: 更新 `_optimize_ensemble_weights` 注释** (`matrix_backtest.py::_optimize_ensemble_weights`)
+- 逻辑不变：仍用 `max(a, 0.0)` 作为权重下限（负 alpha 在多策略 ensemble 中权重为 0）
+- 新增 Iter #16 注释：说明上游 alpha gate 已放宽至 -2%，本函数的 `max(a, 0.0)` 是保守设计
+- 注释提示：若未来需让小幅负 alpha 贡献权重，可改为 `max(a - ALPHA_GATE_THRESHOLD, 0.0)`
+
+**P1: 测试** (`tests/test_alpha_gate.py`, +7 新测试)
+- `TestAlphaGateRelaxedThreshold` 类，7 个测试：
+  1. `test_alpha_gate_constant_exists` — 常量存在且等于 -2.0
+  2. `test_alpha_gate_relaxed_negative_alpha_passes` — alpha=-1% 通过 gate
+  3. `test_alpha_gate_very_negative_fails` — alpha=-5% 仍被拒绝
+  4. `test_alpha_gate_threshold_boundary` — alpha=-2.0% 边界被拒绝（>严格比较）
+  5. `test_alpha_gate_positive_alpha_passes` — alpha=+1% 仍通过（无回归）
+  6. `test_alpha_gate_relaxed_unblocks_spx` — SPX 组 alpha=-1.5% 入选 tier1
+  7. `test_ensemble_weights_with_negative_alpha_single_strategy` — 单策略 ensemble 负 alpha 得 weight=1.0
+- 测试技巧：用 `patch _compute_alpha` 返回精确 alpha 值，避免随机收益序列的方差干扰；重点测 gate 逻辑而非 alpha 计算
+
+**P2: 文档同步**
+- 更新 `designs/design_v2/07-backtest-module.md` §10.4.1：新增 Iter #16 放宽说明
+- 更新 `.codebuddy/CODEBUDDY.md`：新增 Iter #16 条目 + 测试数 707→744
+
+### 验证结果
+
+```
+tests/test_alpha_gate.py: 20 passed, 0 failed (13 旧 + 7 新)
+Full pytest (excluding live): 744 passed, 0 failed, 103 warnings in 25.00s
+```
+
+### --reoptimize 验证结果
+
+**Baseline (Iter #15)**: 2/6 组有权重（NDX_high_vol: rsi_mean_revert, NDX_low_vol: rsi_mean_revert），4/6 组空仓
+
+**Iter #16 --reoptimize 结果**（完整，reoptimize 已完成）:
+
+| 组 | Baseline | Iter #16 | 变化 |
+|----|----------|----------|------|
+| SPX_mid_vol | EMPTY | EMPTY | 无变化（所有 alpha < -4.69%） |
+| SPX_high_vol | EMPTY | EMPTY | 无变化（所有 alpha < -3.61%） |
+| NDX_high_vol | rsi_mean_revert (alpha=+0.40%) | momentum_roc (alpha=-1.84%) | **CHANGED**: momentum_roc 被 -2% gate 解锁 |
+| SPX_low_vol | EMPTY | EMPTY | 无变化（所有 alpha < -4.01%） |
+| NDX_low_vol | rsi_mean_revert (alpha=+1.77%) | rsi_mean_revert + bollinger_band (alpha=-1.24%) | **CHANGED**: bollinger_band 被 -2% gate 解锁 |
+| NDX_mid_vol | EMPTY | EMPTY | 无变化（所有 alpha < -2.48%，差 0.48%） |
+
+**-2% gate 解锁的策略**（alpha 在 (-2%, 0) 区间，旧 alpha>0 gate 会拒绝）:
+1. NDX_high_vol: momentum_roc (alpha=-1.8369%)
+2. NDX_low_vol: bollinger_band (alpha=-1.2414%, weight=0.0 — ensemble 中负 alpha 权重为 0)
+
+**关键发现**: spec §1 假设"SPX 成分股 vs SPY 存在结构性近零 alpha（-1% ~ 0%）"，但实际 SPX 组的 alpha 范围为 -3.61% ~ -15.35%。-2% 阈值对 SPX 组完全不够。NDX 组的 alpha 更接近 spec 假设（-1.84% ~ -2.48%）。
+
+### Constitution 合规
+
+- ✅ 未突破 DD 20% 约束（未修改 DD 阈值）
+- ✅ 测试覆盖率提升（+7 测试，737 → 744）
+- ✅ 未引入黑箱逻辑（ALPHA_GATE_THRESHOLD 是透明常量）
+- ✅ 未修改 WF OOS 校验（仍用 -5% 单轮下限 + avg>0）
+- ✅ 未修改 Sortino 0.5 门槛
+- ✅ 未修改 strategies / indicators / risk / execution / main.py（spec §5 scope boundary 遵守）
+- ✅ 文档与代码同步（trajectory + CODEBUDDY + design_v2/07 更新）
+
+### Success Criteria 对照（spec §4）
+
+| # | 条件 | 状态 |
+|---|------|:----:|
+| 1 | Alpha gate uses ALPHA_GATE_THRESHOLD=-2.0 | ✅ 常量测试 + 代码审查 |
+| 2 | Alpha=-1% passes the gate | ✅ test_alpha_gate_relaxed_negative_alpha_passes |
+| 3 | Alpha=-5% still fails the gate | ✅ test_alpha_gate_very_negative_fails |
+| 4 | All existing tests pass | ✅ 744 passed |
+| 5 | `--reoptimize` shows >2 groups with weights | ❌ NOT MET — 2/6 groups（与 baseline 相同） |
+| 6 | SPX groups no longer all empty | ❌ NOT MET — 3/3 SPX 组仍空仓（alpha 范围 -3.61% ~ -15.35%） |
+
+**注**: 虽然成功标准 5/6 未完全满足，但 -2% gate 确实解锁了 2 个策略（momentum_roc alpha=-1.84%, bollinger_band alpha=-1.24%），这些在旧 alpha>0 gate 下会被拒绝。未满足的原因是 spec 对 SPX 组 alpha 的假设（-1% ~ 0%）与实际数据（-3.61% ~ -15.35%）不符。
+
+### Experience Learned
+
+- **spec 假设 vs 实际 alpha 差距**：spec §1 假设"SPX 成分股 vs SPY 存在结构性近零 alpha（-1% ~ 0%）"，但实际 SPX 组的 alpha 范围为 -3.61% ~ -15.35%。NDX 组的 alpha 更接近 spec 假设（-1.84% ~ -2.48%）。这说明 spec 的根因分析是基于直觉而非数据，实际运行后需要修正。阈值放宽是正确方向，但 -2% 对 SPX 组不够
+- **-2% gate 确实有效**：虽然 SPX 组未解锁，但 NDX 组有 2 个策略被解锁（momentum_roc alpha=-1.84%, bollinger_band alpha=-1.24%），这些在旧 alpha>0 gate 下会被拒绝。gate 逻辑本身是正确的
+- **in-sample vs OOS 阈值分层设计**：Iter #16 的 -2% in-sample gate 与 Iter #13 的 -5% OOS floor 形成 3% 缓冲带。这种分层设计允许 in-sample 稍宽松（让候选进入 OOS 验证），OOS 仍严格把关（avg alpha > 0）
+- **NDX_mid_vol 差 0.48% 未解锁**：NDX_mid_vol 最佳策略 rsi_mean_revert alpha=-2.48%，差 -2% 阈值仅 0.48%。若阈值放宽至 -3%，NDX_mid_vol 将解锁，总组数升至 3/6。但进一步放宽需评估是否与 WF -5% floor 过度接近
+- **并发 reoptimize 进程冲突**：发现一个 4h47m 前启动的旧 reoptimize 进程（pre-Iter-16 代码）仍在运行，与我新启动的 reoptimize 竞争 CPU/IO 并可能覆盖 weights 文件。教训：启动 reoptimize 前应检查是否有残留进程
+- **测试用 mock 控制精确 alpha 值**：随机收益序列的方差会导致 alpha 计算结果波动，使边界测试（如 alpha=-2.0%）不稳定。用 `patch _compute_alpha return_value=mock_alpha` 可以精确控制 alpha 值，使测试聚焦于 gate 逻辑而非 alpha 计算
+
+### 后续建议
+
+1. **考虑将 ALPHA_GATE_THRESHOLD 进一步降至 -3% 或 -5%**：
+   - -3% 会解锁 NDX_mid_vol（最佳 alpha -2.48%），总组数升至 3/6
+   - -5%（与 WF floor 一致）可能解锁部分 SPX 组（SPX_high_vol 最佳 alpha -3.61%）
+   - 风险：进一步放宽会削弱 in-sample vs OOS 的分层设计，更多低质量候选进入 OOS 验证
+2. **策略 pool 在 SPX 上的 alpha 改进**：当前 9 策略在 SPX 组上 alpha 均 < -3.61%，说明策略逻辑不适配 SPX 成分股的低波动率特征。可考虑增加 SPX-specific 策略（如低波动率均值回归 + 质量因子过滤）
+3. **SPX 组使用组内 benchmark**：SPX 成分股 vs SPY 存在结构性 alpha 偏差。可考虑对 SPX 组使用 SPXEW（equal-weight S&P 500）或 VOO（Vanguard S&P 500 ETF）作为 benchmark，而非 SPY
+4. **ensemble weights 与 gate 一致性**：当前 `_optimize_ensemble_weights` 仍用 `max(a, 0.0)`，多策略 ensemble 中负 alpha（但 > -2%）权重为 0。NDX_low_vol 的 bollinger_band（alpha=-1.24%）就是此例——通过 gate 但 ensemble weight=0。若未来希望让小幅负 alpha 策略也贡献权重，可改为 `max(a - ALPHA_GATE_THRESHOLD, 0.0)`
+5. **reoptimize 性能优化**：9 策略 × 284 参数组合 × 6 组 × 5 年，总耗时 ~65 分钟。可考虑按组并行化（每组独立进程）或缓存策略信号矩阵
+
+### L7 流水线状态
+
+```
+✅ Backtest (≥5年, alpha-based selection, batch-optimized, sanity-gated, alpha-gate-relaxed)
+✅ Walk-Forward (4轮, alpha gate, OOS -5% floor + avg>0)
+✅ Portfolio Backtest | ✅ Paper Trading Integrity
+✅ Harness Reliability | ✅ SignalRanker Sortino Priority
+✅ Strategy Diversity (9 策略 pool, 迭代 #14-15 扩展)
+✅ Alpha-Based Selection (迭代 #9)
+✅ Batch Backtest Optimization (迭代 #10)
+✅ Sanity Gate / Reject Degenerate (迭代 #11)
+✅ Alpha Gate (迭代 #12 引入, 迭代 #16 放宽至 -2%)
+✅ WF Gate Alpha Validation (迭代 #13)
+✅ Iter #16 reoptimize 完成 (2/6 组有权重, -2% gate 解锁 2 策略)
+⬜ Paper Trade ≥1月 | ⬜ Live
+```
+
+---
+
 > **Orchestrator 验证记录** (自动追加)
 > - 迭代状态: passed
 > - 测试: 707 passed, 0 failed
@@ -1515,6 +1652,16 @@ Full pytest (excluding live): 707 passed, 0 failed, 103 warnings in 23.56s
 > - 违规: 0 条
 > - 高风险文件: 0 个
 > - 测试数变化: 675 → 707
+> - CodeBuddy 自行更新了 trajectory ✅
+
+---
+
+> **Orchestrator 验证记录** (自动追加)
+> - 迭代状态: passed
+> - 测试: 0 passed, 0 failed
+> - 违规: 0 条
+> - 高风险文件: 0 个
+> - 测试数变化: 737 → 744
 > - CodeBuddy 自行更新了 trajectory ✅
 
 ---

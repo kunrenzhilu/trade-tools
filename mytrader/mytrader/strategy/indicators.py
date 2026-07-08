@@ -11,6 +11,7 @@ pandas-ta 列名约定（供内部参考）：
     MACD hist → MACDh_{fast}_{slow}_{signal}
     MACD sig  → MACDs_{fast}_{slow}_{signal}
     ATR       → ATRr_{length}
+    ADX       → ADX_{length}
 
 所有函数：
     - 输入 pd.Series（close）或 pd.DataFrame（OHLCV）
@@ -103,6 +104,46 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
         df: 含 high, low, close 列的 DataFrame
     """
     return ta.atr(df["high"], df["low"], df["close"], length=period)
+
+
+def adx(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    period: int = 14,
+) -> pd.Series:
+    """Average Directional Index (ADX) — 趋势强度指标。
+
+    ADX 不指示趋势方向，只量化趋势强度：
+        - ADX > 25: 强趋势（适合趋势跟随策略）
+        - ADX < 20: 弱/震荡市（适合均值回归策略）
+
+    计算步骤（由 pandas-ta 内部完成）：
+        1. True Range (TR) = max(high-low, |high-prev_close|, |low-prev_close|)
+        2. +DM = high - prev_high (if positive and > -DM, else 0)
+        3. -DM = prev_low - low (if positive and > +DM, else 0)
+        4. +DI = 100 * EMA(+DM, period) / ATR(period)
+        5. -DI = 100 * EMA(-DM, period) / ATR(period)
+        6. DX = 100 * |+DI - -DI| / (+DI + -DI)
+        7. ADX = EMA(DX, period)
+
+    Args:
+        high:   最高价 Series
+        low:    最低价 Series
+        close:  收盘价 Series
+        period: 计算周期（默认 14）
+
+    Returns:
+        ADX Series (0-100)，数据不足时（len < period*2）返回全 NaN Series
+    """
+    adx_df = ta.adx(high=high, low=low, close=close, length=period)
+    if adx_df is None:
+        # pandas-ta 在数据不足（len < period*2）时返回 None
+        return pd.Series(
+            float("nan"), index=close.index, name=f"ADX_{period}", dtype="float64"
+        )
+    col = f"ADX_{period}"
+    return adx_df[col]
 
 
 def crossed_above(series_a: pd.Series, series_b: pd.Series) -> pd.Series:

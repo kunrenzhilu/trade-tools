@@ -85,6 +85,8 @@ class TestStrategyRegistry:
             "bollinger_band", "macd_cross",
             # 迭代 #14 新增
             "rsi_bb_convergence", "macd_volume",
+            # 迭代 #15 新增
+            "adx_trend", "momentum_roc",
         }
         assert expected.issubset(set(STRATEGY_REGISTRY.keys()))
 
@@ -106,6 +108,41 @@ class TestStrategyRegistry:
         assert "exit_neutral" in REOPTIMIZE_PARAM_GRIDS["rsi_trend_filter"], (
             "rsi_trend_filter 参数网格缺少 exit_neutral 维度"
         )
+
+    def test_iter15_strategies_in_reoptimize_constants(self):
+        """迭代 #15：REOPTIMIZE_STRATEGIES 包含 adx_trend + momentum_roc + 参数网格。"""
+        from main import REOPTIMIZE_STRATEGIES, REOPTIMIZE_PARAM_GRIDS
+        # 策略池应为 9 个策略
+        assert len(REOPTIMIZE_STRATEGIES) == 9, (
+            f"REOPTIMIZE_STRATEGIES 应有 9 个策略，实际 {len(REOPTIMIZE_STRATEGIES)}: {REOPTIMIZE_STRATEGIES}"
+        )
+        for name in ("adx_trend", "momentum_roc"):
+            assert name in REOPTIMIZE_STRATEGIES, (
+                f"'{name}' 未在 REOPTIMIZE_STRATEGIES 中"
+            )
+            assert name in REOPTIMIZE_PARAM_GRIDS, (
+                f"'{name}' 未在 REOPTIMIZE_PARAM_GRIDS 中"
+            )
+        # adx_trend 网格应含 adx_threshold 维度
+        assert "adx_threshold" in REOPTIMIZE_PARAM_GRIDS["adx_trend"], (
+            "adx_trend 参数网格缺少 adx_threshold 维度"
+        )
+        # momentum_roc 网格应含 buy_threshold / sell_threshold 维度
+        assert "buy_threshold" in REOPTIMIZE_PARAM_GRIDS["momentum_roc"], (
+            "momentum_roc 参数网格缺少 buy_threshold 维度"
+        )
+        assert "sell_threshold" in REOPTIMIZE_PARAM_GRIDS["momentum_roc"], (
+            "momentum_roc 参数网格缺少 sell_threshold 维度"
+        )
+        # 组合数验证：adx_trend 2*2*2*2=16，momentum_roc 2*2*2=8
+        adx_combos = 1
+        for v in REOPTIMIZE_PARAM_GRIDS["adx_trend"].values():
+            adx_combos *= len(v)
+        assert adx_combos == 16, f"adx_trend 应有 16 个组合，实际 {adx_combos}"
+        roc_combos = 1
+        for v in REOPTIMIZE_PARAM_GRIDS["momentum_roc"].values():
+            roc_combos *= len(v)
+        assert roc_combos == 8, f"momentum_roc 应有 8 个组合，实际 {roc_combos}"
 
 
 # ---------------------------------------------------------------------------
@@ -791,4 +828,328 @@ class TestRegistryEdgeCases:
         signal = fn(close)
         assert signal.dtype == int, (
             f"{strategy_name}: expected int dtype, got {signal.dtype}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# ADX 指标测试（迭代 #15）
+# ---------------------------------------------------------------------------
+
+class TestADXIndicator:
+    """ADX (Average Directional Index) 指标测试。"""
+
+    @staticmethod
+    def _make_ohlcv(close: pd.Series) -> pd.DataFrame:
+        """从 close 构造简单 OHLCV（high/low 在 close 附近）。"""
+        return pd.DataFrame({
+            "open":  close - 0.5,
+            "high":  close + 1.0,
+            "low":   close - 1.0,
+            "close": close,
+        }, index=close.index)
+
+    def test_adx_basic(self):
+        """ADX 返回同长度 Series，值在 [0, 100] 范围内。"""
+        from mytrader.strategy.indicators import adx
+        close = make_trending_close(100)
+        df = self._make_ohlcv(close)
+        result = adx(df["high"], df["low"], close, period=14)
+        assert len(result) == len(close)
+        valid = result.dropna()
+        assert (valid >= 0).all() and (valid <= 100).all(), (
+            f"ADX 值应全部在 [0, 100]，实际范围 [{valid.min()}, {valid.max()}]"
+        )
+
+    def test_adx_trending_vs_ranging(self):
+        """趋势行情 ADX > 25，震荡行情 ADX < 25。"""
+        from mytrader.strategy.indicators import adx
+        n = 200
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+
+        # 强趋势行情：指数级上升
+        close_trend = pd.Series(
+            100.0 * np.exp(np.cumsum(np.full(n, 0.005))), index=idx, name="close"
+        )
+        df_trend = self._make_ohlcv(close_trend)
+        adx_trend = adx(df_trend["high"], df_trend["low"], close_trend, period=14)
+        # 趋势行情 ADX 均值应 > 25
+        assert adx_trend.dropna().mean() > 25, (
+            f"趋势行情 ADX 均值应 > 25，实际 {adx_trend.dropna().mean():.2f}"
+        )
+
+        # 纯震荡行情：小幅噪声，无方向
+        rng = np.random.default_rng(42)
+        close_range = pd.Series(
+            100.0 + 0.1 * rng.standard_normal(n), index=idx, name="close"
+        )
+        df_range = self._make_ohlcv(close_range)
+        # 震荡市 high/low 间距很小（放大 ADX 的低值特征）
+        df_range["high"] = close_range + 0.05
+        df_range["low"] = close_range - 0.05
+        adx_range = adx(df_range["high"], df_range["low"], close_range, period=14)
+        # 震荡行情 ADX 均值应 < 25
+        assert adx_range.dropna().mean() < 25, (
+            f"震荡行情 ADX 均值应 < 25，实际 {adx_range.dropna().mean():.2f}"
+        )
+
+    def test_adx_custom_period(self):
+        """不同 period 参数正常工作。"""
+        from mytrader.strategy.indicators import adx
+        close = make_trending_close(150)
+        df = self._make_ohlcv(close)
+        adx_14 = adx(df["high"], df["low"], close, period=14)
+        adx_21 = adx(df["high"], df["low"], close, period=21)
+        assert len(adx_14) == len(close)
+        assert len(adx_21) == len(close)
+        # 不同 period 应产生不同的有效值序列
+        valid_14 = adx_14.dropna()
+        valid_21 = adx_21.dropna()
+        # 两者在共同区间上的值不应完全相同
+        common = valid_14.index.intersection(valid_21.index)
+        assert not valid_14.loc[common].equals(valid_21.loc[common]), (
+            "不同 period 应产生不同 ADX 序列"
+        )
+
+    def test_adx_insufficient_data(self):
+        """数据量 < period*2 时不崩溃，返回全 NaN Series。"""
+        from mytrader.strategy.indicators import adx
+        n = 10  # period=14 但数据仅 10 行
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        close = pd.Series(np.linspace(100, 110, n), index=idx, name="close")
+        df = self._make_ohlcv(close)
+        result = adx(df["high"], df["low"], close, period=14)
+        # 数据不足 → 全 NaN
+        assert len(result) == n
+        assert result.isna().all(), (
+            f"数据不足时应返回全 NaN，实际 {result.tolist()}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# ADX Trend 策略测试（迭代 #15）
+# ---------------------------------------------------------------------------
+
+class TestADXTrend:
+    """ADX + EMA 交叉策略测试。"""
+
+    @staticmethod
+    def _make_ohlcv(close: pd.Series, spread: float = 1.0) -> pd.DataFrame:
+        """从 close 构造 OHLCV。"""
+        return pd.DataFrame({
+            "open":  close - spread * 0.5,
+            "high":  close + spread,
+            "low":   close - spread,
+            "close": close,
+        }, index=close.index)
+
+    def test_adx_trend_buy_signal(self):
+        """EMA 金叉 + ADX > threshold → BUY 信号存在。"""
+        from mytrader.strategy.strategies.adx_trend import adx_trend_signal
+        n = 200
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        # 先跌后强涨：触发 EMA 金叉 + ADX 上升
+        prices = np.concatenate([
+            np.linspace(120, 80, 60),   # 下跌
+            np.linspace(80, 150, 140),  # 强上涨
+        ])
+        close = pd.Series(prices, index=idx, name="close")
+        df = self._make_ohlcv(close)
+        signal = adx_trend_signal(close, fast=10, slow=30, df=df, adx_threshold=20.0)
+        assert 1 in signal.values, (
+            f"EMA 金叉 + ADX > threshold 应产生 BUY 信号，实际信号集: {set(signal.values)}"
+        )
+
+    def test_adx_trend_no_buy_without_adx(self):
+        """EMA 金叉但 ADX < threshold → 无 BUY 信号。
+
+        构造：极小波动 + EMA 金叉（震荡市 ADX 低）。使用 adx_threshold=99
+        确保 ADX 始终低于阈值。
+        """
+        from mytrader.strategy.strategies.adx_trend import adx_trend_signal
+        n = 200
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        # 小幅震荡 + 一个明显的金叉点
+        rng = np.random.default_rng(0)
+        prices = 100.0 + np.cumsum(rng.normal(0, 0.05, n))
+        close = pd.Series(prices, index=idx, name="close")
+        df = self._make_ohlcv(close, spread=0.05)  # 极小 high/low 间距 → 低 ADX
+        # adx_threshold=99 → ADX 永远不达标 → 无 BUY
+        signal = adx_trend_signal(close, fast=5, slow=30, df=df, adx_threshold=99.0)
+        assert 1 not in signal.values, (
+            f"ADX 不足时不应有 BUY 信号，实际信号集: {set(signal.values)}"
+        )
+
+    def test_adx_trend_sell_cross(self):
+        """EMA 死叉 → SELL 信号。"""
+        from mytrader.strategy.strategies.adx_trend import adx_trend_signal
+        n = 200
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        # 先涨后跌：触发 EMA 死叉
+        prices = np.concatenate([
+            np.linspace(80, 140, 80),   # 上涨
+            np.linspace(140, 70, 120),  # 下跌
+        ])
+        close = pd.Series(prices, index=idx, name="close")
+        df = self._make_ohlcv(close)
+        # exit_threshold=0 → ADX 出场不触发，只测死叉
+        signal = adx_trend_signal(close, fast=10, slow=30, df=df, exit_threshold=0.0)
+        assert -1 in signal.values, (
+            f"EMA 死叉应产生 SELL 信号，实际信号集: {set(signal.values)}"
+        )
+
+    def test_adx_trend_sell_adx_weak(self):
+        """ADX < exit_threshold → SELL（趋势衰退出场）。
+
+        构造：100 bar 噪声上升趋势（ADX ~65）+ 100 bar 极窄震荡（ADX 跌至 ~22）。
+        exit_threshold=25 → 震荡段 ADX < 25 触发 sell_adx 出场。
+        验证震荡段（后 100 bar）出现 SELL 信号。
+        """
+        from mytrader.strategy.strategies.adx_trend import adx_trend_signal
+        rng = np.random.default_rng(42)
+        n = 200
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        # 噪声上升趋势 + 极窄震荡
+        steps = np.concatenate([
+            rng.normal(0.3, 0.5, 100),   # 上升段
+            rng.normal(0.0, 0.05, 100),  # 震荡段
+        ])
+        close = pd.Series(100.0 + np.cumsum(steps), index=idx, name="close")
+        df = self._make_ohlcv(close, spread=1.0)
+        # 震荡段 high/low 间距极小 → ADX 衰退
+        df.loc[df.index[100:], "high"] = close.iloc[100:] + 0.02
+        df.loc[df.index[100:], "low"] = close.iloc[100:] - 0.02
+        # exit_threshold=25 → 震荡段 ADX < 25 触发 sell_adx
+        signal = adx_trend_signal(close, fast=10, slow=30, df=df, exit_threshold=25.0)
+        # 震荡段（后 100 bar）应出现 SELL 信号
+        flat_section = signal.iloc[100:]
+        assert -1 in flat_section.values, (
+            f"ADX 衰退段应产生 SELL 信号，震荡段信号集: {set(flat_section.values)}"
+        )
+
+    def test_adx_trend_no_df_graceful(self):
+        """df=None → 退化为纯 EMA 交叉策略（不崩溃）。"""
+        from mytrader.strategy.strategies.adx_trend import adx_trend_signal
+        close = make_trending_close(100)
+        signal = adx_trend_signal(close, df=None)
+        assert set(signal.unique()).issubset({-1, 0, 1})
+
+    def test_adx_trend_signal_range(self):
+        """信号值仅在 {-1, 0, 1} 范围内。"""
+        from mytrader.strategy.strategies.adx_trend import adx_trend_signal
+        close = make_trending_close(150)
+        df = self._make_ohlcv(close)
+        signal = adx_trend_signal(close, df=df)
+        assert set(signal.unique()).issubset({-1, 0, 1})
+
+    def test_adx_trend_no_lookahead(self):
+        """shift(1) 防前视偏差：最后 bar 信号不因最后 bar 价格变化而改变。"""
+        from mytrader.strategy.strategies.adx_trend import adx_trend_signal
+        close_normal = make_trending_close(150)
+        df_normal = self._make_ohlcv(close_normal)
+        close_modified = close_normal.copy()
+        close_modified.iloc[-1] = close_modified.iloc[-1] * 2.0
+        df_modified = self._make_ohlcv(close_modified)
+        signal_normal = adx_trend_signal(close_normal, df=df_normal)
+        signal_modified = adx_trend_signal(close_modified, df=df_modified)
+        assert signal_normal.iloc[-1] == signal_modified.iloc[-1], (
+            "adx_trend 有前视偏差：最后 bar 价格变化导致最后 bar 信号变化"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Momentum RoC 策略测试（迭代 #15）
+# ---------------------------------------------------------------------------
+
+class TestMomentumRoC:
+    """Rate of Change 动量策略测试。"""
+
+    def test_momentum_roc_buy_signal(self):
+        """RoC > buy_threshold + close > SMA → BUY 信号存在。"""
+        from mytrader.strategy.strategies.momentum_roc import momentum_roc_signal
+        n = 300
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        # 前 200 bar 平稳 + 后 100 bar 强上涨（RoC > 5 + close > SMA200）
+        prices = np.concatenate([
+            np.full(200, 100.0),
+            np.linspace(100, 160, 100),  # +60% → RoC 远超 5%
+        ])
+        close = pd.Series(prices, index=idx, name="close")
+        signal = momentum_roc_signal(close, roc_period=20, buy_threshold=5.0,
+                                     trend_period=200)
+        assert 1 in signal.values, (
+            f"强动量 + 上升趋势应产生 BUY 信号，实际信号集: {set(signal.values)}"
+        )
+
+    def test_momentum_roc_sell_roc(self):
+        """RoC < sell_threshold → SELL 信号（动量反转）。"""
+        from mytrader.strategy.strategies.momentum_roc import momentum_roc_signal
+        n = 300
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        # 前 200 bar 平稳 + 后 100 bar 强下跌（RoC < -3 + close < SMA200）
+        prices = np.concatenate([
+            np.full(200, 100.0),
+            np.linspace(100, 50, 100),  # -50% → RoC 远低于 -3%
+        ])
+        close = pd.Series(prices, index=idx, name="close")
+        signal = momentum_roc_signal(close, roc_period=20, sell_threshold=-3.0,
+                                     trend_period=200)
+        assert -1 in signal.values, (
+            f"动量反转应产生 SELL 信号，实际信号集: {set(signal.values)}"
+        )
+
+    def test_momentum_roc_sell_trend(self):
+        """close < SMA → SELL 信号（趋势破位）。
+
+        构造：先平稳（SMA 建立），再下跌破 SMA。即使 RoC 未到 sell_threshold，
+        close < SMA 也应触发 SELL。使用 sell_threshold=-99 确保只有趋势破位触发。
+        """
+        from mytrader.strategy.strategies.momentum_roc import momentum_roc_signal
+        n = 300
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        # 前 200 bar 平稳 + 后 100 bar 缓慢下跌（close < SMA 但 RoC 可能未到 -3）
+        prices = np.concatenate([
+            np.full(200, 100.0),
+            np.linspace(100, 92, 100),  # -8% → RoC ≈ -8%（可能触发 sell_roc）
+        ])
+        close = pd.Series(prices, index=idx, name="close")
+        # sell_threshold=-99 → 仅趋势破位触发 SELL
+        signal = momentum_roc_signal(close, roc_period=20, sell_threshold=-99.0,
+                                     trend_period=200)
+        assert -1 in signal.values, (
+            f"趋势破位应产生 SELL 信号，实际信号集: {set(signal.values)}"
+        )
+
+    def test_momentum_roc_no_signal_weak(self):
+        """RoC 介于阈值之间 → 无信号（HOLD）。
+
+        构造：平稳价格（RoC ≈ 0），close ≈ SMA。buy=5, sell=-3 → 无触发。
+        """
+        from mytrader.strategy.strategies.momentum_roc import momentum_roc_signal
+        n = 250
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        # 完全平稳（RoC = 0，close = SMA）
+        close = pd.Series(np.full(n, 100.0), index=idx, name="close")
+        signal = momentum_roc_signal(close, roc_period=20, buy_threshold=5.0,
+                                     sell_threshold=-3.0, trend_period=200)
+        assert (signal == 0).all(), (
+            f"平稳行情应全 HOLD，实际信号集: {set(signal.values)}"
+        )
+
+    def test_momentum_roc_signal_range(self):
+        """信号值仅在 {-1, 0, 1} 范围内。"""
+        from mytrader.strategy.strategies.momentum_roc import momentum_roc_signal
+        close = make_trending_close(300)
+        signal = momentum_roc_signal(close, trend_period=100)
+        assert set(signal.unique()).issubset({-1, 0, 1})
+
+    def test_momentum_roc_no_lookahead(self):
+        """shift(1) 防前视偏差：最后 bar 信号不因最后 bar 价格变化而改变。"""
+        from mytrader.strategy.strategies.momentum_roc import momentum_roc_signal
+        close_normal = make_trending_close(300)
+        close_modified = close_normal.copy()
+        close_modified.iloc[-1] = close_modified.iloc[-1] * 2.0
+        signal_normal = momentum_roc_signal(close_normal, trend_period=100)
+        signal_modified = momentum_roc_signal(close_modified, trend_period=100)
+        assert signal_normal.iloc[-1] == signal_modified.iloc[-1], (
+            "momentum_roc 有前视偏差：最后 bar 价格变化导致最后 bar 信号变化"
         )

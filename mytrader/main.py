@@ -41,6 +41,9 @@ REOPTIMIZE_STRATEGIES: list[str] = [
     # 迭代 #14：新增多因子策略
     "rsi_bb_convergence",
     "macd_volume",
+    # 迭代 #15：新增 ADX 趋势 + RoC 动量策略
+    "adx_trend",
+    "momentum_roc",
 ]
 
 REOPTIMIZE_PARAM_GRIDS: dict[str, dict[str, list]] = {
@@ -67,6 +70,14 @@ REOPTIMIZE_PARAM_GRIDS: dict[str, dict[str, list]] = {
     # 迭代 #14：MACD+成交量确认 → 3×2×2=12 个组合。
     # volume_period 固定 20（不纳入搜索）。
     "macd_volume": {"fast": [8, 12, 16], "slow": [21, 26], "signal_period": [7, 9]},
+    # 迭代 #15：ADX+EMA 交叉 → 2×2×2×2=16 个组合。
+    # exit_threshold 固定 20（不纳入搜索，与 adx_threshold 下界一致）。
+    "adx_trend": {"fast": [10, 20], "slow": [30, 50],
+                  "adx_period": [14, 21], "adx_threshold": [20, 25]},
+    # 迭代 #15：RoC 动量 → 2×2×2=8 个组合。
+    # trend_period 固定 200（不纳入搜索，保持与其他趋势策略一致）。
+    "momentum_roc": {"roc_period": [10, 20], "buy_threshold": [3, 5],
+                     "sell_threshold": [-5, -3]},
 }
 
 

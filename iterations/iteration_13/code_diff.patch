@@ -1,0 +1,18 @@
+diff --git a/alignment/iteration_trajectory.md b/alignment/iteration_trajectory.md
+index 826b202..669700f 100644
+--- a/alignment/iteration_trajectory.md
++++ b/alignment/iteration_trajectory.md
+@@ -1369,3 +1369,13 @@ Iter #12 的 alpha>0 门槛修复了 in-sample 选择器，但 WF gate 仍然只
+ - 运行 `--reoptimize` 验证 WF 是否能正确拒绝 alpha<0 的策略组合（Meta-Agent 验收阶段独立执行）
+ 
+ ---
++
++> **Orchestrator 验证记录** (自动追加)
++> - 迭代状态: failed
++> - 测试: 0 passed, 0 failed
++> - 违规: 0 条
++> - 高风险文件: 0 个
++> - 测试数变化: 659 → 675
++> - CodeBuddy 自行更新了 trajectory ✅
++
++---

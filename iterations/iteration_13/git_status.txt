@@ -1,0 +1,4 @@
+ M alignment/iteration_trajectory.md
+?? iterations/iteration_13/code_diff.patch
+?? iterations/iteration_13/full_response.md
+?? iterations/iteration_13/result.json

@@ -65,6 +65,17 @@ MIN_SORTINO_THRESHOLD: float = 0.5
 # 合理候选；阈值与 WALK_FORWARD_VAL_ALPHA_FLOOR=-5% 形成 3% 缓冲带。
 ALPHA_GATE_THRESHOLD: float = -2.0
 
+# 迭代 #17 新增：Sortino 豁免门槛（in-sample），允许高 Sortino 策略绕过 alpha gate。
+# 设计动机：Iter #16 reoptimize 实证 SPX 组 alpha 范围 -3.61% ~ -15.35%（远低于
+# -2% gate），3/3 SPX 组空仓。但其中部分策略 Sortino 极佳（> 1.5），下行风险
+# 控制优秀，只因"vs SPY 的相对收益"不合格被拒。Constitution L1 首要 KPI 是
+# Sortino（而非 alpha），alpha 是 Iter #9 引入的二级排序指标。本豁免让"Sortino
+# 优秀但 alpha 跑输 SPY"的策略进入 Tier 1/2/3 过滤，不再被 alpha gate 一刀切。
+# 取 1.5 的理由：高于 MIN_SORTINO_THRESHOLD=0.5（Tier 1 合规线）和 1.0（普通优秀），
+# 是"卓越 Sortino"门槛；避免豁免过宽（若设为 0.5 则等于 Tier 1 的 Sortino 门槛，
+# 豁免失去意义）。WF OOS 校验仍用 -5% 单轮下限 + avg>0，本豁免不削弱 OOS 验证。
+SORTINO_ALPHA_EXEMPTION: float = 1.5
+
 # 迭代 #11 新增：健全性门槛 —— 识别"退化策略"（几乎不平仓的伪 buy-and-hold）
 # 判定：组内"有效标的中，已平仓交易数为 0 的比例"超过此阈值 → 退化
 # 设计动机：真策略应在多数标的上完成买卖闭环；若近乎所有标的都从不平仓，
@@ -1340,30 +1351,45 @@ class MatrixBacktest:
         #   同时保留"小幅跑输 SPY 但 Sortino/DD 优秀"的候选。
         #   Walk-Forward（Iter #13）仍用 -5% 单轮下限 + avg>0 汇总门槛作 OOS 校验，
         #   放宽 in-sample gate 不削弱 OOS 验证强度。
+        # 迭代 #17：Sortino 豁免 —— 高 Sortino (> SORTINO_ALPHA_EXEMPTION=1.5)
+        #   的策略绕过 alpha gate。动机：Iter #16 reoptimize 实证 SPX 组 alpha
+        #   范围 -3.61% ~ -15.35%，-2% gate 仍不解锁 SPX 组；但部分策略 Sortino
+        #   极佳（下行风险控制优秀），只因"vs SPY 相对收益"不合格被拒。Constitution
+        #   L1 首要 KPI 是 Sortino（而非 alpha），本豁免让"Sortino 卓越但 alpha 跑输
+        #   SPY"的策略进入 Tier 1/2/3，不再被 alpha gate 一刀切。WF OOS 校验仍用
+        #   -5% 单轮下限 + avg>0，本豁免不削弱 OOS 验证强度。
         # 顺序：健全性（Iter #11）→ 风险（DD，Tier 1/2/3）→ alpha 门槛（本步）→ 排序
         #
-        # 注意：这一步在 candidates 构建后、Tier 1 前，确保 Tier 1/2/3 只在合格 alpha 候选中进行。
-        # 如果某组所有候选 alpha ≤ ALPHA_GATE_THRESHOLD，该组空仓（hold cash），
-        # 不强行选严重跑输 SPY 的策略
+        # 注意：这一步在 candidates 构建后、Tier 1 前，确保 Tier 1/2/3 只在合格候选中进行。
+        # 合格定义：alpha > ALPHA_GATE_THRESHOLD  OR  sortino > SORTINO_ALPHA_EXEMPTION
+        # （二者满足其一即进入 Tier 1/2/3）
+        # 如果某组所有候选都不满足（alpha ≤ threshold 且 sortino ≤ exemption），
+        # 该组空仓（hold cash），不强行选严重跑输 SPY 且 Sortino 平庸的策略
         # （experience.md #8："没有候选满足门槛时，正确动作是空仓/降现金/回退 benchmark，
         #   不是矬子里拔将军"）。
         alpha_qualified_candidates = [
-            c for c in candidates if c[5] > ALPHA_GATE_THRESHOLD
+            c for c in candidates
+            if c[5] > ALPHA_GATE_THRESHOLD or c[3] > SORTINO_ALPHA_EXEMPTION
         ]
 
         if not alpha_qualified_candidates:
-            # 全组 alpha ≤ threshold → 空权重（持仓现金），标记 no_positive_alpha
-            # 字段名保留 no_positive_alpha（向下兼容下游消费方），语义为"无合格 alpha 候选"
-            alpha_strs = [f"{c[0]}({c[5]:.2f}%)" for c in candidates]
+            # 全组候选 alpha ≤ threshold 且 sortino ≤ exemption → 空权重（持仓现金），
+            # 标记 no_positive_alpha
+            # 字段名保留 no_positive_alpha（向下兼容下游消费方），语义为"无合格 alpha/Sortino 候选"
+            alpha_strs = [
+                f"{c[0]}(alpha={c[5]:.2f}%, sortino={c[3]:.4f})" for c in candidates
+            ]
             logger.warning(
                 f"[MatrixBacktest] {group_id}: ALL {len(candidates)} candidates have "
-                f"alpha <= {ALPHA_GATE_THRESHOLD}% (cannot beat SPY within tolerance) — "
+                f"alpha <= {ALPHA_GATE_THRESHOLD}% AND sortino <= {SORTINO_ALPHA_EXEMPTION} "
+                f"(cannot beat SPY within tolerance, no Sortino exemption) — "
                 f"{alpha_strs}. "
                 f"Group produces EMPTY weights (hold cash). Marked no_positive_alpha."
             )
             report.warnings.append(
                 f"{group_id}: no_positive_alpha "
-                f"(all {len(candidates)} candidates alpha <= {ALPHA_GATE_THRESHOLD}%)"
+                f"(all {len(candidates)} candidates alpha <= {ALPHA_GATE_THRESHOLD}% "
+                f"AND sortino <= {SORTINO_ALPHA_EXEMPTION})"
             )
             # 标记已 append 的 GroupBacktestResult 条目（供审计追溯）
             for gr in report.group_results:

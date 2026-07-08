@@ -1,0 +1,33 @@
+{
+  "iteration": 17,
+  "iteration_id": "426931d5",
+  "timestamp_utc": "2026-07-08T10:12:10.611156+00:00",
+  "status": "passed",
+  "tests": {
+    "count_before": 744,
+    "count_after": 751,
+    "passed": 0,
+    "failed": 0,
+    "errors": 0,
+    "warnings": 11,
+    "exit_code": 0,
+    "summary": "tests/test_risk_manager.py: 11 warnings",
+    "has_test_failures": false
+  },
+  "snapshot": {
+    "changed_files_count": 6,
+    "includes_untracked": false,
+    "untracked_count": 0,
+    "git_status_file": "git_status.txt",
+    "untracked_files_file": null,
+    "untracked_diff_file": null
+  },
+  "compliance": {
+    "violations": [],
+    "high_risk_files_touched": [],
+    "buffer_overflow_count": 0
+  },
+  "trajectory_updated_by_codebuddy": false,
+  "decision_log_updated_by_codebuddy": false,
+  "error": null
+}

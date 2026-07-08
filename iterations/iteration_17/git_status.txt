@@ -1,0 +1,7 @@
+ M .codebuddy/notes/experience.md
+ M alignment/decision_log.md
+ M alignment/iteration_trajectory.md
+ M mytrader/designs/design_v2/07-backtest-module.md
+ M mytrader/mytrader/backtest/matrix_backtest.py
+ M mytrader/tests/test_alpha_gate.py
+?? iterations/iteration_17/

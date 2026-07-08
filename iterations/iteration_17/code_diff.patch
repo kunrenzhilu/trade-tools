@@ -1,0 +1,819 @@
+diff --git a/.codebuddy/notes/experience.md b/.codebuddy/notes/experience.md
+index 656bf5e..a5afe29 100644
+--- a/.codebuddy/notes/experience.md
++++ b/.codebuddy/notes/experience.md
+@@ -72,6 +72,16 @@
+ - 验收 gate（无论 WF 还是 paper 准入）必须校验**跑赢 benchmark（正 alpha）**，DD/Sortino 达标 ≠ 有正 alpha
+ - 归一化权重时，负分不能用 `max(x, ε)` 掩盖——那会把"都不好"变成"等权都要"
+ 
++## 9. spec 的根因假设需要用数据验证，不能照单全收
++
++**背景**：Iter #16 spec 假设"SPX 成分股 vs SPY 存在结构性近零 alpha（-1% ~ 0%）"，理由是"SPY 即 S&P 500 本身，交易 SPX 组件 vs SPY 相当于和自己赛跑"。基于此假设，将 alpha gate 从 alpha>0 放宽至 alpha>-2%。但实际 reoptimize 结果显示 SPX_mid_vol 的 9 策略 alpha 范围为 -4.69% ~ -13.84%，SPX_high_vol 为 -3.61% ~ -13.40%。-2% 阈值对 SPX 组完全不够。
++
++**原则**：
++- spec 的根因分析是基于直觉/经验，不一定准确。实施前应先用数据验证："当前 SPX 组的 alpha 分布到底是什么范围？"
++- 阈值选择应基于实际 alpha 分布，而非理论假设。如果 SPX 组的 alpha 中位数是 -6%，-2% 阈值就是无效的
++- 放宽阈值是"治标"，改进策略 alpha 才是"治本"。如果所有策略在 SPX 上都跑输 SPY 5-14%，问题不在 gate 阈值，而在策略逻辑不适配 SPX 成分股的低波动率特征
++- in-sample 与 OOS 阈值应分层：in-sample 宽松（让候选进入 OOS），OOS 严格（avg>0 汇总门槛）。Iter #16 的 -2% in-sample vs Iter #13 的 -5% OOS floor 设计是正确的分层，但 -2% 对 SPX 组来说仍然太严
++
+ ---
+ 
+ *持续更新。每犯一次新类型的错误，提炼一条原则。*
+diff --git a/alignment/decision_log.md b/alignment/decision_log.md
+index 9cfcd88..9a37368 100644
+--- a/alignment/decision_log.md
++++ b/alignment/decision_log.md
+@@ -488,9 +488,39 @@
+   - SPY 不可用时保守拒绝（pass_all_rounds=False）
+   - 675 测试通过
+ 
+-- **经验教训**:
++  - **经验教训**:
+   - **spec 的字段顺序建议可能有 dataclass 兼容性问题**：spec 原文画了 `val_alpha` 在 `passed` 之前，但 Python dataclass 要求有默认值的字段在无默认值的之后。实现时需要判断 spec 的意图（加 alpha 字段）而非字面照搬
+   - **两层 gate 比单层更鲁棒**：单轮 floor 拦截灾难，汇总 avg 拦截系统性问题。这比"每轮都必须 > 0"更容错，避免因单轮市场噪音误杀
+   - **benchmark 缺失时保守拒绝**：比"跳过 gate"更安全。迫使系统确保 benchmark 数据可用，而不是在数据缺失时静默放行
+ 
+ ---
++
++## 决策 #16 — Iter #16: alpha gate 阈值放宽设计
++
++**日期**: 2026-07-08
++**触发**: Iter #15 reoptimize 发现 4/6 组空仓，alpha>0 门槛过于严格
++
++### 决策点
++
++**决策 1: ALPHA_GATE_THRESHOLD 取 -2.0 还是其他值？**
++- 选项 A：-1.0%（更保守，仅允许极小幅跑输）
++- 选项 B：-2.0%（spec 建议，与 WF -5% floor 形成 3% 缓冲带）
++- 选项 C：-5.0%（与 WF floor 一致，最宽松）
++- 选 B：-2.0% 平衡了"过滤灾难性跑输"和"保留合理候选"。3% 缓冲带让 in-sample gate 比 OOS gate 宽松，符合"in-sample 放宽让候选进入 OOS 验证"的分层设计。选 C 会让 in-sample 和 OOS gate 一样宽松，失去分层意义
++
++**决策 2: 是否同时更新 `_optimize_ensemble_weights`？**
++- 选项 A：同时更新，用 `max(a - ALPHA_GATE_THRESHOLD, 0.0)` 替代 `max(a, 0.0)`，让小幅负 alpha 也贡献权重
++- 选项 B：只更新 gate 阈值，ensemble weights 逻辑不变（spec 建议"fine for now"）
++- 选 B：保守设计——多策略 ensemble 中正 alpha 策略应主导权重，负 alpha（即使 > -2%）权重为 0 是合理的。单策略场景由 `len == 1` 早返回得到 weight=1.0，不受影响。若未来需要让小幅负 alpha 贡献权重，可单独迭代
++
++**决策 3: `no_positive_alpha` 字段名是否重命名？**
++- 选项 A：重命名为 `no_qualified_alpha`（语义更准确，因为现在接受小幅负 alpha）
++- 选项 B：保留 `no_positive_alpha`（向下兼容下游消费方）
++- 选 B：字段名是下游消费方（PortfolioBacktester / 风控观测）的接口契约，重命名会破坏兼容性。语义已通过注释说明清楚（"字段名保留 no_positive_alpha，语义为无合格 alpha 候选"）
++
++### 经验教训
++- **in-sample 与 OOS 阈值应分层**：in-sample gate 应比 OOS gate 宽松，让更多候选进入 OOS 验证。Iter #16 的 -2% in-sample vs Iter #13 的 -5% OOS floor + avg>0 汇总门槛，形成"宽松入选 + 严格验证"的分层设计
++- **字段名是接口契约**：即使语义变化（alpha>0 → alpha>-2%），也不应重命名已有字段，避免破坏下游兼容性。通过注释说明语义变化即可
++- **spec 假设需要实际验证**：spec §1 假设"SPX 成分股 alpha 在 -1% ~ 0%"，但实际 SPX_mid_vol 的 alpha 范围为 -4.69% ~ -13.84%。spec 的假设可能基于直觉而非数据，实际运行后需要修正
++
++---
+diff --git a/alignment/iteration_trajectory.md b/alignment/iteration_trajectory.md
+index e205d9b..877d995 100644
+--- a/alignment/iteration_trajectory.md
++++ b/alignment/iteration_trajectory.md
+@@ -1665,3 +1665,64 @@ Full pytest (excluding live): 744 passed, 0 failed, 103 warnings in 25.00s
+ > - CodeBuddy 自行更新了 trajectory ✅
+ 
+ ---
++
++## 迭代 #17 — 按 iterations/iteration_17/spec.md 进行开发。关键目标：通过 Sortino 豁免让高 Sortino 策略绕过 alpha 门槛，解锁 SPX 策略组。按 Implementation Order（§6）逐步实施：1) 读取 matrix_backtest.py::_run_group 定位 alpha gate；2) 添加 SORTINO_ALPHA_EXEMPTION = 1.5 常量；3) 修改 Tier 1 过滤：alpha > -2% OR sortino > 1.5；4) 写 ~7 个新测试（高 Sortino 豁免、低 Sortino 仍需 alpha、DD 仍强制、最低 Sortino 仍强制、边界测试）；5) 运行全部测试；6) 运行 --reoptimize；7) 验证 strategy_weights.json 至少 1 个 SPX 组非空；8) 更新 trajectory + CODEBUDDY。严格遵守 scope：不改策略/indicators/risk/execution/main.py。
++
++- **日期**: 2026-07-08 10:12 UTC
++- **类型**: 自动化迭代 (Orchestrator → CodeBuddy via ACP)
++- **变更摘要**: 按 iterations/iteration_17/spec.md 进行开发。关键目标：通过 Sortino 豁免让高 Sortino 策略绕过 alpha 门槛，解锁 SPX 策略组。按 Implementation Order（§6）逐步实施：1) 读取 matrix_backtest.py::_run_group 定位 alpha gate；2) 添加 SORTINO_ALPHA_EXEMPTION = 1.5 常量；3) 修改 Tier 1 过滤：alpha > -2% OR sortino > 1.5；4) 写 ~7 个新测试（高 Sortino 豁免、低 Sortino 仍需 alpha、DD 仍强制、最低 Sortino 仍强制、边界测试）；5) 运行全部测试；6) 运行 --reoptimize；7) 验证 strategy_weights.json 至少 1 个 SPX 组非空；8) 更新 trajectory + CODEBUDDY。严格遵守 scope：不改策略/indicators/risk/execution/main.py。
++- **执行时长**: 1769s (29.5min)
++- **状态**: passed
++- **CodeBuddy 更新数**: 4393
++- **工具调用数**: 244
++- **团队事件数**: 0
++- **权限请求数**: 0
++
++### 变更文件
++.codebuddy/notes/experience.md, alignment/decision_log.md, mytrader/designs/design_v2/07-backtest-module.md, mytrader/mytrader/backtest/matrix_backtest.py, mytrader/tests/test_alpha_gate.py, iterations/iteration_17/
++
++### 测试结果
++0 passed, 0 failed (before=744, after=751, delta=+7)
++
++### 违规详情
++- ✅ 无违规
++
++### Constitution 合规
++- DD 20% 约束: ✅
++- 测试覆盖率: ✅ 不降 (before=744, after=751)
++- 黑箱策略: ✅ 未引入
++- RL 引入: ✅ 未引入
++- 文档同步: ⚠️ CodeBuddy 未更新，orchestrator 自动补写
++
++### CodeBuddy 响应摘要（自动提取）
++1→# Iteration #8 — Trend-Filtered Mean Reversion 策略
++   2→
++   3→> 日期：2026-07-04
++   4→> 类型：策略新增
++   5→> 状态：implemented
++   6→
++   7→## 1. 目标
++   8→
++   9→新增 **RSI Trend Filter** 策略（`rsi_trend_filter`），在经典 RSI 均值回归信号上叠加 200 日 SMA 趋势过滤，降低单边趋势中的逆势假信号风险。
++  10→
++  11→## 2. 策略设计
++  12→
++  13→### 信号规则
++  14→
++  15→| 条件 | 信号 |
++  16→|------|------|
++  17→| RSI < oversold **AND** close > SMA(200) | BUY (+1) — 上升趋势中的超卖 |
++  18→| RSI > overbought **AND** close < SMA(200) | SELL (-1) — 下降趋势中的超买 |
++  19→| 其他 | HOLD (0) |
++  
++
++### Experience Learned
++- 迭代通过 ACP 协议执行，状态: passed
++- trajectory_updated_by_codebuddy: False
++- decision_log_updated_by_codebuddy: False
++
++### 后续建议
++- 检查测试是否全部通过
++- 无高风险文件触及
++
++---
+diff --git a/mytrader/designs/design_v2/07-backtest-module.md b/mytrader/designs/design_v2/07-backtest-module.md
+index f5ca5a3..6c8d750 100644
+--- a/mytrader/designs/design_v2/07-backtest-module.md
++++ b/mytrader/designs/design_v2/07-backtest-module.md
+@@ -395,14 +395,14 @@ def run_matrix_backtest(universe: UniverseManager,
+ | **实盘 ensemble 对齐** | MatrixBacktest 的 ensemble 权重优化须在"单点离散值聚合"语义下验证 | 实盘只取 iloc[-1] 单点离散值加权，与序列级加权不等价，权重必须在相同语义下产出 |
+ | **Walk-Forward** | 滚动训练窗口，月度重优化 | 平衡过拟合与适应性 |
+ 
+-### 10.4.1 Top-K 选择三级 Fallback（迭代 #9 新增，迭代 #11 前置健全性门槛，迭代 #12 前置 alpha>0 门槛）
++### 10.4.1 Top-K 选择三级 Fallback（迭代 #9 新增，迭代 #11 前置健全性门槛，迭代 #12 前置 alpha gate，迭代 #16 放宽 alpha gate 阈值）
+ 
+ ```
+ [迭代 #11 前置] 健全性过滤：剔除 closed_trades==0 比例 ≥ 80% 的退化策略
+                 全退化组 → 空权重 + no_valid_strategy=True（hold cash）
+                     ↓
+-[迭代 #12 前置] alpha>0 硬门槛：剔除 alpha≤0 的候选（跑不赢 SPY 的策略不进权重）
+-                全负 alpha 组 → 空权重 + no_positive_alpha=True（hold cash）
++[迭代 #12 前置 / 迭代 #16 放宽] alpha gate：剔除 alpha ≤ ALPHA_GATE_THRESHOLD (-2%) 的候选
++                全不合格 alpha 组 → 空权重 + no_positive_alpha=True（hold cash）
+                     ↓
+ Tier 1: DD ≤ 20% AND Sortino > 0.5  →  Alpha 降序取 top-K
+    ↓ (若空)
+@@ -411,18 +411,25 @@ Tier 2: DD ≤ 20%（放宽 Sortino）   →  Alpha 降序取 top-K，WARNING 
+ Tier 3: 无 DD 合规候选              →  DD 升序取 top-K，dd_constrained=True
+ ```
+ 
+-**迭代 #11 健全性门槛（先于 alpha>0 门槛）**：
++**迭代 #11 健全性门槛（先于 alpha gate）**：
+ - `SingleBacktestResult.closed_trades` 字段从 vbt `pf.trades.closed.count()` 提取（区分"真交易闭环"与"末尾强平计 1 笔的伪 buy-and-hold"）
+ - 退化定义：组内 `closed_trades==0` 的标的比例 ≥ `DEGENERATE_NO_CLOSE_FRACTION (0.8)`
+ - 全退化组返回空权重（持仓现金），不强行选退化策略；标记 `GroupBacktestResult.no_valid_strategy=True`
+ - 设计动机（`experience.md #8`）：Iter #10 `rsi_trend_filter` 凭"持仓盯市 + 末尾强平"的 Sortino/alpha 假象骗过 alpha 排序进入 4/6 组权重 → 组合 alpha=-25.26%。`closed_trades` 信号缺失时无健全性门槛可拦住整个灾难。0.8 阈值保守，低频合法策略（每标的 2-3 笔）不会被误伤
+ 
+-**迭代 #12 alpha>0 硬门槛（健全性之后、Tier 1/2/3 之前）**：
++**迭代 #12 alpha gate（健全性之后、Tier 1/2/3 之前）**：
+ - 在 candidates 构建后、Tier 1/2/3 fallback 之前，剔除 `alpha≤0` 的候选
+ - 全负 alpha 组返回空权重（持仓现金），标记 `GroupBacktestResult.no_positive_alpha=True`
+ - `_optimize_ensemble_weights` 修负 alpha 归一化 bug：旧代码 `max(alpha, 0.01)` 把负 alpha 掩盖成 0.01 → 等权；新代码 `max(alpha, 0.0)` → 负 alpha 权重为 0，只有正 alpha 参与归一化
+ - 设计动机（`experience.md #8`：`sanity → risk → positive alpha → rank`）：Iter #11 健全性门槛修复了退化策略，但 11 条权重中 9 条负 alpha → 组合 alpha=-21.41%。alpha>0 门槛确保只有跑赢 SPY 的策略进权重。全负 alpha 组空仓（hold cash），不"矬子里拔将军"
+ 
++**迭代 #16 放宽 alpha gate 阈值（从 alpha>0 到 alpha > ALPHA_GATE_THRESHOLD=-2%）**：
++- Iter #12 的 `alpha>0` 门槛在 Iter #15 reoptimize 中导致 4/6 组空仓（SPX_mid_vol / SPX_high_vol / SPX_low_vol / NDX_mid_vol）
++- 根因：SPX 成分股 vs SPY benchmark 存在结构性近零 alpha —— SPY 即 S&P 500 本身，交易 SPX 组件 vs SPY 相当于"和自己赛跑"
++- 放宽至 `ALPHA_GATE_THRESHOLD = -2.0`：仍过滤"灾难性跑输"（如 -5% 以下），但保留"小幅跑输 SPY 但 Sortino/DD 优秀"的候选
++- 与 WF OOS 校验��关系：Walk-Forward（Iter #13）仍用 -5% 单轮下限 + avg>0 汇总门槛，放宽 in-sample gate 不削弱 OOS 验证强度
++- `_optimize_ensemble_weights` 保持 `max(a, 0.0)` 不变（负 alpha 在多策略 ensemble 中权重仍为 0，保守设计）
++
+ **设计动机**（iteration #9 spec §1-2）：
+ - Constitution 目标：年化 20-30%（需 alpha +10~20%）
+ - 旧逻辑：Sortino 降序 → 永远选均值回归策略 → 年化 8.02%，alpha = -11.34%
+diff --git a/mytrader/mytrader/backtest/matrix_backtest.py b/mytrader/mytrader/backtest/matrix_backtest.py
+index 6922c8c..21bfe2c 100644
+--- a/mytrader/mytrader/backtest/matrix_backtest.py
++++ b/mytrader/mytrader/backtest/matrix_backtest.py
+@@ -65,6 +65,17 @@ MIN_SORTINO_THRESHOLD: float = 0.5
+ # 合理候选；阈值与 WALK_FORWARD_VAL_ALPHA_FLOOR=-5% 形成 3% 缓冲带。
+ ALPHA_GATE_THRESHOLD: float = -2.0
+ 
++# 迭代 #17 新增：Sortino 豁免门槛（in-sample），允许高 Sortino 策略绕过 alpha gate。
++# 设计动机：Iter #16 reoptimize 实证 SPX 组 alpha 范围 -3.61% ~ -15.35%（远低于
++# -2% gate），3/3 SPX 组空仓。但其中部分策略 Sortino 极佳（> 1.5），下行风险
++# 控制优秀，只因"vs SPY 的相对收益"不合格被拒。Constitution L1 首要 KPI 是
++# Sortino（而非 alpha），alpha 是 Iter #9 引入的二级排序指标。本豁免让"Sortino
++# 优秀但 alpha 跑输 SPY"的策略进入 Tier 1/2/3 过滤，不再被 alpha gate 一刀切。
++# 取 1.5 的理由：高于 MIN_SORTINO_THRESHOLD=0.5（Tier 1 合规线）和 1.0（普通优秀），
++# 是"卓越 Sortino"门槛；避免豁免过宽（若设为 0.5 则等于 Tier 1 的 Sortino 门槛，
++# 豁免失去意义）。WF OOS 校验仍用 -5% 单轮下限 + avg>0，本豁免不削弱 OOS 验证。
++SORTINO_ALPHA_EXEMPTION: float = 1.5
++
+ # 迭代 #11 新增：健全性门槛 —— 识别"退化策略"（几乎不平仓的伪 buy-and-hold）
+ # 判定：组内"有效标的中，已平仓交易数为 0 的比例"超过此阈值 → 退化
+ # 设计动机：真策略应在多数标的上完成买卖闭环；若近乎所有标的都从不平仓，
+@@ -1340,30 +1351,45 @@ class MatrixBacktest:
+         #   同时保留"小幅跑输 SPY 但 Sortino/DD 优秀"的候选。
+         #   Walk-Forward（Iter #13）仍用 -5% 单轮下限 + avg>0 汇总门槛作 OOS 校验，
+         #   放宽 in-sample gate 不削弱 OOS 验证强度。
++        # 迭代 #17：Sortino 豁免 —— 高 Sortino (> SORTINO_ALPHA_EXEMPTION=1.5)
++        #   的策略绕过 alpha gate。动机：Iter #16 reoptimize 实证 SPX 组 alpha
++        #   范围 -3.61% ~ -15.35%，-2% gate 仍不解锁 SPX 组；但部分策略 Sortino
++        #   极佳（下行风险控制优秀），只因"vs SPY 相对收益"不合格被拒。Constitution
++        #   L1 首要 KPI 是 Sortino（而非 alpha），本豁免让"Sortino 卓越但 alpha 跑输
++        #   SPY"的策略进入 Tier 1/2/3，不再被 alpha gate 一刀切。WF OOS 校验仍用
++        #   -5% 单轮下限 + avg>0，本豁免不削弱 OOS 验证强度。
+         # 顺序：健全性（Iter #11）→ 风险（DD，Tier 1/2/3）→ alpha 门槛（本步）→ 排序
+         #
+-        # 注意：这一步在 candidates 构建后、Tier 1 前，确保 Tier 1/2/3 只在合格 alpha 候选中进行。
+-        # 如果某组所有候选 alpha ≤ ALPHA_GATE_THRESHOLD，该组空仓（hold cash），
+-        # 不强行选严重跑输 SPY 的策略
++        # 注意：这一步在 candidates 构建后、Tier 1 前，确保 Tier 1/2/3 只在合格候选中进行。
++        # 合格定义：alpha > ALPHA_GATE_THRESHOLD  OR  sortino > SORTINO_ALPHA_EXEMPTION
++        # （二者满足其一即进入 Tier 1/2/3）
++        # 如果某组所有候选都不满足（alpha ≤ threshold 且 sortino ≤ exemption），
++        # 该组空仓（hold cash），不强行选严重跑输 SPY 且 Sortino 平庸的策略
+         # （experience.md #8："没有候选满足门槛时，正确动作是空仓/降现金/回退 benchmark，
+         #   不是矬子里拔将军"）。
+         alpha_qualified_candidates = [
+-            c for c in candidates if c[5] > ALPHA_GATE_THRESHOLD
++            c for c in candidates
++            if c[5] > ALPHA_GATE_THRESHOLD or c[3] > SORTINO_ALPHA_EXEMPTION
+         ]
+ 
+         if not alpha_qualified_candidates:
+-            # 全组 alpha ≤ threshold → 空权重（持仓现金），标记 no_positive_alpha
+-            # 字段名保留 no_positive_alpha（向下兼容下游消费方），语义为"无合格 alpha 候选"
+-            alpha_strs = [f"{c[0]}({c[5]:.2f}%)" for c in candidates]
++            # 全组候选 alpha ≤ threshold 且 sortino ≤ exemption → 空权重（持仓现金），
++            # 标记 no_positive_alpha
++            # 字段名保留 no_positive_alpha（向下兼容下游消费方），语义为"无合格 alpha/Sortino 候选"
++            alpha_strs = [
++                f"{c[0]}(alpha={c[5]:.2f}%, sortino={c[3]:.4f})" for c in candidates
++            ]
+             logger.warning(
+                 f"[MatrixBacktest] {group_id}: ALL {len(candidates)} candidates have "
+-                f"alpha <= {ALPHA_GATE_THRESHOLD}% (cannot beat SPY within tolerance) — "
++                f"alpha <= {ALPHA_GATE_THRESHOLD}% AND sortino <= {SORTINO_ALPHA_EXEMPTION} "
++                f"(cannot beat SPY within tolerance, no Sortino exemption) — "
+                 f"{alpha_strs}. "
+                 f"Group produces EMPTY weights (hold cash). Marked no_positive_alpha."
+             )
+             report.warnings.append(
+                 f"{group_id}: no_positive_alpha "
+-                f"(all {len(candidates)} candidates alpha <= {ALPHA_GATE_THRESHOLD}%)"
++                f"(all {len(candidates)} candidates alpha <= {ALPHA_GATE_THRESHOLD}% "
++                f"AND sortino <= {SORTINO_ALPHA_EXEMPTION})"
+             )
+             # 标记已 append 的 GroupBacktestResult 条目（供审计追溯）
+             for gr in report.group_results:
+diff --git a/mytrader/tests/test_alpha_gate.py b/mytrader/tests/test_alpha_gate.py
+index a9cf29a..ec17fe5 100644
+--- a/mytrader/tests/test_alpha_gate.py
++++ b/mytrader/tests/test_alpha_gate.py
+@@ -5,6 +5,12 @@
+ 4/6 组空仓。放宽至 -2% 仍过滤"灾难性跑输"，但保留"小幅跑输 SPY 但 Sortino/DD
+ 优秀"的候选。WF OOS 校验仍用 -5% 单轮下限 + avg>0 汇总门槛，不削弱 OOS 验证。
+ 
++迭代 #17 更新：新增 Sortino 豁免 —— 高 Sortino (> SORTINO_ALPHA_EXEMPTION=1.5)
++的策略绕过 alpha gate。动机：Iter #16 reoptimize 实证 SPX 组 alpha 范围 -3.61% ~
++-15.35%，-2% gate 仍不解锁 SPX 组；但部分策略 Sortino 极佳，只因"vs SPY 相对收益"
++不合格被拒。Constitution L1 首要 KPI 是 Sortino，本豁免让"Sortino 卓越但 alpha 跑输
++SPY"的策略进入 Tier 1/2/3。WF OOS 校验不变。
++
+ 验证：
+     1. `GroupBacktestResult.no_positive_alpha` 字段默认 False
+     2. `_run_group` 在 candidates 构建后、Tier 1 剔除 alpha ≤ ALPHA_GATE_THRESHOLD 的候选
+@@ -20,8 +26,16 @@
+     12. [Iter #16] alpha=+1% 仍通过（无回归）
+     13. [Iter #16] 集成场景：SPX 组 alpha=-1.5% 策略入选 tier1
+     14. [Iter #16] 单策略 ensemble 负 alpha（> -2%）仍得 weight=1.0（早返回）
+-
+-背景见 `iterations/iteration_16/spec.md` + `.codebuddy/notes/experience.md` #8。
++    15. [Iter #17] SORTINO_ALPHA_EXEMPTION 常量存在且等于 1.5
++    16. [Iter #17] 高 Sortino (2.0) 豁免 alpha gate（alpha=-5% 仍通过）
++    17. [Iter #17] 低 Sortino (0.6) 不豁免（仍需 alpha > -2%）
++    18. [Iter #17] DD 仍强制（高 Sortino 豁免后仍经 Tier 1/2/3 DD 过滤）
++    19. [Iter #17] MIN_SORTINO_THRESHOLD 在 Tier 1 仍强制（正 alpha + 低 Sortino → Tier 2）
++    20. [Iter #17] Sortino=1.5 边界值不豁免（> 严格比较）
++    21. [Iter #17] Sortino=1.51 刚过边界豁免通过
++
++背景见 `iterations/iteration_16/spec.md` + `iterations/iteration_17/spec.md` +
++`.codebuddy/notes/experience.md` #8。
+ """
+ 
+ from __future__ import annotations
+@@ -35,6 +49,8 @@ import pytest
+ 
+ from mytrader.backtest.matrix_backtest import (
+     ALPHA_GATE_THRESHOLD,
++    MIN_SORTINO_THRESHOLD,
++    SORTINO_ALPHA_EXEMPTION,
+     GroupBacktestResult,
+     MatrixBacktest,
+     MatrixBacktestReport,
+@@ -962,6 +978,8 @@ class TestAlphaGateRelaxedThreshold:
+ 
+         场景：单策略 alpha=-5%，健全性通过。
+         验证：返回空权重，no_positive_alpha=True。
++        迭代 #17 注：需同时 mock sortino ≤ SORTINO_ALPHA_EXEMPTION 以隔离 alpha gate
++        测试（否则高 Sortino 会触发豁免，使 alpha=-5% 通过）。
+         """
+         n = 300
+         idx = pd.date_range("2021-01-01", periods=n, freq="B")
+@@ -1001,6 +1019,9 @@ class TestAlphaGateRelaxedThreshold:
+         ), patch(
+             "mytrader.backtest.matrix_backtest._compute_alpha",
+             return_value=mock_alpha,
++        ), patch(
++            "mytrader.backtest.matrix_backtest._portfolio_sortino_from_results",
++            return_value=0.0,
+         ):
+             weights = mb._run_group(
+                 group_id="test_group",
+@@ -1027,6 +1048,8 @@ class TestAlphaGateRelaxedThreshold:
+ 
+         场景：alpha 精确等于 -2.0%（边界值）。
+         验证：返回空权重（因为 `c[5] > ALPHA_GATE_THRESHOLD` 是严格大于）。
++        迭代 #17 注：需同时 mock sortino ≤ SORTINO_ALPHA_EXEMPTION 以隔离 alpha gate
++        测试（否则高 Sortino 会触发豁免，使 alpha=-2.0% 通过）。
+         """
+         n = 300
+         idx = pd.date_range("2021-01-01", periods=n, freq="B")
+@@ -1064,6 +1087,9 @@ class TestAlphaGateRelaxedThreshold:
+         ), patch(
+             "mytrader.backtest.matrix_backtest._compute_alpha",
+             return_value=mock_alpha,
++        ), patch(
++            "mytrader.backtest.matrix_backtest._portfolio_sortino_from_results",
++            return_value=0.0,
+         ):
+             weights = mb._run_group(
+                 group_id="test_group",
+@@ -1246,3 +1272,473 @@ class TestAlphaGateRelaxedThreshold:
+             f"单策略 ensemble 应早返回 weight=1.0（不依赖 alpha 值），"
+             f"实际 {weights[0][2]}"
+         )
++
++
++# ---------------------------------------------------------------------------
++# Iter #17: Sortino alpha exemption (SORTINO_ALPHA_EXEMPTION = 1.5)
++# ---------------------------------------------------------------------------
++
++class TestSortinoAlphaExemption:
++    """迭代 #17：Sortino 豁免 —— 高 Sortino (> 1.5) 的策略绕过 alpha gate。
++
++    动机见 spec：Iter #16 reoptimize 实证 SPX 组 alpha 范围 -3.61% ~ -15.35%，
++    -2% gate 仍不解锁 SPX 组；但部分策略 Sortino 极佳（下行风险控制优秀），
++    只因"vs SPY 相对收益"不合格被拒。Constitution L1 首要 KPI 是 Sortino，
++    本豁免让"Sortino 卓越但 alpha 跑输 SPY"的策略进入 Tier 1/2/3。
++
++    合格定义：alpha > ALPHA_GATE_THRESHOLD (-2%)  OR  sortino > SORTINO_ALPHA_EXEMPTION (1.5)
++    """
++
++    def test_sortino_exemption_constant_exists(self):
++        """SORTINO_ALPHA_EXEMPTION 常量存在且等于 1.5。"""
++        assert hasattr(
++            __import__("mytrader.backtest.matrix_backtest", fromlist=["matrix_backtest"]),
++            "SORTINO_ALPHA_EXEMPTION",
++        ), "matrix_backtest 必须导出 SORTINO_ALPHA_EXEMPTION 常量"
++        assert SORTINO_ALPHA_EXEMPTION == 1.5, (
++            f"SORTINO_ALPHA_EXEMPTION 应为 1.5，实际 {SORTINO_ALPHA_EXEMPTION}"
++        )
++
++    def test_high_sortino_exempts_negative_alpha(self):
++        """高 Sortino (2.0) 豁免 alpha gate：alpha=-5% 仍通过。
++
++        场景：单策略 alpha=-5%（远低于 -2% gate），sortino=2.0（高于 1.5 豁免），
++              DD=10%（合规），健全性通过。
++        验证：权重正常产出（非空），no_positive_alpha=False。
++        旧逻辑（无豁免）：alpha=-5% 被拒绝 → 空权重。
++        """
++        n = 300
++        idx = pd.date_range("2021-01-01", periods=n, freq="B")
++        spy_df = _make_spy_df(n, annual_return=0.10)
++
++        np.random.seed(42)
++        returns_a = pd.Series(np.random.normal(0.0004, 0.004, n), index=idx)
++
++        mock_alpha = -5.0  # 远低于 -2% gate
++        mock_sortino = 2.0  # 高于 1.5 豁免
++        assert mock_alpha < ALPHA_GATE_THRESHOLD
++        assert mock_sortino > SORTINO_ALPHA_EXEMPTION
++
++        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
++            results = []
++            for sym, df in data.items():
++                if df is None or df.empty or len(df) < 30:
++                    continue
++                results.append(_make_result(sym, strategy_name, returns_a, closed_trades=10))
++            return results
++
++        df_up = _make_ohlcv(n, trend="up")
++        store = _make_store_with_spy({"AAA": df_up, "BBB": df_up}, spy_df)
++        universe = _make_mock_universe({"test_group": ["AAA", "BBB"]})
++
++        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
++        report = MatrixBacktestReport(
++            generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
++            backtest_window="2021-01-01 ~ 2022-01-01",
++            groups={},
++        )
++
++        with patch(
++            "mytrader.backtest.matrix_backtest._backtest_batch",
++            side_effect=mock_backtest_batch,
++        ), patch(
++            "mytrader.backtest.matrix_backtest._compute_alpha",
++            return_value=mock_alpha,
++        ), patch(
++            "mytrader.backtest.matrix_backtest._portfolio_sortino_from_results",
++            return_value=mock_sortino,
++        ):
++            weights = mb._run_group(
++                group_id="test_group",
++                symbols=["AAA", "BBB"],
++                start=date(2021, 1, 1),
++                end=date(2022, 1, 1),
++                strategies=["dual_ma"],
++                param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
++                report=report,
++            )
++
++        # 关键断言：高 Sortino 豁免 alpha gate → 权重非空
++        assert len(weights) > 0, (
++            f"alpha={mock_alpha}% 但 sortino={mock_sortino} > {SORTINO_ALPHA_EXEMPTION} "
++            f"应通过 Sortino 豁免，实际 weights={weights}"
++        )
++        # no_positive_alpha 不应被标记
++        for gr in report.group_results:
++            if gr.group_id == "test_group":
++                assert gr.no_positive_alpha is False, (
++                    "高 Sortino 豁免组不应标记 no_positive_alpha=True"
++                )
++        warning_text = " ".join(report.warnings)
++        assert "no_positive_alpha" not in warning_text, (
++            f"高 Sortino 豁免组不应有 no_positive_alpha 警告，warnings={report.warnings}"
++        )
++
++    def test_low_sortino_does_not_exempt(self):
++        """低 Sortino (0.6) 不豁免：alpha=-5% 仍被拒绝。
++
++        场景：单策略 alpha=-5%（低于 -2% gate），sortino=0.6（高于 MIN_SORTINO_THRESHOLD 0.5
++              但低于豁免 1.5），DD=10%，健全性通过。
++        验证：返回空权重，no_positive_alpha=True。
++        说明：sortino=0.6 通过 Tier 1 的 MIN_SORTINO_THRESHOLD 但不构成豁免，
++              证明"过 Tier 1 Sortino 门槛"≠"豁免 alpha gate"。
++        """
++        n = 300
++        idx = pd.date_range("2021-01-01", periods=n, freq="B")
++        spy_df = _make_spy_df(n, annual_return=0.10)
++
++        np.random.seed(42)
++        returns_a = pd.Series(np.random.normal(0.0004, 0.004, n), index=idx)
++
++        mock_alpha = -5.0
++        mock_sortino = 0.6  # 高于 MIN_SORTINO_THRESHOLD(0.5) 但低于豁免(1.5)
++        assert mock_alpha < ALPHA_GATE_THRESHOLD
++        assert MIN_SORTINO_THRESHOLD < mock_sortino <= SORTINO_ALPHA_EXEMPTION
++
++        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
++            results = []
++            for sym, df in data.items():
++                if df is None or df.empty or len(df) < 30:
++                    continue
++                results.append(_make_result(sym, strategy_name, returns_a, closed_trades=10))
++            return results
++
++        df_up = _make_ohlcv(n, trend="up")
++        store = _make_store_with_spy({"AAA": df_up, "BBB": df_up}, spy_df)
++        universe = _make_mock_universe({"test_group": ["AAA", "BBB"]})
++
++        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
++        report = MatrixBacktestReport(
++            generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
++            backtest_window="2021-01-01 ~ 2022-01-01",
++            groups={},
++        )
++
++        with patch(
++            "mytrader.backtest.matrix_backtest._backtest_batch",
++            side_effect=mock_backtest_batch,
++        ), patch(
++            "mytrader.backtest.matrix_backtest._compute_alpha",
++            return_value=mock_alpha,
++        ), patch(
++            "mytrader.backtest.matrix_backtest._portfolio_sortino_from_results",
++            return_value=mock_sortino,
++        ):
++            weights = mb._run_group(
++                group_id="test_group",
++                symbols=["AAA", "BBB"],
++                start=date(2021, 1, 1),
++                end=date(2022, 1, 1),
++                strategies=["dual_ma"],
++                param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
++                report=report,
++            )
++
++        # 关键断言：低 Sortino 不豁免 → 空权重
++        assert weights == [], (
++            f"alpha={mock_alpha}% 且 sortino={mock_sortino} ≤ {SORTINO_ALPHA_EXEMPTION} "
++            f"不应豁免，实际 weights={weights}"
++        )
++        warning_text = " ".join(report.warnings)
++        assert "no_positive_alpha" in warning_text
++        for gr in report.group_results:
++            if gr.group_id == "test_group":
++                assert gr.no_positive_alpha is True
++
++    def test_dd_still_mandatory_with_sortino_exemption(self):
++        """DD 仍强制：高 Sortino 豁免 alpha gate 后，仍经 Tier 1/2/3 DD 过滤。
++
++        场景：单策略 alpha=-5%（gate 拒绝），sortino=2.0（豁免通过），
++              DD=25%（超 20% 硬约束），健全性通过。
++        验证：通过 alpha gate（豁免），但 Tier 1 DD 拒绝、Tier 2 DD 拒绝、
++              Tier 3 fallback 选中并标记 dd_constrained=True。
++        说明：证明 Sortino 豁免只绕过 alpha gate，不绕过 DD 过滤。
++        """
++        n = 300
++        idx = pd.date_range("2021-01-01", periods=n, freq="B")
++        spy_df = _make_spy_df(n, annual_return=0.10)
++
++        np.random.seed(42)
++        returns_a = pd.Series(np.random.normal(0.0004, 0.004, n), index=idx)
++
++        mock_alpha = -5.0
++        mock_sortino = 2.0  # 豁免
++        mock_dd = 25.0  # 超 20% 硬约束
++        assert mock_alpha < ALPHA_GATE_THRESHOLD
++        assert mock_sortino > SORTINO_ALPHA_EXEMPTION
++        assert mock_dd > 20.0
++
++        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
++            results = []
++            for sym, df in data.items():
++                if df is None or df.empty or len(df) < 30:
++                    continue
++                results.append(_make_result(sym, strategy_name, returns_a, closed_trades=10))
++            return results
++
++        df_up = _make_ohlcv(n, trend="up")
++        store = _make_store_with_spy({"AAA": df_up, "BBB": df_up}, spy_df)
++        universe = _make_mock_universe({"test_group": ["AAA", "BBB"]})
++
++        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
++        report = MatrixBacktestReport(
++            generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
++            backtest_window="2021-01-01 ~ 2022-01-01",
++            groups={},
++        )
++
++        with patch(
++            "mytrader.backtest.matrix_backtest._backtest_batch",
++            side_effect=mock_backtest_batch,
++        ), patch(
++            "mytrader.backtest.matrix_backtest._compute_alpha",
++            return_value=mock_alpha,
++        ), patch(
++            "mytrader.backtest.matrix_backtest._portfolio_sortino_from_results",
++            return_value=mock_sortino,
++        ), patch(
++            "mytrader.backtest.matrix_backtest._portfolio_max_drawdown_from_results",
++            return_value=mock_dd,
++        ):
++            weights = mb._run_group(
++                group_id="test_group",
++                symbols=["AAA", "BBB"],
++                start=date(2021, 1, 1),
++                end=date(2022, 1, 1),
++                strategies=["dual_ma"],
++                param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
++                report=report,
++            )
++
++        # 通过 alpha gate（豁免），但 DD 过滤仍生效 → Tier 3 fallback
++        assert len(weights) > 0, (
++            f"高 Sortino 豁免应通过 alpha gate；DD=25% 触发 Tier 3 fallback "
++            f"仍应产出权重（dd_constrained），实际 weights={weights}"
++        )
++        # dd_constrained=True（DD 过滤触发 Tier 3 fallback）
++        assert weights[0]["dd_constrained"] is True, (
++            f"DD=25% > 20% 应触发 Tier 3 fallback，dd_constrained=True，"
++            f"实际 dd_constrained={weights[0]['dd_constrained']}"
++        )
++        assert weights[0]["backtest_dd_status"] == "dd_constrained"
++        # no_positive_alpha 不应被标记（Sortino 豁免通过了 alpha gate）
++        warning_text = " ".join(report.warnings)
++        assert "no_positive_alpha" not in warning_text, (
++            f"高 Sortino 豁免通过 alpha gate，不应触发 no_positive_alpha，"
++            f"warnings={report.warnings}"
++        )
++        # dd_constrained 警告应存在
++        assert "dd_constrained" in warning_text
++
++    def test_min_sortino_threshold_still_enforced_in_tier1(self):
++        """MIN_SORTINO_THRESHOLD 在 Tier 1 仍强制（正 alpha + 低 Sortino → Tier 2）。
++
++        场景：单策略 alpha=+1%（正 alpha，过 gate 无需豁免），sortino=0.3
++              （低于 MIN_SORTINO_THRESHOLD 0.5），DD=10%（合规）。
++        验证：过 alpha gate，但 Tier 1 拒绝（sortino ≤ 0.5）→ Tier 2 (DD-only) 通过；
++              权重非空，且日志含 "Sortino filter relaxed" 警告。
++        说明：证明 Iter #17 的 Sortino 豁免（1.5）不破坏 Iter #9 的 Tier 1
++              MIN_SORTINO_THRESHOLD 过滤——二者是不同层级的检查。
++        """
++        from loguru import logger
++
++        n = 300
++        idx = pd.date_range("2021-01-01", periods=n, freq="B")
++        spy_df = _make_spy_df(n, annual_return=0.10)
++
++        np.random.seed(42)
++        returns_a = pd.Series(np.random.normal(0.0004, 0.004, n), index=idx)
++
++        mock_alpha = 1.0  # 正 alpha，过 gate
++        mock_sortino = 0.3  # 低于 MIN_SORTINO_THRESHOLD 0.5
++        assert mock_alpha > ALPHA_GATE_THRESHOLD
++        assert mock_sortino <= MIN_SORTINO_THRESHOLD
++
++        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
++            results = []
++            for sym, df in data.items():
++                if df is None or df.empty or len(df) < 30:
++                    continue
++                results.append(_make_result(sym, strategy_name, returns_a, closed_trades=10))
++            return results
++
++        df_up = _make_ohlcv(n, trend="up")
++        store = _make_store_with_spy({"AAA": df_up, "BBB": df_up}, spy_df)
++        universe = _make_mock_universe({"test_group": ["AAA", "BBB"]})
++
++        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
++        report = MatrixBacktestReport(
++            generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
++            backtest_window="2021-01-01 ~ 2022-01-01",
++            groups={},
++        )
++
++        msgs: list[str] = []
++        handler_id = logger.add(lambda m: msgs.append(str(m)), level="WARNING")
++
++        try:
++            with patch(
++                "mytrader.backtest.matrix_backtest._backtest_batch",
++                side_effect=mock_backtest_batch,
++            ), patch(
++                "mytrader.backtest.matrix_backtest._compute_alpha",
++                return_value=mock_alpha,
++            ), patch(
++                "mytrader.backtest.matrix_backtest._portfolio_sortino_from_results",
++                return_value=mock_sortino,
++            ):
++                weights = mb._run_group(
++                    group_id="test_group",
++                    symbols=["AAA", "BBB"],
++                    start=date(2021, 1, 1),
++                    end=date(2022, 1, 1),
++                    strategies=["dual_ma"],
++                    param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
++                    report=report,
++                )
++        finally:
++            logger.remove(handler_id)
++
++        # 权重非空（Tier 2 DD-only fallback 选中）
++        assert len(weights) > 0, (
++            f"正 alpha 过 gate；Tier 1 拒绝（sortino ≤ {MIN_SORTINO_THRESHOLD}）→ "
++            f"Tier 2 (DD-only) 应选中，实际 weights={weights}"
++        )
++        # Tier 1 失败 → Tier 2 触发 "Sortino filter relaxed" 警告
++        assert any("Sortino filter relaxed" in m for m in msgs), (
++            f"sortino={mock_sortino} ≤ {MIN_SORTINO_THRESHOLD} 应触发 Tier 1 失败 + "
++            f"Tier 2 'Sortino filter relaxed' 警告，实际捕获: {msgs}"
++        )
++        # Tier 2 不是 dd_constrained（DD 合规）
++        assert weights[0]["dd_constrained"] is False
++        # no_positive_alpha 不触发（正 alpha）
++        warning_text = " ".join(report.warnings)
++        assert "no_positive_alpha" not in warning_text
++
++    def test_sortino_exemption_boundary_rejected(self):
++        """Sortino=1.5 恰好在豁免边界 → 不豁免（> 严格比较）。
++
++        场景：alpha=-5%（gate 拒绝），sortino=1.5（恰好等于豁免阈值）。
++        验证：返回空权重（因为 `c[3] > SORTINO_ALPHA_EXEMPTION` 是严格大于）。
++        """
++        n = 300
++        idx = pd.date_range("2021-01-01", periods=n, freq="B")
++        spy_df = _make_spy_df(n, annual_return=0.10)
++
++        np.random.seed(42)
++        returns_a = pd.Series(np.random.normal(0.0004, 0.004, n), index=idx)
++
++        mock_alpha = -5.0
++        mock_sortino = SORTINO_ALPHA_EXEMPTION  # 1.5 边界
++
++        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
++            results = []
++            for sym, df in data.items():
++                if df is None or df.empty or len(df) < 30:
++                    continue
++                results.append(_make_result(sym, strategy_name, returns_a, closed_trades=10))
++            return results
++
++        df_up = _make_ohlcv(n, trend="up")
++        store = _make_store_with_spy({"AAA": df_up, "BBB": df_up}, spy_df)
++        universe = _make_mock_universe({"test_group": ["AAA", "BBB"]})
++
++        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
++        report = MatrixBacktestReport(
++            generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
++            backtest_window="2021-01-01 ~ 2022-01-01",
++            groups={},
++        )
++
++        with patch(
++            "mytrader.backtest.matrix_backtest._backtest_batch",
++            side_effect=mock_backtest_batch,
++        ), patch(
++            "mytrader.backtest.matrix_backtest._compute_alpha",
++            return_value=mock_alpha,
++        ), patch(
++            "mytrader.backtest.matrix_backtest._portfolio_sortino_from_results",
++            return_value=mock_sortino,
++        ):
++            weights = mb._run_group(
++                group_id="test_group",
++                symbols=["AAA", "BBB"],
++                start=date(2021, 1, 1),
++                end=date(2022, 1, 1),
++                strategies=["dual_ma"],
++                param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
++                report=report,
++            )
++
++        # 关键断言：sortino == 豁免阈值 → 不豁免（> 严格比较）
++        assert weights == [], (
++            f"sortino == {SORTINO_ALPHA_EXEMPTION} 应不豁免（使用 > 严格比较），"
++            f"实际 weights={weights}"
++        )
++        warning_text = " ".join(report.warnings)
++        assert "no_positive_alpha" in warning_text
++
++    def test_sortino_exemption_just_above_boundary(self):
++        """Sortino=1.51 刚过豁免边界 → 豁免通过。
++
++        场景：alpha=-5%（gate 拒绝），sortino=1.51（刚高于豁免阈值 1.5）。
++        验证：权重非空（豁免通过）。
++        """
++        n = 300
++        idx = pd.date_range("2021-01-01", periods=n, freq="B")
++        spy_df = _make_spy_df(n, annual_return=0.10)
++
++        np.random.seed(42)
++        returns_a = pd.Series(np.random.normal(0.0004, 0.004, n), index=idx)
++
++        mock_alpha = -5.0
++        mock_sortino = 1.51  # 刚高于 1.5
++        assert mock_sortino > SORTINO_ALPHA_EXEMPTION
++
++        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
++            results = []
++            for sym, df in data.items():
++                if df is None or df.empty or len(df) < 30:
++                    continue
++                results.append(_make_result(sym, strategy_name, returns_a, closed_trades=10))
++            return results
++
++        df_up = _make_ohlcv(n, trend="up")
++        store = _make_store_with_spy({"AAA": df_up, "BBB": df_up}, spy_df)
++        universe = _make_mock_universe({"test_group": ["AAA", "BBB"]})
++
++        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
++        report = MatrixBacktestReport(
++            generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
++            backtest_window="2021-01-01 ~ 2022-01-01",
++            groups={},
++        )
++
++        with patch(
++            "mytrader.backtest.matrix_backtest._backtest_batch",
++            side_effect=mock_backtest_batch,
++        ), patch(
++            "mytrader.backtest.matrix_backtest._compute_alpha",
++            return_value=mock_alpha,
++        ), patch(
++            "mytrader.backtest.matrix_backtest._portfolio_sortino_from_results",
++            return_value=mock_sortino,
++        ):
++            weights = mb._run_group(
++                group_id="test_group",
++                symbols=["AAA", "BBB"],
++                start=date(2021, 1, 1),
++                end=date(2022, 1, 1),
++                strategies=["dual_ma"],
++                param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
++                report=report,
++            )
++
++        # 关键断言：sortino=1.51 > 1.5 → 豁免通过
++        assert len(weights) > 0, (
++            f"sortino={mock_sortino} > {SORTINO_ALPHA_EXEMPTION} 应豁免通过，"
++            f"实际 weights={weights}"
++        )
++        for gr in report.group_results:
++            if gr.group_id == "test_group":
++                assert gr.no_positive_alpha is False

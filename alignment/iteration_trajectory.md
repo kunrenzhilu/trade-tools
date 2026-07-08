@@ -1665,3 +1665,64 @@ Full pytest (excluding live): 744 passed, 0 failed, 103 warnings in 25.00s
 > - CodeBuddy 自行更新了 trajectory ✅
 
 ---
+
+## 迭代 #17 — 按 iterations/iteration_17/spec.md 进行开发。关键目标：通过 Sortino 豁免让高 Sortino 策略绕过 alpha 门槛，解锁 SPX 策略组。按 Implementation Order（§6）逐步实施：1) 读取 matrix_backtest.py::_run_group 定位 alpha gate；2) 添加 SORTINO_ALPHA_EXEMPTION = 1.5 常量；3) 修改 Tier 1 过滤：alpha > -2% OR sortino > 1.5；4) 写 ~7 个新测试（高 Sortino 豁免、低 Sortino 仍需 alpha、DD 仍强制、最低 Sortino 仍强制、边界测试）；5) 运行全部测试；6) 运行 --reoptimize；7) 验证 strategy_weights.json 至少 1 个 SPX 组非空；8) 更新 trajectory + CODEBUDDY。严格遵守 scope：不改策略/indicators/risk/execution/main.py。
+
+- **日期**: 2026-07-08 10:12 UTC
+- **类型**: 自动化迭代 (Orchestrator → CodeBuddy via ACP)
+- **变更摘要**: 按 iterations/iteration_17/spec.md 进行开发。关键目标：通过 Sortino 豁免让高 Sortino 策略绕过 alpha 门槛，解锁 SPX 策略组。按 Implementation Order（§6）逐步实施：1) 读取 matrix_backtest.py::_run_group 定位 alpha gate；2) 添加 SORTINO_ALPHA_EXEMPTION = 1.5 常量；3) 修改 Tier 1 过滤：alpha > -2% OR sortino > 1.5；4) 写 ~7 个新测试（高 Sortino 豁免、低 Sortino 仍需 alpha、DD 仍强制、最低 Sortino 仍强制、边界测试）；5) 运行全部测试；6) 运行 --reoptimize；7) 验证 strategy_weights.json 至少 1 个 SPX 组非空；8) 更新 trajectory + CODEBUDDY。严格遵守 scope：不改策略/indicators/risk/execution/main.py。
+- **执行时长**: 1769s (29.5min)
+- **状态**: passed
+- **CodeBuddy 更新数**: 4393
+- **工具调用数**: 244
+- **团队事件数**: 0
+- **权限请求数**: 0
+
+### 变更文件
+.codebuddy/notes/experience.md, alignment/decision_log.md, mytrader/designs/design_v2/07-backtest-module.md, mytrader/mytrader/backtest/matrix_backtest.py, mytrader/tests/test_alpha_gate.py, iterations/iteration_17/
+
+### 测试结果
+0 passed, 0 failed (before=744, after=751, delta=+7)
+
+### 违规详情
+- ✅ 无违规
+
+### Constitution 合规
+- DD 20% 约束: ✅
+- 测试覆盖率: ✅ 不降 (before=744, after=751)
+- 黑箱策略: ✅ 未引入
+- RL 引入: ✅ 未引入
+- 文档同步: ⚠️ CodeBuddy 未更新，orchestrator 自动补写
+
+### CodeBuddy 响应摘要（自动提取）
+1→# Iteration #8 — Trend-Filtered Mean Reversion 策略
+   2→
+   3→> 日期：2026-07-04
+   4→> 类型：策略新增
+   5→> 状态：implemented
+   6→
+   7→## 1. 目标
+   8→
+   9→新增 **RSI Trend Filter** 策略（`rsi_trend_filter`），在经典 RSI 均值回归信号上叠加 200 日 SMA 趋势过滤，降低单边趋势中的逆势假信号风险。
+  10→
+  11→## 2. 策略设计
+  12→
+  13→### 信号规则
+  14→
+  15→| 条件 | 信号 |
+  16→|------|------|
+  17→| RSI < oversold **AND** close > SMA(200) | BUY (+1) — 上升趋势中的超卖 |
+  18→| RSI > overbought **AND** close < SMA(200) | SELL (-1) — 下降趋势中的超买 |
+  19→| 其他 | HOLD (0) |
+  
+
+### Experience Learned
+- 迭代通过 ACP 协议执行，状态: passed
+- trajectory_updated_by_codebuddy: False
+- decision_log_updated_by_codebuddy: False
+
+### 后续建议
+- 检查测试是否全部通过
+- 无高风险文件触及
+
+---

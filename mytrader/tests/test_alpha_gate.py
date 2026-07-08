@@ -5,6 +5,12 @@
 4/6 组空仓。放宽至 -2% 仍过滤"灾难性跑输"，但保留"小幅跑输 SPY 但 Sortino/DD
 优秀"的候选。WF OOS 校验仍用 -5% 单轮下限 + avg>0 汇总门槛，不削弱 OOS 验证。
 
+迭代 #17 更新：新增 Sortino 豁免 —— 高 Sortino (> SORTINO_ALPHA_EXEMPTION=1.5)
+的策略绕过 alpha gate。动机：Iter #16 reoptimize 实证 SPX 组 alpha 范围 -3.61% ~
+-15.35%，-2% gate 仍不解锁 SPX 组；但部分策略 Sortino 极佳，只因"vs SPY 相对收益"
+不合格被拒。Constitution L1 首要 KPI 是 Sortino，本豁免让"Sortino 卓越但 alpha 跑输
+SPY"的策略进入 Tier 1/2/3。WF OOS 校验不变。
+
 验证：
     1. `GroupBacktestResult.no_positive_alpha` 字段默认 False
     2. `_run_group` 在 candidates 构建后、Tier 1 剔除 alpha ≤ ALPHA_GATE_THRESHOLD 的候选
@@ -20,8 +26,16 @@
     12. [Iter #16] alpha=+1% 仍通过（无回归）
     13. [Iter #16] 集成场景：SPX 组 alpha=-1.5% 策略入选 tier1
     14. [Iter #16] 单策略 ensemble 负 alpha（> -2%）仍得 weight=1.0（早返回）
+    15. [Iter #17] SORTINO_ALPHA_EXEMPTION 常量存在且等于 1.5
+    16. [Iter #17] 高 Sortino (2.0) 豁免 alpha gate（alpha=-5% 仍通过）
+    17. [Iter #17] 低 Sortino (0.6) 不豁免（仍需 alpha > -2%）
+    18. [Iter #17] DD 仍强制（高 Sortino 豁免后仍经 Tier 1/2/3 DD 过滤）
+    19. [Iter #17] MIN_SORTINO_THRESHOLD 在 Tier 1 仍强制（正 alpha + 低 Sortino → Tier 2）
+    20. [Iter #17] Sortino=1.5 边界值不豁免（> 严格比较）
+    21. [Iter #17] Sortino=1.51 刚过边界豁免通过
 
-背景见 `iterations/iteration_16/spec.md` + `.codebuddy/notes/experience.md` #8。
+背景见 `iterations/iteration_16/spec.md` + `iterations/iteration_17/spec.md` +
+`.codebuddy/notes/experience.md` #8。
 """
 
 from __future__ import annotations
@@ -35,6 +49,8 @@ import pytest
 
 from mytrader.backtest.matrix_backtest import (
     ALPHA_GATE_THRESHOLD,
+    MIN_SORTINO_THRESHOLD,
+    SORTINO_ALPHA_EXEMPTION,
     GroupBacktestResult,
     MatrixBacktest,
     MatrixBacktestReport,
@@ -962,6 +978,8 @@ class TestAlphaGateRelaxedThreshold:
 
         场景：单策略 alpha=-5%，健全性通过。
         验证：返回空权重，no_positive_alpha=True。
+        迭代 #17 注：需同时 mock sortino ≤ SORTINO_ALPHA_EXEMPTION 以隔离 alpha gate
+        测试（否则高 Sortino 会触发豁免，使 alpha=-5% 通过）。
         """
         n = 300
         idx = pd.date_range("2021-01-01", periods=n, freq="B")
@@ -1001,6 +1019,9 @@ class TestAlphaGateRelaxedThreshold:
         ), patch(
             "mytrader.backtest.matrix_backtest._compute_alpha",
             return_value=mock_alpha,
+        ), patch(
+            "mytrader.backtest.matrix_backtest._portfolio_sortino_from_results",
+            return_value=0.0,
         ):
             weights = mb._run_group(
                 group_id="test_group",
@@ -1027,6 +1048,8 @@ class TestAlphaGateRelaxedThreshold:
 
         场景：alpha 精确等于 -2.0%（边界值）。
         验证：返回空权重（因为 `c[5] > ALPHA_GATE_THRESHOLD` 是严格大于）。
+        迭代 #17 注：需同时 mock sortino ≤ SORTINO_ALPHA_EXEMPTION 以隔离 alpha gate
+        测试（否则高 Sortino 会触发豁免，使 alpha=-2.0% 通过）。
         """
         n = 300
         idx = pd.date_range("2021-01-01", periods=n, freq="B")
@@ -1064,6 +1087,9 @@ class TestAlphaGateRelaxedThreshold:
         ), patch(
             "mytrader.backtest.matrix_backtest._compute_alpha",
             return_value=mock_alpha,
+        ), patch(
+            "mytrader.backtest.matrix_backtest._portfolio_sortino_from_results",
+            return_value=0.0,
         ):
             weights = mb._run_group(
                 group_id="test_group",
@@ -1246,3 +1272,473 @@ class TestAlphaGateRelaxedThreshold:
             f"单策略 ensemble 应早返回 weight=1.0（不依赖 alpha 值），"
             f"实际 {weights[0][2]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Iter #17: Sortino alpha exemption (SORTINO_ALPHA_EXEMPTION = 1.5)
+# ---------------------------------------------------------------------------
+
+class TestSortinoAlphaExemption:
+    """迭代 #17：Sortino 豁免 —— 高 Sortino (> 1.5) 的策略绕过 alpha gate。
+
+    动机见 spec：Iter #16 reoptimize 实证 SPX 组 alpha 范围 -3.61% ~ -15.35%，
+    -2% gate 仍不解锁 SPX 组；但部分策略 Sortino 极佳（下行风险控制优秀），
+    只因"vs SPY 相对收益"不合格被拒。Constitution L1 首要 KPI 是 Sortino，
+    本豁免让"Sortino 卓越但 alpha 跑输 SPY"的策略进入 Tier 1/2/3。
+
+    合格定义：alpha > ALPHA_GATE_THRESHOLD (-2%)  OR  sortino > SORTINO_ALPHA_EXEMPTION (1.5)
+    """
+
+    def test_sortino_exemption_constant_exists(self):
+        """SORTINO_ALPHA_EXEMPTION 常量存在且等于 1.5。"""
+        assert hasattr(
+            __import__("mytrader.backtest.matrix_backtest", fromlist=["matrix_backtest"]),
+            "SORTINO_ALPHA_EXEMPTION",
+        ), "matrix_backtest 必须导出 SORTINO_ALPHA_EXEMPTION 常量"
+        assert SORTINO_ALPHA_EXEMPTION == 1.5, (
+            f"SORTINO_ALPHA_EXEMPTION 应为 1.5，实际 {SORTINO_ALPHA_EXEMPTION}"
+        )
+
+    def test_high_sortino_exempts_negative_alpha(self):
+        """高 Sortino (2.0) 豁免 alpha gate：alpha=-5% 仍通过。
+
+        场景：单策略 alpha=-5%（远低于 -2% gate），sortino=2.0（高于 1.5 豁免），
+              DD=10%（合规），健全性通过。
+        验证：权重正常产出（非空），no_positive_alpha=False。
+        旧逻辑（无豁免）：alpha=-5% 被拒绝 → 空权重。
+        """
+        n = 300
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        spy_df = _make_spy_df(n, annual_return=0.10)
+
+        np.random.seed(42)
+        returns_a = pd.Series(np.random.normal(0.0004, 0.004, n), index=idx)
+
+        mock_alpha = -5.0  # 远低于 -2% gate
+        mock_sortino = 2.0  # 高于 1.5 豁免
+        assert mock_alpha < ALPHA_GATE_THRESHOLD
+        assert mock_sortino > SORTINO_ALPHA_EXEMPTION
+
+        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
+            results = []
+            for sym, df in data.items():
+                if df is None or df.empty or len(df) < 30:
+                    continue
+                results.append(_make_result(sym, strategy_name, returns_a, closed_trades=10))
+            return results
+
+        df_up = _make_ohlcv(n, trend="up")
+        store = _make_store_with_spy({"AAA": df_up, "BBB": df_up}, spy_df)
+        universe = _make_mock_universe({"test_group": ["AAA", "BBB"]})
+
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
+        report = MatrixBacktestReport(
+            generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
+            backtest_window="2021-01-01 ~ 2022-01-01",
+            groups={},
+        )
+
+        with patch(
+            "mytrader.backtest.matrix_backtest._backtest_batch",
+            side_effect=mock_backtest_batch,
+        ), patch(
+            "mytrader.backtest.matrix_backtest._compute_alpha",
+            return_value=mock_alpha,
+        ), patch(
+            "mytrader.backtest.matrix_backtest._portfolio_sortino_from_results",
+            return_value=mock_sortino,
+        ):
+            weights = mb._run_group(
+                group_id="test_group",
+                symbols=["AAA", "BBB"],
+                start=date(2021, 1, 1),
+                end=date(2022, 1, 1),
+                strategies=["dual_ma"],
+                param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+                report=report,
+            )
+
+        # 关键断言：高 Sortino 豁免 alpha gate → 权重非空
+        assert len(weights) > 0, (
+            f"alpha={mock_alpha}% 但 sortino={mock_sortino} > {SORTINO_ALPHA_EXEMPTION} "
+            f"应通过 Sortino 豁免，实际 weights={weights}"
+        )
+        # no_positive_alpha 不应被标记
+        for gr in report.group_results:
+            if gr.group_id == "test_group":
+                assert gr.no_positive_alpha is False, (
+                    "高 Sortino 豁免组不应标记 no_positive_alpha=True"
+                )
+        warning_text = " ".join(report.warnings)
+        assert "no_positive_alpha" not in warning_text, (
+            f"高 Sortino 豁免组不应有 no_positive_alpha 警告，warnings={report.warnings}"
+        )
+
+    def test_low_sortino_does_not_exempt(self):
+        """低 Sortino (0.6) 不豁免：alpha=-5% 仍被拒绝。
+
+        场景：单策略 alpha=-5%（低于 -2% gate），sortino=0.6（高于 MIN_SORTINO_THRESHOLD 0.5
+              但低于豁免 1.5），DD=10%，健全性通过。
+        验证：返回空权重，no_positive_alpha=True。
+        说明：sortino=0.6 通过 Tier 1 的 MIN_SORTINO_THRESHOLD 但不构成豁免，
+              证明"过 Tier 1 Sortino 门槛"≠"豁免 alpha gate"。
+        """
+        n = 300
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        spy_df = _make_spy_df(n, annual_return=0.10)
+
+        np.random.seed(42)
+        returns_a = pd.Series(np.random.normal(0.0004, 0.004, n), index=idx)
+
+        mock_alpha = -5.0
+        mock_sortino = 0.6  # 高于 MIN_SORTINO_THRESHOLD(0.5) 但低于豁免(1.5)
+        assert mock_alpha < ALPHA_GATE_THRESHOLD
+        assert MIN_SORTINO_THRESHOLD < mock_sortino <= SORTINO_ALPHA_EXEMPTION
+
+        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
+            results = []
+            for sym, df in data.items():
+                if df is None or df.empty or len(df) < 30:
+                    continue
+                results.append(_make_result(sym, strategy_name, returns_a, closed_trades=10))
+            return results
+
+        df_up = _make_ohlcv(n, trend="up")
+        store = _make_store_with_spy({"AAA": df_up, "BBB": df_up}, spy_df)
+        universe = _make_mock_universe({"test_group": ["AAA", "BBB"]})
+
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
+        report = MatrixBacktestReport(
+            generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
+            backtest_window="2021-01-01 ~ 2022-01-01",
+            groups={},
+        )
+
+        with patch(
+            "mytrader.backtest.matrix_backtest._backtest_batch",
+            side_effect=mock_backtest_batch,
+        ), patch(
+            "mytrader.backtest.matrix_backtest._compute_alpha",
+            return_value=mock_alpha,
+        ), patch(
+            "mytrader.backtest.matrix_backtest._portfolio_sortino_from_results",
+            return_value=mock_sortino,
+        ):
+            weights = mb._run_group(
+                group_id="test_group",
+                symbols=["AAA", "BBB"],
+                start=date(2021, 1, 1),
+                end=date(2022, 1, 1),
+                strategies=["dual_ma"],
+                param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+                report=report,
+            )
+
+        # 关键断言：低 Sortino 不豁免 → 空权重
+        assert weights == [], (
+            f"alpha={mock_alpha}% 且 sortino={mock_sortino} ≤ {SORTINO_ALPHA_EXEMPTION} "
+            f"不应豁免，实际 weights={weights}"
+        )
+        warning_text = " ".join(report.warnings)
+        assert "no_positive_alpha" in warning_text
+        for gr in report.group_results:
+            if gr.group_id == "test_group":
+                assert gr.no_positive_alpha is True
+
+    def test_dd_still_mandatory_with_sortino_exemption(self):
+        """DD 仍强制：高 Sortino 豁免 alpha gate 后，仍经 Tier 1/2/3 DD 过滤。
+
+        场景：单策略 alpha=-5%（gate 拒绝），sortino=2.0（豁免通过），
+              DD=25%（超 20% 硬约束），健全性通过。
+        验证：通过 alpha gate（豁免），但 Tier 1 DD 拒绝、Tier 2 DD 拒绝、
+              Tier 3 fallback 选中并标记 dd_constrained=True。
+        说明：证明 Sortino 豁免只绕过 alpha gate，不绕过 DD 过滤。
+        """
+        n = 300
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        spy_df = _make_spy_df(n, annual_return=0.10)
+
+        np.random.seed(42)
+        returns_a = pd.Series(np.random.normal(0.0004, 0.004, n), index=idx)
+
+        mock_alpha = -5.0
+        mock_sortino = 2.0  # 豁免
+        mock_dd = 25.0  # 超 20% 硬约束
+        assert mock_alpha < ALPHA_GATE_THRESHOLD
+        assert mock_sortino > SORTINO_ALPHA_EXEMPTION
+        assert mock_dd > 20.0
+
+        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
+            results = []
+            for sym, df in data.items():
+                if df is None or df.empty or len(df) < 30:
+                    continue
+                results.append(_make_result(sym, strategy_name, returns_a, closed_trades=10))
+            return results
+
+        df_up = _make_ohlcv(n, trend="up")
+        store = _make_store_with_spy({"AAA": df_up, "BBB": df_up}, spy_df)
+        universe = _make_mock_universe({"test_group": ["AAA", "BBB"]})
+
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
+        report = MatrixBacktestReport(
+            generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
+            backtest_window="2021-01-01 ~ 2022-01-01",
+            groups={},
+        )
+
+        with patch(
+            "mytrader.backtest.matrix_backtest._backtest_batch",
+            side_effect=mock_backtest_batch,
+        ), patch(
+            "mytrader.backtest.matrix_backtest._compute_alpha",
+            return_value=mock_alpha,
+        ), patch(
+            "mytrader.backtest.matrix_backtest._portfolio_sortino_from_results",
+            return_value=mock_sortino,
+        ), patch(
+            "mytrader.backtest.matrix_backtest._portfolio_max_drawdown_from_results",
+            return_value=mock_dd,
+        ):
+            weights = mb._run_group(
+                group_id="test_group",
+                symbols=["AAA", "BBB"],
+                start=date(2021, 1, 1),
+                end=date(2022, 1, 1),
+                strategies=["dual_ma"],
+                param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+                report=report,
+            )
+
+        # 通过 alpha gate（豁免），但 DD 过滤仍生效 → Tier 3 fallback
+        assert len(weights) > 0, (
+            f"高 Sortino 豁免应通过 alpha gate；DD=25% 触发 Tier 3 fallback "
+            f"仍应产出权重（dd_constrained），实际 weights={weights}"
+        )
+        # dd_constrained=True（DD 过滤触发 Tier 3 fallback）
+        assert weights[0]["dd_constrained"] is True, (
+            f"DD=25% > 20% 应触发 Tier 3 fallback，dd_constrained=True，"
+            f"实际 dd_constrained={weights[0]['dd_constrained']}"
+        )
+        assert weights[0]["backtest_dd_status"] == "dd_constrained"
+        # no_positive_alpha 不应被标记（Sortino 豁免通过了 alpha gate）
+        warning_text = " ".join(report.warnings)
+        assert "no_positive_alpha" not in warning_text, (
+            f"高 Sortino 豁免通过 alpha gate，不应触发 no_positive_alpha，"
+            f"warnings={report.warnings}"
+        )
+        # dd_constrained 警告应存在
+        assert "dd_constrained" in warning_text
+
+    def test_min_sortino_threshold_still_enforced_in_tier1(self):
+        """MIN_SORTINO_THRESHOLD 在 Tier 1 仍强制（正 alpha + 低 Sortino → Tier 2）。
+
+        场景：单策略 alpha=+1%（正 alpha，过 gate 无需豁免），sortino=0.3
+              （低于 MIN_SORTINO_THRESHOLD 0.5），DD=10%（合规）。
+        验证：过 alpha gate，但 Tier 1 拒绝（sortino ≤ 0.5）→ Tier 2 (DD-only) 通过；
+              权重非空，且日志含 "Sortino filter relaxed" 警告。
+        说明：证明 Iter #17 的 Sortino 豁免（1.5）不破坏 Iter #9 的 Tier 1
+              MIN_SORTINO_THRESHOLD 过滤——二者是不同层级的检查。
+        """
+        from loguru import logger
+
+        n = 300
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        spy_df = _make_spy_df(n, annual_return=0.10)
+
+        np.random.seed(42)
+        returns_a = pd.Series(np.random.normal(0.0004, 0.004, n), index=idx)
+
+        mock_alpha = 1.0  # 正 alpha，过 gate
+        mock_sortino = 0.3  # 低于 MIN_SORTINO_THRESHOLD 0.5
+        assert mock_alpha > ALPHA_GATE_THRESHOLD
+        assert mock_sortino <= MIN_SORTINO_THRESHOLD
+
+        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
+            results = []
+            for sym, df in data.items():
+                if df is None or df.empty or len(df) < 30:
+                    continue
+                results.append(_make_result(sym, strategy_name, returns_a, closed_trades=10))
+            return results
+
+        df_up = _make_ohlcv(n, trend="up")
+        store = _make_store_with_spy({"AAA": df_up, "BBB": df_up}, spy_df)
+        universe = _make_mock_universe({"test_group": ["AAA", "BBB"]})
+
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
+        report = MatrixBacktestReport(
+            generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
+            backtest_window="2021-01-01 ~ 2022-01-01",
+            groups={},
+        )
+
+        msgs: list[str] = []
+        handler_id = logger.add(lambda m: msgs.append(str(m)), level="WARNING")
+
+        try:
+            with patch(
+                "mytrader.backtest.matrix_backtest._backtest_batch",
+                side_effect=mock_backtest_batch,
+            ), patch(
+                "mytrader.backtest.matrix_backtest._compute_alpha",
+                return_value=mock_alpha,
+            ), patch(
+                "mytrader.backtest.matrix_backtest._portfolio_sortino_from_results",
+                return_value=mock_sortino,
+            ):
+                weights = mb._run_group(
+                    group_id="test_group",
+                    symbols=["AAA", "BBB"],
+                    start=date(2021, 1, 1),
+                    end=date(2022, 1, 1),
+                    strategies=["dual_ma"],
+                    param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+                    report=report,
+                )
+        finally:
+            logger.remove(handler_id)
+
+        # 权重非空（Tier 2 DD-only fallback 选中）
+        assert len(weights) > 0, (
+            f"正 alpha 过 gate；Tier 1 拒绝（sortino ≤ {MIN_SORTINO_THRESHOLD}）→ "
+            f"Tier 2 (DD-only) 应选中，实际 weights={weights}"
+        )
+        # Tier 1 失败 → Tier 2 触发 "Sortino filter relaxed" 警告
+        assert any("Sortino filter relaxed" in m for m in msgs), (
+            f"sortino={mock_sortino} ≤ {MIN_SORTINO_THRESHOLD} 应触发 Tier 1 失败 + "
+            f"Tier 2 'Sortino filter relaxed' 警告，实际捕获: {msgs}"
+        )
+        # Tier 2 不是 dd_constrained（DD 合规）
+        assert weights[0]["dd_constrained"] is False
+        # no_positive_alpha 不触发（正 alpha）
+        warning_text = " ".join(report.warnings)
+        assert "no_positive_alpha" not in warning_text
+
+    def test_sortino_exemption_boundary_rejected(self):
+        """Sortino=1.5 恰好在豁免边界 → 不豁免（> 严格比较）。
+
+        场景：alpha=-5%（gate 拒绝），sortino=1.5（恰好等于豁免阈值）。
+        验证：返回空权重（因为 `c[3] > SORTINO_ALPHA_EXEMPTION` 是严格大于）。
+        """
+        n = 300
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        spy_df = _make_spy_df(n, annual_return=0.10)
+
+        np.random.seed(42)
+        returns_a = pd.Series(np.random.normal(0.0004, 0.004, n), index=idx)
+
+        mock_alpha = -5.0
+        mock_sortino = SORTINO_ALPHA_EXEMPTION  # 1.5 边界
+
+        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
+            results = []
+            for sym, df in data.items():
+                if df is None or df.empty or len(df) < 30:
+                    continue
+                results.append(_make_result(sym, strategy_name, returns_a, closed_trades=10))
+            return results
+
+        df_up = _make_ohlcv(n, trend="up")
+        store = _make_store_with_spy({"AAA": df_up, "BBB": df_up}, spy_df)
+        universe = _make_mock_universe({"test_group": ["AAA", "BBB"]})
+
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
+        report = MatrixBacktestReport(
+            generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
+            backtest_window="2021-01-01 ~ 2022-01-01",
+            groups={},
+        )
+
+        with patch(
+            "mytrader.backtest.matrix_backtest._backtest_batch",
+            side_effect=mock_backtest_batch,
+        ), patch(
+            "mytrader.backtest.matrix_backtest._compute_alpha",
+            return_value=mock_alpha,
+        ), patch(
+            "mytrader.backtest.matrix_backtest._portfolio_sortino_from_results",
+            return_value=mock_sortino,
+        ):
+            weights = mb._run_group(
+                group_id="test_group",
+                symbols=["AAA", "BBB"],
+                start=date(2021, 1, 1),
+                end=date(2022, 1, 1),
+                strategies=["dual_ma"],
+                param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+                report=report,
+            )
+
+        # 关键断言：sortino == 豁免阈值 → 不豁免（> 严格比较）
+        assert weights == [], (
+            f"sortino == {SORTINO_ALPHA_EXEMPTION} 应不豁免（使用 > 严格比较），"
+            f"实际 weights={weights}"
+        )
+        warning_text = " ".join(report.warnings)
+        assert "no_positive_alpha" in warning_text
+
+    def test_sortino_exemption_just_above_boundary(self):
+        """Sortino=1.51 刚过豁免边界 → 豁免通过。
+
+        场景：alpha=-5%（gate 拒绝），sortino=1.51（刚高于豁免阈值 1.5）。
+        验证：权重非空（豁免通过）。
+        """
+        n = 300
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        spy_df = _make_spy_df(n, annual_return=0.10)
+
+        np.random.seed(42)
+        returns_a = pd.Series(np.random.normal(0.0004, 0.004, n), index=idx)
+
+        mock_alpha = -5.0
+        mock_sortino = 1.51  # 刚高于 1.5
+        assert mock_sortino > SORTINO_ALPHA_EXEMPTION
+
+        def mock_backtest_batch(data, strategy_name, params, *args, **kwargs):
+            results = []
+            for sym, df in data.items():
+                if df is None or df.empty or len(df) < 30:
+                    continue
+                results.append(_make_result(sym, strategy_name, returns_a, closed_trades=10))
+            return results
+
+        df_up = _make_ohlcv(n, trend="up")
+        store = _make_store_with_spy({"AAA": df_up, "BBB": df_up}, spy_df)
+        universe = _make_mock_universe({"test_group": ["AAA", "BBB"]})
+
+        mb = MatrixBacktest(store=store, universe=universe, years=1, top_k=2)
+        report = MatrixBacktestReport(
+            generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
+            backtest_window="2021-01-01 ~ 2022-01-01",
+            groups={},
+        )
+
+        with patch(
+            "mytrader.backtest.matrix_backtest._backtest_batch",
+            side_effect=mock_backtest_batch,
+        ), patch(
+            "mytrader.backtest.matrix_backtest._compute_alpha",
+            return_value=mock_alpha,
+        ), patch(
+            "mytrader.backtest.matrix_backtest._portfolio_sortino_from_results",
+            return_value=mock_sortino,
+        ):
+            weights = mb._run_group(
+                group_id="test_group",
+                symbols=["AAA", "BBB"],
+                start=date(2021, 1, 1),
+                end=date(2022, 1, 1),
+                strategies=["dual_ma"],
+                param_grids={"dual_ma": {"fast": [5], "slow": [20]}},
+                report=report,
+            )
+
+        # 关键断言：sortino=1.51 > 1.5 → 豁免通过
+        assert len(weights) > 0, (
+            f"sortino={mock_sortino} > {SORTINO_ALPHA_EXEMPTION} 应豁免通过，"
+            f"实际 weights={weights}"
+        )
+        for gr in report.group_results:
+            if gr.group_id == "test_group":
+                assert gr.no_positive_alpha is False

@@ -1,6 +1,6 @@
 # Trade-Tools 项目核心参考文档
 
-> 最后更新：2026-07-08 (Iter #16: Relax Alpha Gate Threshold / Unblock SPX Groups)  
+> 最后更新：2026-07-09 (Iter #18: Trend-Following Strategies for Bull Markets)  
 > 本文是项目规范 + 关键索引，供 AI 助手快速建立项目上下文。  
 > **各阶段开发详情见** → [`.codebuddy/notes/dev_records.md`](.codebuddy/notes/dev_records.md)
 
@@ -119,13 +119,13 @@ mytrader/
     │   ├── constituents.py             # 成分股抓取
     │   └── grouping.py                 # 波动率分层
     ├── strategy/               # Module 02 — Strategy Engine ✅
-    │   ├── strategies/         # dual_ma / rsi_mean_revert / rsi_trend_filter / macd_cross / bollinger_band / rsi_bb_convergence [Iter #14] / macd_volume [Iter #14]
+    │   ├── strategies/         # dual_ma / rsi_mean_revert / rsi_trend_filter / macd_cross / bollinger_band / rsi_bb_convergence [Iter #14] / macd_volume [Iter #14] / adx_trend [Iter #15] / momentum_roc [Iter #15] / sma_trend [Iter #18] / breakout [Iter #18]
     │   ├── ensemble.py
     │   └── matrix_runner.py    # [Phase 5] StrategyMatrixRunner
     │                           # [迭代 #5] build_matrix_signal_indicators 共享 helper
     ├── backtest/               # Module 07 — Backtest ✅
     │   ├── runner.py           # BacktestRunner（含 daily_returns）
-    │   ├── matrix_backtest.py  # [Phase 5] MatrixBacktest（含 backtest_dd_status + [Iter #9] alpha selection + [Iter #11] closed_trades/sanity gate + [Iter #12] alpha gate/no_positive_alpha + [Iter #13] WF alpha gate/val_alpha + [Iter #16] ALPHA_GATE_THRESHOLD=-2.0 放宽 alpha gate）
+    │   ├── matrix_backtest.py  # [Phase 5] MatrixBacktest（含 backtest_dd_status + [Iter #9] alpha selection + [Iter #11] closed_trades/sanity gate + [Iter #12] alpha gate/no_positive_alpha + [Iter #13] WF alpha gate/val_alpha + [Iter #16] ALPHA_GATE_THRESHOLD=-2.0 放宽 alpha gate + [Iter #17] SORTINO_ALPHA_EXEMPTION=1.5 高 Sortino 豁免）
     │   └── portfolio_backtest.py  # [迭代 #4] PortfolioBacktester（组合层级回测）
     │                               # [迭代 #5] 复用 build_matrix_signal_indicators
     │                               # [迭代 #7] SPY benchmark 对比（alpha/IR/benchmark Sortino/DD）
@@ -202,9 +202,11 @@ mytrader/
 | **Iter #13** | ✅ 完成 | 16 | WF Gate Alpha Validation（`WALK_FORWARD_VAL_ALPHA_FLOOR=-5.0` + `WalkForwardRound.val_alpha` + `WalkForwardReport.avg/min_val_alpha` + WF gate 加 alpha 校验 + `main.py` WF 日志增加 alpha） |
 | **Iter #14** | ✅ 完成 | 32 | Multi-Factor Strategy Exploration（rsi_trend_filter 修复 exit_neutral + rsi_bb_convergence 新策略 + macd_volume 新策略 + 7 策略 pool + 284 参数组合） |
 | **Iter #16** | ✅ 完成 | 7 | Relax Alpha Gate Threshold（`ALPHA_GATE_THRESHOLD=-2.0` 常量 + `_run_group` alpha gate 从 `alpha>0` 放宽至 `alpha > -2%` + 7 新测试覆盖边界/通过/拒绝/SPX 解锁场景；不修改 WF OOS 校验 / DD 20% / Sortino 0.5） |
+| **Iter #17** | ✅ 完成 | 7 | Sortino Alpha Exemption（`SORTINO_ALPHA_EXEMPTION=1.5` 常量 + `_run_group` Tier 1 过滤改为 `alpha > -2% OR sortino > 1.5` + 高 Sortino 策略绕过 alpha 门槛解锁 SPX 组） |
+| **Iter #18** | ✅ 完成 | 13 | Trend-Following Strategies for Bull Markets（新增 `sma_trend` 持续型 SMA 趋势跟踪 + `breakout` Donchian 通道突破 + 策略池 9→11 + 3+3 参数组合 + 解决牛市零信号问题） |
 | **Phase 6** | 🔲 待开发 | — | AlpacaBroker auto 端到端验证 + 对账真实集成 + 港股支持 |
 
-**当前总测试数：744 passed，0 failed**（live 测试默认隔离，迭代 #16 后；harness 测试 38 个在 `alignment/tests/`）
+**当前总测试数：776 passed，0 failed**（live 测试默认隔离，迭代 #18 后；harness 测试 38 个在 `alignment/tests/`）
 
 > 各阶段详细实现见 **[dev_records.md](.codebuddy/notes/dev_records.md)**
 

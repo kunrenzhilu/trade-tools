@@ -14,6 +14,8 @@ import mytrader.strategy.strategies.rsi_bb_convergence  # noqa: F401  [迭代 #1
 import mytrader.strategy.strategies.macd_volume         # noqa: F401  [迭代 #14]
 import mytrader.strategy.strategies.adx_trend           # noqa: F401  [迭代 #15]
 import mytrader.strategy.strategies.momentum_roc        # noqa: F401  [迭代 #15]
+import mytrader.strategy.strategies.sma_trend            # noqa: F401  [迭代 #18]
+import mytrader.strategy.strategies.breakout             # noqa: F401  [迭代 #18]
 
 __all__ = [
     "Signal",

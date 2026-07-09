@@ -87,6 +87,8 @@ class TestStrategyRegistry:
             "rsi_bb_convergence", "macd_volume",
             # 迭代 #15 新增
             "adx_trend", "momentum_roc",
+            # 迭代 #18 新增
+            "sma_trend", "breakout",
         }
         assert expected.issubset(set(STRATEGY_REGISTRY.keys()))
 
@@ -112,9 +114,9 @@ class TestStrategyRegistry:
     def test_iter15_strategies_in_reoptimize_constants(self):
         """迭代 #15：REOPTIMIZE_STRATEGIES 包含 adx_trend + momentum_roc + 参数网格。"""
         from main import REOPTIMIZE_STRATEGIES, REOPTIMIZE_PARAM_GRIDS
-        # 策略池应为 9 个策略
-        assert len(REOPTIMIZE_STRATEGIES) == 9, (
-            f"REOPTIMIZE_STRATEGIES 应有 9 个策略，实际 {len(REOPTIMIZE_STRATEGIES)}: {REOPTIMIZE_STRATEGIES}"
+        # 策略池应至少 9 个策略（迭代 #18 扩展到 11，故放宽为 >= 9）
+        assert len(REOPTIMIZE_STRATEGIES) >= 9, (
+            f"REOPTIMIZE_STRATEGIES 应至少 9 个策略，实际 {len(REOPTIMIZE_STRATEGIES)}: {REOPTIMIZE_STRATEGIES}"
         )
         for name in ("adx_trend", "momentum_roc"):
             assert name in REOPTIMIZE_STRATEGIES, (
@@ -143,6 +145,31 @@ class TestStrategyRegistry:
         for v in REOPTIMIZE_PARAM_GRIDS["momentum_roc"].values():
             roc_combos *= len(v)
         assert roc_combos == 8, f"momentum_roc 应有 8 个组合，实际 {roc_combos}"
+
+    def test_iter18_strategies_in_reoptimize_constants(self):
+        """迭代 #18：REOPTIMIZE_STRATEGIES 包含 sma_trend + breakout + 参数网格。"""
+        from main import REOPTIMIZE_STRATEGIES, REOPTIMIZE_PARAM_GRIDS
+        # 策略池应为 11 个策略（9 + 2 个持续型顺势策略）
+        assert len(REOPTIMIZE_STRATEGIES) == 11, (
+            f"REOPTIMIZE_STRATEGIES 应有 11 个策略，实际 {len(REOPTIMIZE_STRATEGIES)}: {REOPTIMIZE_STRATEGIES}"
+        )
+        for name in ("sma_trend", "breakout"):
+            assert name in REOPTIMIZE_STRATEGIES, (
+                f"'{name}' 未在 REOPTIMIZE_STRATEGIES 中"
+            )
+            assert name in REOPTIMIZE_PARAM_GRIDS, (
+                f"'{name}' 未在 REOPTIMIZE_PARAM_GRIDS 中"
+            )
+        # 两策略均仅含 period 维度
+        assert list(REOPTIMIZE_PARAM_GRIDS["sma_trend"].keys()) == ["period"], (
+            "sma_trend 参数网格应仅含 period 维度"
+        )
+        assert list(REOPTIMIZE_PARAM_GRIDS["breakout"].keys()) == ["period"], (
+            "breakout 参数网格应仅含 period 维度"
+        )
+        # 组合数验证：sma_trend 3，breakout 3
+        assert REOPTIMIZE_PARAM_GRIDS["sma_trend"]["period"] == [50, 100, 200]
+        assert REOPTIMIZE_PARAM_GRIDS["breakout"]["period"] == [20, 50, 100]
 
 
 # ---------------------------------------------------------------------------
@@ -1152,4 +1179,213 @@ class TestMomentumRoC:
         signal_modified = momentum_roc_signal(close_modified, trend_period=100)
         assert signal_normal.iloc[-1] == signal_modified.iloc[-1], (
             "momentum_roc 有前视偏差：最后 bar 价格变化导致最后 bar 信号变化"
+        )
+
+
+# ---------------------------------------------------------------------------
+# SMA Trend 策略测试（迭代 #18）
+# ---------------------------------------------------------------------------
+
+class TestSmaTrend:
+    """简单均线趋势跟踪策略测试（持续型顺势）。"""
+
+    def test_sma_trend_buy_in_uptrend(self):
+        """上升趋势中（close > SMA）应持续产生 BUY 信号。"""
+        from mytrader.strategy.strategies.sma_trend import sma_trend_signal
+        n = 200
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        # 前 60 bar 平稳建 SMA + 后 140 bar 强上涨（close 持续高于 SMA）
+        prices = np.concatenate([
+            np.full(60, 100.0),
+            np.linspace(100, 200, 140),  # +100% → close 远高于 SMA(50)
+        ])
+        close = pd.Series(prices, index=idx, name="close")
+        signal = sma_trend_signal(close, period=50)
+        # 上涨段（shift 后）应出现 BUY
+        assert 1 in signal.values, (
+            f"上升趋势应产生 BUY 信号，实际信号集: {set(signal.values)}"
+        )
+
+    def test_sma_trend_sell_on_trend_break(self):
+        """趋势反转（close < SMA）→ SELL 信号。"""
+        from mytrader.strategy.strategies.sma_trend import sma_trend_signal
+        n = 200
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        # 前 100 bar 平稳建 SMA + 后 100 bar 强下跌（close 持续低于 SMA）
+        prices = np.concatenate([
+            np.full(100, 100.0),
+            np.linspace(100, 50, 100),  # -50% → close 远低于 SMA(50)
+        ])
+        close = pd.Series(prices, index=idx, name="close")
+        signal = sma_trend_signal(close, period=50)
+        assert -1 in signal.values, (
+            f"趋势破位应产生 SELL 信号，实际信号集: {set(signal.values)}"
+        )
+
+    def test_sma_trend_signal_range(self):
+        """信号值仅在 {-1, 0, 1} 范围内。"""
+        from mytrader.strategy.strategies.sma_trend import sma_trend_signal
+        close = make_trending_close(150)
+        signal = sma_trend_signal(close, period=50)
+        assert set(signal.unique()).issubset({-1, 0, 1})
+
+    def test_sma_trend_custom_period(self):
+        """自定义 period 参数生效（短/中/长周期趋势线）。"""
+        from mytrader.strategy.strategies.sma_trend import sma_trend_signal
+        close = make_trending_close(300)
+        # 不同周期应都能运行，且均产生 BUY（强趋势中 close > SMA 任意周期）
+        for period in (50, 100, 200):
+            signal = sma_trend_signal(close, period=period)
+            assert set(signal.unique()).issubset({-1, 0, 1}), (
+                f"period={period} 信号值越界: {set(signal.unique())}"
+            )
+            assert len(signal) == len(close), (
+                f"period={period} 信号长度不匹配"
+            )
+
+    def test_sma_trend_continuous_in_trend(self):
+        """持续型特征：在整段趋势中保持 BUY，而非仅在交叉日触发。
+
+        构造 100 bar 单调上涨，SMA(50) 建立后所有 bar 的 close > SMA →
+        信号应为连续的 1（区别于 dual_ma 仅在金叉当日触发的 1 bar 信号）。
+        """
+        from mytrader.strategy.strategies.sma_trend import sma_trend_signal
+        n = 150
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        # 单调上涨：close 持续高于 SMA(50)
+        prices = 100.0 + np.arange(n) * 0.5
+        close = pd.Series(prices, index=idx, name="close")
+        signal = sma_trend_signal(close, period=50)
+        # SMA(50) 在第 50 bar 后有效；shift(1) 后第 52 bar 起应有持续 BUY
+        tail_signal = signal.iloc[55:]
+        buy_count = (tail_signal == 1).sum()
+        # 单调上涨 → 几乎所有 bar 都应 BUY（>50%）
+        assert buy_count > len(tail_signal) * 0.8, (
+            f"持续型特征失效：单调上涨中 BUY 占比 {buy_count}/{len(tail_signal)} "
+            f"(< 80%)，说明策略退化为事件型"
+        )
+
+    def test_sma_trend_no_lookahead(self):
+        """shift(1) 防前视偏差：最后 bar 信号不因最后 bar 价格变化而改变。"""
+        from mytrader.strategy.strategies.sma_trend import sma_trend_signal
+        close_normal = make_trending_close(150)
+        close_modified = close_normal.copy()
+        close_modified.iloc[-1] = close_modified.iloc[-1] * 2.0
+        signal_normal = sma_trend_signal(close_normal, period=50)
+        signal_modified = sma_trend_signal(close_modified, period=50)
+        assert signal_normal.iloc[-1] == signal_modified.iloc[-1], (
+            "sma_trend 有前视偏差：最后 bar 价格变化导致最后 bar 信号变化"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Breakout 策略测试（迭代 #18）
+# ---------------------------------------------------------------------------
+
+class TestBreakout:
+    """N 日价格通道突破策略测试（持续型顺势）。"""
+
+    @staticmethod
+    def _make_ohlcv(close: pd.Series, spread: float = 1.0) -> pd.DataFrame:
+        """从 close 构造 OHLCV。"""
+        return pd.DataFrame({
+            "open":  close - spread * 0.5,
+            "high":  close + spread,
+            "low":   close - spread,
+            "close": close,
+        }, index=close.index)
+
+    def test_breakout_buy_on_breakout(self):
+        """突破 N 日高点 → BUY 信号存在。"""
+        from mytrader.strategy.strategies.breakout import breakout_signal
+        n = 100
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        # 前 50 bar 横盘 + 后 50 bar 突破上涨
+        prices = np.concatenate([
+            np.full(50, 100.0),
+            np.linspace(100, 150, 50),  # 突破 50 日高点
+        ])
+        close = pd.Series(prices, index=idx, name="close")
+        df = self._make_ohlcv(close, spread=0.5)
+        signal = breakout_signal(close, period=20, df=df)
+        assert 1 in signal.values, (
+            f"突破 N 日高点应产生 BUY 信号，实际信号集: {set(signal.values)}"
+        )
+
+    def test_breakout_sell_on_breakdown(self):
+        """跌破 N 日低点 → SELL 信号。"""
+        from mytrader.strategy.strategies.breakout import breakout_signal
+        n = 100
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        # 前 50 bar 横盘 + 后 50 bar 突破下跌
+        prices = np.concatenate([
+            np.full(50, 100.0),
+            np.linspace(100, 60, 50),  # 跌破 20 日低点
+        ])
+        close = pd.Series(prices, index=idx, name="close")
+        df = self._make_ohlcv(close, spread=0.5)
+        signal = breakout_signal(close, period=20, df=df)
+        assert -1 in signal.values, (
+            f"跌破 N 日低点应产生 SELL 信号，实际信号集: {set(signal.values)}"
+        )
+
+    def test_breakout_no_df_fallback(self):
+        """df=None → 退化为 close 通道（不崩溃，仍能产生信号）。"""
+        from mytrader.strategy.strategies.breakout import breakout_signal
+        n = 100
+        idx = pd.date_range("2023-01-01", periods=n, freq="B")
+        # 横盘后突破（close 突破 close 的 rolling max）
+        prices = np.concatenate([
+            np.full(50, 100.0),
+            np.linspace(100, 140, 50),
+        ])
+        close = pd.Series(prices, index=idx, name="close")
+        signal = breakout_signal(close, period=20, df=None)
+        # 无 df 时退化为 close 通道，仍应产生 BUY（close 突破历史 close 高点）
+        assert set(signal.unique()).issubset({-1, 0, 1}), (
+            f"df=None 退化时信号值越界: {set(signal.unique())}"
+        )
+        assert 1 in signal.values, (
+            f"df=None 退化应仍能产生 BUY 信号，实际信号集: {set(signal.values)}"
+        )
+
+    def test_breakout_signal_range(self):
+        """信号值仅在 {-1, 0, 1} 范围内。"""
+        from mytrader.strategy.strategies.breakout import breakout_signal
+        close = make_trending_close(150)
+        df = self._make_ohlcv(close)
+        signal = breakout_signal(close, period=20, df=df)
+        assert set(signal.unique()).issubset({-1, 0, 1})
+
+    def test_breakout_custom_period(self):
+        """自定义 period 参数生效（短/中/长周期突破）。"""
+        from mytrader.strategy.strategies.breakout import breakout_signal
+        close = make_trending_close(200)
+        df = self._make_ohlcv(close)
+        for period in (20, 50, 100):
+            signal = breakout_signal(close, period=period, df=df)
+            assert set(signal.unique()).issubset({-1, 0, 1}), (
+                f"period={period} 信号值越界: {set(signal.unique())}"
+            )
+            assert len(signal) == len(close), (
+                f"period={period} 信号长度不匹配"
+            )
+
+    def test_breakout_no_lookahead(self):
+        """shift(1) 防前视偏差：最后 bar 信号不因最后 bar 价格变化而改变。
+
+        构造 df_normal 与 df_modified（仅最后 bar 价格翻倍），
+        验证最后 bar 信号不变。注意：breakout 的 rolling max 已内含 shift(1)
+        排除当日 high，再加外层 signal.shift(1)，双重保护确保无前视偏差。
+        """
+        from mytrader.strategy.strategies.breakout import breakout_signal
+        close_normal = make_trending_close(150)
+        df_normal = self._make_ohlcv(close_normal)
+        close_modified = close_normal.copy()
+        close_modified.iloc[-1] = close_modified.iloc[-1] * 2.0
+        df_modified = self._make_ohlcv(close_modified)
+        signal_normal = breakout_signal(close_normal, period=20, df=df_normal)
+        signal_modified = breakout_signal(close_modified, period=20, df=df_modified)
+        assert signal_normal.iloc[-1] == signal_modified.iloc[-1], (
+            "breakout 有前视偏差：最后 bar 价格变化导致最后 bar 信号变化"
         )

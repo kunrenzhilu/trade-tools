@@ -44,6 +44,9 @@ REOPTIMIZE_STRATEGIES: list[str] = [
     # 迭代 #15：新增 ADX 趋势 + RoC 动量策略
     "adx_trend",
     "momentum_roc",
+    # 迭代 #18：新增持续型顺势策略（解决牛市零信号问题）
+    "sma_trend",
+    "breakout",
 ]
 
 REOPTIMIZE_PARAM_GRIDS: dict[str, dict[str, list]] = {
@@ -78,6 +81,12 @@ REOPTIMIZE_PARAM_GRIDS: dict[str, dict[str, list]] = {
     # trend_period 固定 200（不纳入搜索，保持与其他趋势策略一致）。
     "momentum_roc": {"roc_period": [10, 20], "buy_threshold": [3, 5],
                      "sell_threshold": [-5, -3]},
+    # 迭代 #18：SMA 趋势跟踪 → 3 个组合（短/中/长期趋势线）。
+    # 持续型顺势策略：close > SMA → BUY，close < SMA → SELL。
+    "sma_trend": {"period": [50, 100, 200]},
+    # 迭代 #18：N 日通道突破 → 3 个组合（短/中/长期突破）。
+    # Donchian 风格：close > highest(high, N) → BUY，close < lowest(low, N) → SELL。
+    "breakout": {"period": [20, 50, 100]},
 }
 
 

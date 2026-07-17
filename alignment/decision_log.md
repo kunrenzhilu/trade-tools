@@ -524,3 +524,45 @@
 - **spec 假设需要实际验证**：spec §1 假设"SPX 成分股 alpha 在 -1% ~ 0%"，但实际 SPX_mid_vol 的 alpha 范围为 -4.69% ~ -13.84%。spec 的假设可能基于直觉而非数据，实际运行后需要修正
 
 ---
+
+## 决策 #17 — Iter #18: breakout 双 shift(1) 设计
+
+**日期**: 2026-07-09
+**触发**: Iter #18 新增 breakout 策略，需决定 rolling max/min 是否内含 shift
+
+### 决策点
+
+**决策 1: breakout 的 rolling max/min 是否内含 shift(1)？**
+- 选项 A：不内含 shift，仅依赖外层 signal.shift(1)（与 bollinger_band / dual_ma 一致）
+  - 问题：`high.rolling(period).max()` 包含当日 high，而 close ≤ high 恒成立
+  - → `close > upper` 几乎永不触发，策略失效
+- 选项 B：内层 `high.rolling(period).max().shift(1)`（排除当日 high）+ 外层 `signal.shift(1)`
+  - 内层 shift：符合 Donchian 通道标准定义（"今天收盘 vs 截至昨日的 N 日高点"）
+  - 外层 shift：项目统一约定（当前 bar 开盘时执行前一根 K 线的信号）
+  - → 双 shift 形成约 1 bar 的额外延迟，但语义清晰且无前视
+- 选 B：breakout 的语义本质是"突破历史通道"，close ≤ high 的恒等关系使得
+  必须排除当日 high 才能让突破条件可触发。这与 bollinger_band 不同——
+  bollinger 的 `close > upper` 可触发是因为 upper 基于close 计算（close
+  可能高于 mean+2std），而 breakout 的 upper 基于 high，close 永远
+  ≤ high。
+
+**决策 2: 无 df 时退化策略**
+- 选项 A：无 df 时抛异常，强制上游传入 OHLCV
+- 选项 B：无 df 时退化为 close 通道（`high = low = close`），仍可工作
+- 选 B：与 adx_trend 的 df=None 退化设计一致。矩阵回测中部分标的可能
+  只有 close 数据（理论上），退化让策略不崩溃。close 突破 close 的
+  rolling max 仍是有效信号（"收盘价创 N 日新高"）
+
+### 经验教训
+- **策略语义决定 shift 设计**：不能盲目复制其他策略的 shift 模式。
+  bollinger_band 的 `close > upper` 可触发（upper 基于close），breakout
+  的 `close > high_max` 不可触发（close ≤ high）。必须根据指标的数据源
+  判断是否需要内层 shift
+- **双 shift 不是 bug**：看似冗余的两次 shift(1) 实际承担不同语义——
+  内层排除当日数据（Donchian 定义），外层延迟到次日开盘（项目约定）。
+  移除任一层都会导致策略失效或前视偏差
+- **退化设计应与同类策略一致**：breakout 无 df 时退化为 close 通道，
+  与 adx_trend 无 df 时退化为纯 EMA 交叉的设计模式一致。保持一致
+  的退化策略降低维护成本
+
+---
